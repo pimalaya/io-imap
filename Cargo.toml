@@ -1,0 +1,30 @@
+[package]
+name = "imap-client"
+description = "Rust library to manage IMAP clients"
+version = "0.3.0"
+authors = ["soywod <clement.douin@posteo.net>"]
+edition = "2021"
+license = "MIT"
+categories = ["email"]
+keywords = ["email", "imap", "client"]
+homepage = "https://pimalaya.org/"
+documentation = "https://github.com/pimalaya/imap-client/"
+repository = "https://github.com/pimalaya/imap-client/"
+
+[features]
+default = []
+
+[dev-dependencies]
+async-std = { version = "1.13", features = ["attributes"] }
+static_assertions = "1.1"
+tokio = { version = "1.37", features = ["full"] }
+
+[dependencies]
+imap-next = { version = "0.3", features = ["tag_generator", "ext_id", "ext_metadata", "ext_condstore_qresync", "ext_metadata", "ext_namespace", "ext_utf8"] }
+rip-starttls = { version = "0.1", features = ["tokio"] }
+rustls-platform-verifier = "0.6"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.37", default-features = false, features = ["fs", "io-util", "net", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+tracing = "0.1"
