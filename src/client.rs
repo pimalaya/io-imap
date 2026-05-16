@@ -1,9 +1,9 @@
 //! # Standard, blocking IMAP client
 //!
-//! Holds a single boxed [`Stream`] (any blocking `Read + Write` impl) plus the
-//! long-lived [`ImapContext`], and exposes one method per common coroutine. The
-//! bare [`new`] constructor takes a pre-connected stream; callers handle TCP
-//! and TLS themselves. With one of the TLS feature flags enabled
+//! Holds a single stream (any blocking `Read + Write` impl) plus the
+//! long-lived [`ImapContext`], and exposes one method per common coroutine.
+//! The bare [`new`] constructor takes a pre-connected stream; callers handle
+//! TCP and TLS themselves. With one of the TLS feature flags enabled
 //! (`rustls-ring`, `rustls-aws`, `native-tls`), [`connect`] is also available
 //! and produces a ready-to-use authenticated client end-to-end: it opens the
 //! transport (plain TCP for `imap://`, implicit TLS for `imaps://`),
@@ -12,7 +12,6 @@
 //!
 //! [`new`]: ImapClientStd::new
 //! [`connect`]: ImapClientStd::connect
-//! [`StreamStd`]: [`pimalaya_stream::std::stream::StreamStd`]
 
 #[cfg(any(
     feature = "rustls-aws",
@@ -21,7 +20,6 @@
 ))]
 use std::string::{String, ToString};
 use std::{
-    boxed::Box,
     collections::BTreeMap,
     io::{Read, Write},
     num::NonZeroU32,
@@ -70,12 +68,6 @@ use thiserror::Error;
 ))]
 use url::Url;
 
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-use crate::rfc3501::starttls::*;
 #[cfg(feature = "scram")]
 use crate::rfc7677::auth_scram_sha_256::*;
 use crate::{
@@ -84,7 +76,7 @@ use crate::{
     rfc3501::{
         append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, expunge::*,
         fetch::*, greeting::*, list::*, login::*, logout::*, lsub::*, noop::*, rename::*,
-        search::*, select::*, status::*, store::*, subscribe::*, unsubscribe::*,
+        search::*, select::*, starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc5161::enable::*,
@@ -182,11 +174,6 @@ pub enum ImapClientStdError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[cfg(any(
-        feature = "rustls-aws",
-        feature = "rustls-ring",
-        feature = "native-tls"
-    ))]
     #[error(transparent)]
     StartTls(#[from] ImapStartTlsError),
     #[cfg(any(
@@ -224,14 +211,10 @@ pub enum ImapClientStdError {
     MissingContext,
 }
 
-/// Marker for everything the client can drive; auto-implemented for any
-/// blocking `Read + Write` impl.
-trait Stream: Read + Write {}
-impl<T: Read + Write + ?Sized> Stream for T {}
-
-/// Std-blocking IMAP client wrapping a single [`Stream`].
-pub struct ImapClientStd {
-    stream: Box<dyn Stream>,
+/// Std-blocking IMAP client wrapping a single `Read + Write` stream
+/// plus the long-lived [`ImapContext`].
+pub struct ImapClientStd<S: Read + Write> {
+    stream: S,
     context: Option<ImapContext>,
 }
 
@@ -272,209 +255,51 @@ macro_rules! coroutine {
     }};
 }
 
-impl ImapClientStd {
+impl<S: Read + Write> ImapClientStd<S> {
     /// Builds a client around `stream` with a fresh [`ImapContext`]. The caller
     /// is responsible for opening the connection (TCP, TLS handshake if needed,
     /// STARTTLS upgrade if needed). Pair with [`with_context`] when bringing
     /// over an already-progressed session.
     ///
     /// [`with_context`]: ImapClientStd::with_context
-    pub fn new<S: Read + Write + 'static>(stream: S) -> Self {
+    pub fn new(stream: S) -> Self {
         Self::with_context(stream, ImapContext::new())
     }
 
     /// Builds a client around `stream` and adopts `context` as its inner state.
     /// Useful when handing the stream off post-greeting / post-auth: the caller
-    /// drives the early coroutines, then transfers the resulting context into
+    /// runs the early coroutines, then transfers the resulting context into
     /// the client.
-    pub fn with_context<S: Read + Write + 'static>(stream: S, context: ImapContext) -> Self {
+    pub fn with_context(stream: S, context: ImapContext) -> Self {
         Self {
-            stream: Box::new(stream),
+            stream,
             context: Some(context),
         }
-    }
-
-    /// Connects to `url`, optionally performs the STARTTLS upgrade, reads the
-    /// greeting + capability list, then runs the chosen SASL mechanism.
-    ///
-    /// - `imap://`  goes through plain TCP (port defaults to 143).
-    /// - `imaps://` goes through implicit TLS (port defaults to 993).
-    /// - `starttls = true` (only valid on `imap://`) drives the IMAP
-    ///   `STARTTLS` dance and upgrades the underlying TCP stream to TLS
-    ///   before authenticating.
-    /// - `sasl` is the optional SASL mechanism. Accepts anything that converts
-    ///   into a [`Sasl`], so callers can pass the per-mechanism struct
-    ///   directly (e.g. `Some(SaslLogin { .. })`) without wrapping it in a
-    ///   [`Sasl`] variant. Supported mechanisms: [`SaslLogin`] (mapped to
-    ///   the IMAP `LOGIN` command, RFC 3501 §6.2.3), [`SaslPlain`] (RFC
-    ///   4616), [`SaslAnonymous`] (RFC 4505), [`SaslOauthbearer`] (RFC
-    ///   7628), [`SaslXoauth2`] (Google), and [`SaslScramSha256`] (RFC
-    ///   7677, behind the `scram` cargo feature). Pass [`None`] to skip
-    ///   authentication.
-    ///
-    /// Returns a fully authenticated client ready to issue further
-    /// commands.
-    #[cfg(any(
-        feature = "rustls-aws",
-        feature = "rustls-ring",
-        feature = "native-tls"
-    ))]
-    pub fn connect(
-        url: &Url,
-        tls: &Tls,
-        starttls: bool,
-        sasl: Option<impl Into<Sasl>>,
-    ) -> Result<Self, ImapClientStdError> {
-        let Some(host) = url.host_str() else {
-            return Err(ImapClientStdError::UrlMissingHost(url.to_string()));
-        };
-
-        let (mut stream, is_tls) = match url.scheme() {
-            scheme if scheme.eq_ignore_ascii_case("imap") => (
-                StreamStd::connect_tcp(host, url.port().unwrap_or(143))?,
-                false,
-            ),
-            scheme if scheme.eq_ignore_ascii_case("imaps") => (
-                StreamStd::connect_tls(host, url.port().unwrap_or(993), tls)?,
-                true,
-            ),
-            scheme => {
-                let url = url.to_string();
-                let scheme = scheme.to_string();
-                return Err(ImapClientStdError::UrlUnsupportedScheme(url, scheme));
-            }
-        };
-
-        let mut context = ImapContext::new();
-
-        if starttls {
-            if is_tls {
-                return Err(ImapClientStdError::StartTlsOverTls);
-            }
-
-            let mut coroutine = ImapStartTls::new(context);
-            context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                ImapStartTlsResult::WantsStartTls { context, .. } => DriveOutcome::Ok(context),
-                ImapStartTlsResult::WantsRead => DriveOutcome::WantsRead,
-                ImapStartTlsResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                ImapStartTlsResult::Err { err, .. } => DriveOutcome::Err(err),
-            })?;
-
-            stream = stream.upgrade_tls(tls)?;
-
-            let mut coroutine = ImapCapabilityGet::new(context);
-            context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                ImapCapabilityGetResult::Ok { context } => DriveOutcome::Ok(context),
-                ImapCapabilityGetResult::WantsRead => DriveOutcome::WantsRead,
-                ImapCapabilityGetResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                ImapCapabilityGetResult::Err { err, .. } => DriveOutcome::Err(err),
-            })?;
-        } else {
-            let mut coroutine = ImapGreetingGet::new(context, true);
-            context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                ImapGreetingGetResult::Ok { context } => DriveOutcome::Ok(context),
-                ImapGreetingGetResult::WantsRead => DriveOutcome::WantsRead,
-                ImapGreetingGetResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                ImapGreetingGetResult::Err { err, .. } => DriveOutcome::Err(err),
-            })?;
-        }
-
-        if let Some(sasl) = sasl.map(Into::into) {
-            let ir = context.capability.contains(&Capability::SaslIr);
-
-            match sasl {
-                Sasl::Anonymous(SaslAnonymous { message }) => {
-                    let params = ImapAuthAnonymousParams::new(message.unwrap_or_default(), ir);
-                    let mut coroutine = ImapAuthAnonymous::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapAuthAnonymousResult::Ok { context } => DriveOutcome::Ok(context),
-                        ImapAuthAnonymousResult::WantsRead => DriveOutcome::WantsRead,
-                        ImapAuthAnonymousResult::WantsWrite(bytes) => {
-                            DriveOutcome::WantsWrite(bytes)
-                        }
-                        ImapAuthAnonymousResult::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                Sasl::Login(SaslLogin { username, password }) => {
-                    let params = ImapLoginParams::new(username, password)?;
-                    let mut coroutine = ImapLogin::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapLoginResult::Ok { context } => DriveOutcome::Ok(context),
-                        ImapLoginResult::WantsRead => DriveOutcome::WantsRead,
-                        ImapLoginResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                        ImapLoginResult::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                Sasl::Plain(SaslPlain {
-                    authzid,
-                    authcid,
-                    passwd,
-                }) => {
-                    let params = ImapAuthPlainParams::new(authzid, authcid, passwd, ir);
-                    let mut coroutine = ImapAuthPlain::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapAuthPlainResult::Ok { context } => DriveOutcome::Ok(context),
-                        ImapAuthPlainResult::WantsRead => DriveOutcome::WantsRead,
-                        ImapAuthPlainResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                        ImapAuthPlainResult::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                Sasl::Oauthbearer(SaslOauthbearer {
-                    username,
-                    host,
-                    port,
-                    token,
-                }) => {
-                    let params = ImapAuthOAuthBearerParams::new(username, host, port, token, ir);
-                    let mut coroutine = ImapAuthOAuthBearer::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapAuthOAuthBearerResult::Ok { context } => DriveOutcome::Ok(context),
-                        ImapAuthOAuthBearerResult::WantsRead => DriveOutcome::WantsRead,
-                        ImapAuthOAuthBearerResult::WantsWrite(bytes) => {
-                            DriveOutcome::WantsWrite(bytes)
-                        }
-                        ImapAuthOAuthBearerResult::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
-                    let params = ImapAuthXOAuth2Params::new(username, token, ir);
-                    let mut coroutine = ImapAuthXOAuth2::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapAuthXOAuth2Result::Ok { context } => DriveOutcome::Ok(context),
-                        ImapAuthXOAuth2Result::WantsRead => DriveOutcome::WantsRead,
-                        ImapAuthXOAuth2Result::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
-                        ImapAuthXOAuth2Result::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                #[cfg(feature = "scram")]
-                Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
-                    let params = ImapAuthScramSha256Params::new(username, password, ir);
-                    let mut coroutine = ImapAuthScramSha256::new(context, params, true);
-                    context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                        ImapAuthScramSha256Result::Ok { context } => DriveOutcome::Ok(context),
-                        ImapAuthScramSha256Result::WantsRead => DriveOutcome::WantsRead,
-                        ImapAuthScramSha256Result::WantsWrite(bytes) => {
-                            DriveOutcome::WantsWrite(bytes)
-                        }
-                        ImapAuthScramSha256Result::Err { err, .. } => DriveOutcome::Err(err),
-                    })?;
-                }
-                #[cfg(not(feature = "scram"))]
-                Sasl::ScramSha256(_) => {
-                    return Err(ImapClientStdError::ScramSha256NotEnabled);
-                }
-            }
-        }
-
-        Ok(Self {
-            stream: Box::new(stream),
-            context: Some(context),
-        })
     }
 
     /// Returns the current session context, if any.
     pub fn context(&self) -> Option<&ImapContext> {
         self.context.as_ref()
+    }
+
+    /// Returns a shared reference to the underlying stream.
+    pub fn stream(&self) -> &S {
+        &self.stream
+    }
+
+    /// Returns an exclusive reference to the underlying stream.
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Consumes the client and returns its underlying stream plus the inner
+    /// context (if still present). Useful after [`starttls`] to perform a TLS
+    /// upgrade on the raw stream before rebuilding a fresh client around the
+    /// upgraded stream while preserving the negotiated context.
+    ///
+    /// [`starttls`]: ImapClientStd::starttls
+    pub fn into_parts(self) -> (S, Option<ImapContext>) {
+        (self.stream, self.context)
     }
 
     fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
@@ -513,6 +338,149 @@ impl ImapClientStd {
             self,
             ImapLogin::new(context, params, true),
             ImapLoginResult,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapStartTls`] (`STARTTLS`, RFC 3501 §6.2.1). The IMAP-layer
+    /// handshake is complete on return; the caller must now upgrade the
+    /// underlying socket to TLS (consume the client via [`into_parts`], call
+    /// `upgrade_tls`, then rebuild a client with [`with_context`]) and refresh
+    /// capabilities over the encrypted channel via [`capability`]. The
+    /// returned bytes are anything the coroutine pre-read past the tagged
+    /// response (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes
+    /// would be a classic STARTTLS-injection signal).
+    ///
+    /// [`into_parts`]: ImapClientStd::into_parts
+    /// [`with_context`]: ImapClientStd::with_context
+    /// [`capability`]: ImapClientStd::capability
+    pub fn starttls(&mut self) -> Result<Vec<u8>, ImapClientStdError> {
+        let context = self.take_context()?;
+        let mut coroutine = ImapStartTls::new(context);
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        let mut arg: Option<&[u8]> = None;
+
+        loop {
+            match coroutine.resume(arg) {
+                ImapStartTlsResult::WantsStartTls { context, remaining } => {
+                    self.context = Some(context);
+                    return Ok(remaining);
+                }
+                ImapStartTlsResult::WantsRead => {
+                    let n = self.stream.read(&mut buf)?;
+                    arg = Some(&buf[..n]);
+                }
+                ImapStartTlsResult::WantsWrite(bytes) => {
+                    self.stream.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapStartTlsResult::Err { context, err } => {
+                    self.context = Some(context);
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
+    /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC 4505)
+    /// with `ensure_capabilities=true` so the capability list is refreshed
+    /// before returning.
+    pub fn auth_anonymous(
+        &mut self,
+        params: ImapAuthAnonymousParams,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthAnonymous::new(context, params, true),
+            ImapAuthAnonymousResult,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy two-prompt
+    /// mechanism) with `ensure_capabilities=true`. Prefer [`auth_plain`] or
+    /// [`auth_scram_sha256`] when the server supports them.
+    ///
+    /// [`auth_plain`]: ImapClientStd::auth_plain
+    /// [`auth_scram_sha256`]: ImapClientStd::auth_scram_sha256
+    pub fn auth_login(
+        &mut self,
+        params: ImapAuthLoginParams,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthLogin::new(context, params, true),
+            ImapAuthLoginResult,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616) with
+    /// `ensure_capabilities=true`.
+    pub fn auth_plain(
+        &mut self,
+        params: ImapAuthPlainParams,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthPlain::new(context, params, true),
+            ImapAuthPlainResult,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapAuthOAuthBearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
+    /// RFC 7628) with `ensure_capabilities=true`. The `token` is an OAuth 2.0
+    /// bearer access token: the connection **must** be TLS-protected before
+    /// calling this method.
+    pub fn auth_oauthbearer(
+        &mut self,
+        params: ImapAuthOAuthBearerParams,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthOAuthBearer::new(context, params, true),
+            ImapAuthOAuthBearerResult,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapAuthXOAuth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
+    /// pre-standard OAuth 2.0 mechanism) with `ensure_capabilities=true`. The
+    /// `token` is an OAuth 2.0 bearer access token: the connection **must**
+    /// be TLS-protected. Prefer [`auth_oauthbearer`] on servers that support
+    /// both.
+    ///
+    /// [`auth_oauthbearer`]: ImapClientStd::auth_oauthbearer
+    pub fn auth_xoauth2(
+        &mut self,
+        params: ImapAuthXOAuth2Params,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthXOAuth2::new(context, params, true),
+            ImapAuthXOAuth2Result,
+            { .. } => self.context.as_ref().unwrap().capability.as_slice()
+        );
+    }
+
+    /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
+    /// RFC 7677) with `ensure_capabilities=true`.
+    #[cfg(feature = "scram")]
+    pub fn auth_scram_sha256(
+        &mut self,
+        params: ImapAuthScramSha256Params,
+    ) -> Result<&[Capability<'static>], ImapClientStdError> {
+        let context = self.take_context()?;
+        coroutine!(
+            self,
+            ImapAuthScramSha256::new(context, params, true),
+            ImapAuthScramSha256Result,
             { .. } => self.context.as_ref().unwrap().capability.as_slice()
         );
     }
@@ -898,38 +866,117 @@ impl ImapClientStd {
     feature = "rustls-ring",
     feature = "native-tls"
 ))]
-enum DriveOutcome<T, E> {
-    Ok(T),
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(E),
-}
+impl ImapClientStd<StreamStd> {
+    /// Connects to `url`, optionally performs the STARTTLS upgrade, reads the
+    /// greeting + capability list, then runs the chosen SASL mechanism.
+    ///
+    /// - `imap://`  goes through plain TCP (port defaults to 143).
+    /// - `imaps://` goes through implicit TLS (port defaults to 993).
+    /// - `starttls = true` (only valid on `imap://`) performs the IMAP
+    ///   `STARTTLS` upgrade and refreshes capabilities over TLS before
+    ///   authenticating.
+    /// - `sasl` is the optional SASL mechanism. Accepts anything that converts
+    ///   into a [`Sasl`], so callers can pass the per-mechanism struct
+    ///   directly (e.g. `Some(SaslLogin { .. })`) without wrapping it in a
+    ///   [`Sasl`] variant. Supported mechanisms: [`SaslLogin`] (mapped to
+    ///   the IMAP `LOGIN` command, RFC 3501 §6.2.3), [`SaslPlain`] (RFC
+    ///   4616), [`SaslAnonymous`] (RFC 4505), [`SaslOauthbearer`] (RFC
+    ///   7628), [`SaslXoauth2`] (Google), and [`SaslScramSha256`] (RFC
+    ///   7677, behind the `scram` cargo feature). Pass [`None`] to skip
+    ///   authentication.
+    ///
+    /// Returns a fully authenticated client ready to issue further
+    /// commands.
+    pub fn connect(
+        url: &Url,
+        tls: &Tls,
+        starttls: bool,
+        sasl: Option<impl Into<Sasl>>,
+    ) -> Result<Self, ImapClientStdError> {
+        let Some(host) = url.host_str() else {
+            return Err(ImapClientStdError::UrlMissingHost(url.to_string()));
+        };
 
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-fn drive<F, T, E>(stream: &mut StreamStd, mut step: F) -> Result<T, ImapClientStdError>
-where
-    F: FnMut(Option<&[u8]>) -> DriveOutcome<T, E>,
-    ImapClientStdError: From<E>,
-{
-    let mut buf = [0u8; READ_BUFFER_SIZE];
-    let mut arg: Option<&[u8]> = None;
+        let (stream, is_tls) = match url.scheme() {
+            scheme if scheme.eq_ignore_ascii_case("imap") => (
+                StreamStd::connect_tcp(host, url.port().unwrap_or(143))?,
+                false,
+            ),
+            scheme if scheme.eq_ignore_ascii_case("imaps") => (
+                StreamStd::connect_tls(host, url.port().unwrap_or(993), tls)?,
+                true,
+            ),
+            scheme => {
+                let url = url.to_string();
+                let scheme = scheme.to_string();
+                return Err(ImapClientStdError::UrlUnsupportedScheme(url, scheme));
+            }
+        };
 
-    loop {
-        match step(arg) {
-            DriveOutcome::Ok(value) => return Ok(value),
-            DriveOutcome::WantsRead => {
-                let n = stream.read(&mut buf)?;
-                arg = Some(&buf[..n]);
-            }
-            DriveOutcome::WantsWrite(bytes) => {
-                stream.write_all(&bytes)?;
-                arg = None;
-            }
-            DriveOutcome::Err(err) => return Err(err.into()),
+        if starttls && is_tls {
+            return Err(ImapClientStdError::StartTlsOverTls);
         }
+
+        let mut client = Self::new(stream);
+
+        if starttls {
+            client.starttls()?;
+            let (raw, context) = client.into_parts();
+            let upgraded = raw.upgrade_tls(tls)?;
+            client = Self::with_context(upgraded, context.unwrap_or_else(ImapContext::new));
+            client.capability()?;
+        } else {
+            client.greeting()?;
+        }
+
+        if let Some(sasl) = sasl.map(Into::into) {
+            let ir = client
+                .context()
+                .map(|ctx| ctx.capability.contains(&Capability::SaslIr))
+                .unwrap_or(false);
+
+            match sasl {
+                Sasl::Anonymous(SaslAnonymous { message }) => {
+                    let params = ImapAuthAnonymousParams::new(message.unwrap_or_default(), ir);
+                    client.auth_anonymous(params)?;
+                }
+                Sasl::Login(SaslLogin { username, password }) => {
+                    let params = ImapLoginParams::new(username, password)?;
+                    client.login(params)?;
+                }
+                Sasl::Plain(SaslPlain {
+                    authzid,
+                    authcid,
+                    passwd,
+                }) => {
+                    let params = ImapAuthPlainParams::new(authzid, authcid, passwd, ir);
+                    client.auth_plain(params)?;
+                }
+                Sasl::Oauthbearer(SaslOauthbearer {
+                    username,
+                    host,
+                    port,
+                    token,
+                }) => {
+                    let params = ImapAuthOAuthBearerParams::new(username, host, port, token, ir);
+                    client.auth_oauthbearer(params)?;
+                }
+                Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
+                    let params = ImapAuthXOAuth2Params::new(username, token, ir);
+                    client.auth_xoauth2(params)?;
+                }
+                #[cfg(feature = "scram")]
+                Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
+                    let params = ImapAuthScramSha256Params::new(username, password, ir);
+                    client.auth_scram_sha256(params)?;
+                }
+                #[cfg(not(feature = "scram"))]
+                Sasl::ScramSha256(_) => {
+                    return Err(ImapClientStdError::ScramSha256NotEnabled);
+                }
+            }
+        }
+
+        Ok(client)
     }
 }
