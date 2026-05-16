@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  push:
+
+jobs:
+  global-tests:
+    uses: pimalaya/nix/.github/workflows/tests.yml@master
+    secrets: inherit
+
+  fastmail-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: soywod
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - run: nix develop -c cargo test --test fastmail -- --ignored
+        env:
+          RUST_LOG: trace
+          FASTMAIL_EMAIL: ${{ secrets.FASTMAIL_EMAIL }}
+          FASTMAIL_APP_PASSWORD: ${{ secrets.FASTMAIL_APP_PASSWORD }}
+
+  gmail-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: soywod
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - run: nix develop -c cargo test --test gmail -- --ignored
+        env:
+          RUST_LOG: trace
+          GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+  stalwart-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: soywod
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - run: ./tests/stalwart.sh
+      - run: nix develop -c cargo test --test stalwart -- --ignored
+        env:
+          RUST_LOG: trace

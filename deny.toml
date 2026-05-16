@@ -1,17 +1,7 @@
 [sources]
+allow-git = ["https://github.com/pimalaya/stream"]
+unknown-git = "deny"
 unknown-registry = "deny"
-unknown-git      = "deny"
-
-allow-git = [
-    "https://github.com/duesee/imap-codec",
-]
 
 [licenses]
-allow = [ "Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-DFS-2016", "ISC", "OpenSSL" ]
-
-[[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 }
-]
+allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]

@@ -3,10 +3,9 @@ use std::{
     io::{Read, Write},
 };
 
-use imap_codec::imap_types::{core::Literal, extensions::binary::LiteralOrLiteral8};
 use io_imap::{
     context::ImapContext,
-    rfc3501::{append::*, greeting_with_capability::*, login::*, select::*},
+    rfc3501::{greeting_with_capability::*, login::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
 use secrecy::SecretString;
@@ -22,7 +21,6 @@ fn main() {
 
     let user = env::var("USER").expect("USER env var");
     let pass = env::var("PASS").expect("PASS env var");
-    let mbox = env::var("MAILBOX").expect("MAILBOX env var");
 
     let tls = Tls::default();
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
@@ -70,7 +68,7 @@ fn main() {
     let mut coroutine = ImapMailboxSelect::new(context, "INBOX".try_into().unwrap());
     let mut arg: Option<&[u8]> = None;
 
-    let (data, mut context) = loop {
+    let (data, context) = loop {
         match coroutine.resume(arg.take()) {
             ImapMailboxSelectResult::Ok { context, data } => break (data, context),
             ImapMailboxSelectResult::WantsRead => {
@@ -86,39 +84,6 @@ fn main() {
     };
 
     println!("select: {data:#?}");
-
-    let mut coroutine = ImapMessageAppend::new(
-        context,
-        mbox.try_into().unwrap(),
-        Default::default(),
-        None,
-        LiteralOrLiteral8::Literal(Literal::unvalidated(include_bytes!("./emacs.eml"))),
-    );
-    let mut arg: Option<&[u8]> = None;
-
-    let exists = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMessageAppendResult::Ok {
-                context: ctx,
-                exists,
-                ..
-            } => {
-                context = ctx;
-                break exists;
-            }
-            ImapMessageAppendResult::WantsRead => {
-                let n = stream.read(&mut buf).unwrap();
-                arg = Some(&buf[..n]);
-            }
-            ImapMessageAppendResult::WantsWrite(bytes) => {
-                stream.write_all(&bytes).unwrap();
-                arg = None;
-            }
-            ImapMessageAppendResult::Err { err, .. } => panic!("{err:?}"),
-        }
-    };
-
-    println!("exists: {exists:#?}");
 
     println!();
     println!("context: {context:#?}");
