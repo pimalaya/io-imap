@@ -83,8 +83,8 @@ use crate::{
     rfc2971::id::*,
     rfc3501::{
         append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, expunge::*,
-        fetch::*, greeting_with_capability::*, list::*, login::*, logout::*, lsub::*, noop::*,
-        rename::*, search::*, select::*, status::*, store::*, subscribe::*, unsubscribe::*,
+        fetch::*, greeting::*, list::*, login::*, logout::*, lsub::*, noop::*, rename::*,
+        search::*, select::*, status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc5161::enable::*,
@@ -100,7 +100,7 @@ const READ_BUFFER_SIZE: usize = 16 * 1024;
 #[derive(Debug, Error)]
 pub enum ImapClientStdError {
     #[error(transparent)]
-    GreetingWithCapability(#[from] ImapGreetingWithCapabilityGetError),
+    Greeting(#[from] ImapGreetingGetError),
     #[error(transparent)]
     Login(#[from] ImapLoginError),
     #[error(transparent)]
@@ -370,14 +370,12 @@ impl ImapClientStd {
                 ImapCapabilityGetResult::Err { err, .. } => DriveOutcome::Err(err),
             })?;
         } else {
-            let mut coroutine = ImapGreetingWithCapabilityGet::new(context);
+            let mut coroutine = ImapGreetingGet::new(context, true);
             context = drive(&mut stream, |arg| match coroutine.resume(arg) {
-                ImapGreetingWithCapabilityGetResult::Ok { context } => DriveOutcome::Ok(context),
-                ImapGreetingWithCapabilityGetResult::WantsRead => DriveOutcome::WantsRead,
-                ImapGreetingWithCapabilityGetResult::WantsWrite(bytes) => {
-                    DriveOutcome::WantsWrite(bytes)
-                }
-                ImapGreetingWithCapabilityGetResult::Err { err, .. } => DriveOutcome::Err(err),
+                ImapGreetingGetResult::Ok { context } => DriveOutcome::Ok(context),
+                ImapGreetingGetResult::WantsRead => DriveOutcome::WantsRead,
+                ImapGreetingGetResult::WantsWrite(bytes) => DriveOutcome::WantsWrite(bytes),
+                ImapGreetingGetResult::Err { err, .. } => DriveOutcome::Err(err),
             })?;
         }
 
@@ -487,9 +485,10 @@ impl ImapClientStd {
 
     // ---- Session lifecycle ------------------------------------------------
 
-    /// Runs [`ImapGreetingWithCapabilityGet`]: consumes the initial server
-    /// greeting and populates the capability list. Call this once after
-    /// [`new`] / [`connect`]. Returns the freshly negotiated capability list.
+    /// Runs [`ImapGreetingGet`] with `ensure_capabilities` set to `true`:
+    /// consumes the initial server greeting and populates the capability list.
+    /// Call this once after [`new`] / [`connect`]. Returns the freshly
+    /// negotiated capability list.
     ///
     /// [`new`]: ImapClientStd::new
     /// [`connect`]: ImapClientStd::connect
@@ -497,8 +496,8 @@ impl ImapClientStd {
         let context = self.take_context()?;
         coroutine!(
             self,
-            ImapGreetingWithCapabilityGet::new(context),
-            ImapGreetingWithCapabilityGetResult,
+            ImapGreetingGet::new(context, true),
+            ImapGreetingGetResult,
             { .. } => self.context.as_ref().unwrap().capability.as_slice()
         );
     }

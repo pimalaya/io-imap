@@ -8,8 +8,6 @@ pub mod delete;
 pub mod expunge;
 pub mod fetch;
 pub mod greeting;
-#[path = "greeting-with-capability.rs"]
-pub mod greeting_with_capability;
 pub mod list;
 pub mod login;
 pub mod logout;

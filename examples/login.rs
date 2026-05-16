@@ -5,7 +5,7 @@ use std::{
 
 use io_imap::{
     context::ImapContext,
-    rfc3501::{greeting_with_capability::*, login::*},
+    rfc3501::{greeting::*, login::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
 use secrecy::SecretString;
@@ -28,21 +28,21 @@ fn main() {
     let mut buf = [0u8; 16 * 1024];
 
     let mut context = ImapContext::new();
-    let mut coroutine = ImapGreetingWithCapabilityGet::new(context);
+    let mut coroutine = ImapGreetingGet::new(context, true);
     let mut arg: Option<&[u8]> = None;
 
     context = loop {
         match coroutine.resume(arg.take()) {
-            ImapGreetingWithCapabilityGetResult::Ok { context } => break context,
-            ImapGreetingWithCapabilityGetResult::WantsRead => {
+            ImapGreetingGetResult::Ok { context } => break context,
+            ImapGreetingGetResult::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingWithCapabilityGetResult::WantsWrite(bytes) => {
+            ImapGreetingGetResult::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapGreetingWithCapabilityGetResult::Err { err, .. } => panic!("{err}"),
+            ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
         }
     };
 

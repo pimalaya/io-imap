@@ -17,7 +17,7 @@ fn main() {
     let tls = Tls::default();
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
 
-    let mut coroutine = ImapGreetingGet::new(context);
+    let mut coroutine = ImapGreetingGet::new(context, false);
     let mut arg: Option<&[u8]> = None;
     let mut buf = [0u8; 16 * 1024];
 
@@ -28,6 +28,7 @@ fn main() {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
+            ImapGreetingGetResult::WantsWrite(_) => unreachable!(),
             ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
         }
     };

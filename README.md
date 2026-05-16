@@ -80,7 +80,7 @@ use io_imap::{context::ImapContext, rfc3501::greeting::*};
 let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
 let mut buf = [0u8; 16 * 1024];
 
-let mut coroutine = ImapGreetingGet::new(ImapContext::new());
+let mut coroutine = ImapGreetingGet::new(ImapContext::new(), false);
 let mut arg: Option<&[u8]> = None;
 
 let context = loop {
@@ -90,6 +90,7 @@ let context = loop {
             let n = stream.read(&mut buf).unwrap();
             arg = Some(&buf[..n]);
         }
+        ImapGreetingGetResult::WantsWrite(_) => unreachable!(),
         ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
     }
 };

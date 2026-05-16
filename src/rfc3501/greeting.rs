@@ -2,7 +2,7 @@
 
 use core::mem;
 
-use alloc::{boxed::Box, string::String, string::ToString};
+use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     GreetingCodec,
@@ -17,7 +17,7 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::context::ImapContext;
+use crate::{context::ImapContext, rfc3501::capability::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -34,6 +34,9 @@ pub enum ImapGreetingGetError {
 
     #[error("Parse IMAP greeting BYE error: {0}")]
     Bye(String),
+
+    #[error(transparent)]
+    Capability(#[from] ImapCapabilityGetError),
 }
 
 /// Output emitted when the coroutine terminates its progression.
@@ -42,6 +45,7 @@ pub enum ImapGreetingGetResult {
         context: ImapContext,
     },
     WantsRead,
+    WantsWrite(Vec<u8>),
     Err {
         context: ImapContext,
         err: ImapGreetingGetError,
@@ -51,6 +55,7 @@ pub enum ImapGreetingGetResult {
 enum State {
     Read,
     Deserialize,
+    Capability(ImapCapabilityGet),
 }
 
 /// I/O-free coroutine to read the greeting from an IMAP server.
@@ -60,17 +65,21 @@ pub struct ImapGreetingGet {
     state: State,
     wants_read: bool,
     fragmentizer: Fragmentizer,
+    ensure_capabilities: bool,
 }
 
 impl ImapGreetingGet {
-    /// Creates a new coroutine.
-    pub fn new(context: ImapContext) -> Self {
+    /// Creates a new coroutine. When `ensure_capabilities` is true and the
+    /// server did not piggyback a capability list on the greeting, the
+    /// coroutine drives an extra `CAPABILITY` round-trip before completing.
+    pub fn new(context: ImapContext, ensure_capabilities: bool) -> Self {
         Self {
             context: Some(context),
             codec: GreetingCodec::new(),
             state: State::Read,
             wants_read: false,
             fragmentizer: Fragmentizer::without_max_message_size(),
+            ensure_capabilities,
         }
     }
 
@@ -86,7 +95,7 @@ impl ImapGreetingGet {
                 return ImapGreetingGetResult::WantsRead;
             }
 
-            match self.state {
+            match &mut self.state {
                 State::Read => match arg.take() {
                     Some(&[]) => {
                         // SAFETY: context always exists during a resume cycle
@@ -130,6 +139,11 @@ impl ImapGreetingGet {
                                         capability.into_static().into_iter().collect();
                                 }
 
+                                if self.ensure_capabilities && context.capability.is_empty() {
+                                    self.state = State::Capability(ImapCapabilityGet::new(context));
+                                    continue;
+                                }
+
                                 return ImapGreetingGetResult::Ok { context };
                             }
                             Err(err) => {
@@ -158,6 +172,23 @@ impl ImapGreetingGet {
                     }
                     None => {
                         self.state = State::Read;
+                    }
+                },
+                State::Capability(coroutine) => match coroutine.resume(arg.take()) {
+                    ImapCapabilityGetResult::WantsRead => {
+                        return ImapGreetingGetResult::WantsRead;
+                    }
+                    ImapCapabilityGetResult::WantsWrite(bytes) => {
+                        return ImapGreetingGetResult::WantsWrite(bytes);
+                    }
+                    ImapCapabilityGetResult::Ok { context } => {
+                        return ImapGreetingGetResult::Ok { context };
+                    }
+                    ImapCapabilityGetResult::Err { context, err } => {
+                        return ImapGreetingGetResult::Err {
+                            context,
+                            err: err.into(),
+                        };
                     }
                 },
             }

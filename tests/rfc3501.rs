@@ -6,12 +6,12 @@
 
 use io_imap::{
     context::ImapContext,
-    rfc3501::{capability::*, greeting::*, greeting_with_capability::*, noop::*},
+    rfc3501::{capability::*, greeting::*, noop::*},
 };
 
 fn run_greeting(response: &'static [u8]) -> ImapGreetingGetResult {
     let context = ImapContext::new();
-    let mut coroutine = ImapGreetingGet::new(context);
+    let mut coroutine = ImapGreetingGet::new(context, false);
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
@@ -52,16 +52,16 @@ fn run_capability(response: &'static [u8]) -> ImapCapabilityGetResult {
     }
 }
 
-fn run_greeting_with_capability(response: &'static [u8]) -> ImapGreetingWithCapabilityGetResult {
+fn run_greeting_with_capability(response: &'static [u8]) -> ImapGreetingGetResult {
     let context = ImapContext::new();
-    let mut coroutine = ImapGreetingWithCapabilityGet::new(context);
+    let mut coroutine = ImapGreetingGet::new(context, true);
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
     loop {
         match coroutine.resume(arg.take()) {
-            ImapGreetingWithCapabilityGetResult::WantsWrite(_) => arg = None,
-            ImapGreetingWithCapabilityGetResult::WantsRead => {
+            ImapGreetingGetResult::WantsWrite(_) => arg = None,
+            ImapGreetingGetResult::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -115,7 +115,7 @@ fn greeting_with_capability_ok() {
     let response = b"* OK [CAPABILITY IMAP4rev1 LITERAL+ SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN] Dovecot ready.\r\n";
 
     match run_greeting_with_capability(response) {
-        ImapGreetingWithCapabilityGetResult::Ok { context } => {
+        ImapGreetingGetResult::Ok { context } => {
             assert!(!context.capability.is_empty());
         }
         _ => panic!("unexpected result"),

@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 
 use io_imap::{
     context::ImapContext,
-    rfc3501::{greeting_with_capability::*, login::*, logout::*, select::*},
+    rfc3501::{greeting::*, login::*, logout::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
 use secrecy::SecretString;
@@ -44,21 +44,21 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     // ── GREETING + CAPABILITY ─────────────────────────────────────────────────
 
-    let mut coroutine = ImapGreetingWithCapabilityGet::new(context);
+    let mut coroutine = ImapGreetingGet::new(context, true);
     let mut arg: Option<&[u8]> = None;
 
     context = loop {
         match coroutine.resume(arg.take()) {
-            ImapGreetingWithCapabilityGetResult::Ok { context } => break context,
-            ImapGreetingWithCapabilityGetResult::WantsRead => {
+            ImapGreetingGetResult::Ok { context } => break context,
+            ImapGreetingGetResult::WantsRead => {
                 let n = stream.read(&mut buf).expect("greeting read");
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingWithCapabilityGetResult::WantsWrite(bytes) => {
+            ImapGreetingGetResult::WantsWrite(bytes) => {
                 stream.write_all(&bytes).expect("greeting write");
                 arg = None;
             }
-            ImapGreetingWithCapabilityGetResult::Err { err, .. } => panic!("GREETING: {err}"),
+            ImapGreetingGetResult::Err { err, .. } => panic!("GREETING: {err}"),
         }
     };
 
