@@ -18,10 +18,5 @@ use crate::common::run_imap;
 #[test]
 #[ignore = "requires a running Stalwart instance on localhost:143 and --ignored"]
 fn stalwart() {
-    run_imap(
-        "127.0.0.1",
-        143,
-        "test@pimalaya.org",
-        "P!malaya-test-2026",
-    );
+    run_imap("127.0.0.1", 143, "test@pimalaya.org", "P!malaya-test-2026");
 }

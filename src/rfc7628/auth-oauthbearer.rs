@@ -13,6 +13,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 use crate::{context::ImapContext, rfc3501::capability::*, send::*};
@@ -75,14 +76,14 @@ impl ImapAuthOAuthBearerParams {
         username: impl ToString,
         host: impl ToString,
         port: u16,
-        token: Secret<String>,
+        token: SecretString,
         ir: bool,
     ) -> Self {
         Self {
             username: username.to_string(),
             host: host.to_string(),
             port,
-            token,
+            token: token.expose_secret().to_string().into(),
             ir,
         }
     }

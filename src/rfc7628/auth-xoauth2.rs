@@ -13,6 +13,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 use crate::{context::ImapContext, rfc3501::capability::*, send::*};
@@ -69,10 +70,10 @@ pub struct ImapAuthXOAuth2Params {
 }
 
 impl ImapAuthXOAuth2Params {
-    pub fn new(username: impl ToString, token: Secret<String>, ir: bool) -> Self {
+    pub fn new(username: impl ToString, token: SecretString, ir: bool) -> Self {
         Self {
             username: username.to_string(),
-            token,
+            token: token.expose_secret().to_string().into(),
             ir,
         }
     }

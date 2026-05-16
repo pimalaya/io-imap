@@ -17,6 +17,7 @@ use imap_codec::{
     },
 };
 use rand::{Rng, distributions::Alphanumeric};
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -90,10 +91,10 @@ pub struct ImapAuthScramSha256Params {
 }
 
 impl ImapAuthScramSha256Params {
-    pub fn new(username: impl ToString, password: Secret<String>, ir: bool) -> Self {
+    pub fn new(username: impl ToString, password: SecretString, ir: bool) -> Self {
         Self {
             username: username.to_string(),
-            password,
+            password: password.expose_secret().to_string().into(),
             ir,
         }
     }

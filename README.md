@@ -170,16 +170,16 @@ io-imap = "0.0.1" # rustls-ring is enabled by default
 
 ```rust,ignore
 use io_imap::client::ImapClientStd;
-use pimalaya_stream::{sasl::{Sasl, SaslLogin}, tls::Tls};
+use pimalaya_stream::{sasl::SaslLogin, tls::Tls};
 use secrecy::SecretString;
 use url::Url;
 
 let url = Url::parse("imaps://imap.example.com")?;
 let tls = Tls::default();
-let sasl = Sasl::Login(SaslLogin {
+let sasl = SaslLogin {
     username: "alice@example.com".into(),
     password: SecretString::from("hunter2".to_owned()),
-});
+};
 
 let mut client = ImapClientStd::connect(&url, &tls, false, Some(sasl))?;
 
@@ -189,7 +189,7 @@ for (mailbox, _, _) in client.list("".try_into()?, "*".try_into()?)? {
 }
 ```
 
-For mechanisms not yet reachable through `connect` (OAUTHBEARER / XOAUTH2 / SCRAM-SHA-256), use `ImapClientStd::new(stream)` (mode 2) and drive the relevant coroutine directly.
+The `sasl` argument is `Option<impl Into<Sasl>>`, so any of the per-mechanism structs (`SaslLogin`, `SaslPlain`, `SaslAnonymous`, `SaslOauthbearer`, `SaslXoauth2`, `SaslScramSha256` behind the `scram` feature) can be passed in `Some(...)` directly without wrapping in a `Sasl` variant.
 
 *See complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).*
 
