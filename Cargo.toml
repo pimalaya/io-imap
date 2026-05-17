@@ -17,9 +17,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["rustls-ring"]
-std = []
-client = ["std"]
+default = []
+client = []
 scram = ["dep:base64", "dep:hmac", "dep:pbkdf2", "dep:rand", "dep:sha2"]
 rustls-ring = ["client", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:url"]
 rustls-aws  = ["client", "pimalaya-stream/rustls-aws", "dep:anyhow", "dep:url"]

@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-};
+use core::num::NonZeroU32;
+
+use std::collections::{HashMap, HashSet};
 
 use imap_next::imap_types::{
     command::{CommandBody, FetchModifier},

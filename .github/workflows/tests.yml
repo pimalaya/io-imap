@@ -4,7 +4,7 @@ on:
   push:
 
 jobs:
-  global-tests:
+  tests:
     uses: pimalaya/nix/.github/workflows/tests.yml@master
     secrets: inherit
 
@@ -20,7 +20,7 @@ jobs:
           name: soywod
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
-      - run: nix develop -c cargo test --test fastmail -- --ignored
+      - run: nix develop -c cargo test --features rustls-ring --test fastmail -- --ignored
         env:
           RUST_LOG: trace
           FASTMAIL_EMAIL: ${{ secrets.FASTMAIL_EMAIL }}
@@ -38,7 +38,7 @@ jobs:
           name: soywod
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
-      - run: nix develop -c cargo test --test gmail -- --ignored
+      - run: nix develop -c cargo test --features rustls-ring --test gmail -- --ignored
         env:
           RUST_LOG: trace
           GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
@@ -57,6 +57,6 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
       - run: ./tests/stalwart.sh
-      - run: nix develop -c cargo test --test stalwart -- --ignored
+      - run: nix develop -c cargo test --features rustls-ring --test stalwart -- --ignored
         env:
           RUST_LOG: trace

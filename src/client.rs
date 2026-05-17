@@ -1,30 +1,28 @@
 //! # Standard, blocking IMAP client
 //!
-//! Holds a single stream (any blocking `Read + Write` impl) plus the
-//! long-lived [`ImapContext`], and exposes one method per common coroutine.
-//! The bare [`new`] constructor takes a pre-connected stream; callers handle
-//! TCP and TLS themselves. With one of the TLS feature flags enabled
-//! (`rustls-ring`, `rustls-aws`, `native-tls`), [`connect`] is also available
-//! and produces a ready-to-use authenticated client end-to-end: it opens the
-//! transport (plain TCP for `imap://`, implicit TLS for `imaps://`),
-//! optionally performs the STARTTLS upgrade, reads the greeting and capability
-//! list, then runs the chosen SASL mechanism if one was provided.
+//! Holds a single stream (any blocking `Read + Write` impl) plus the long-lived
+//! [`ImapContext`], and exposes one method per common coroutine.  The bare
+//! [`new`] constructor takes a pre-connected stream; callers handle TCP and TLS
+//! themselves. With one of the TLS feature flags enabled (`rustls-ring`,
+//! `rustls-aws`, `native-tls`), [`connect`] is also available and produces a
+//! ready-to-use authenticated client end-to-end: it opens the transport (plain
+//! TCP for `imap://`, implicit TLS for `imaps://`), optionally performs the
+//! STARTTLS upgrade, reads the greeting and capability list, then runs the
+//! chosen SASL mechanism if one was provided.
 //!
 //! [`new`]: ImapClientStd::new
 //! [`connect`]: ImapClientStd::connect
+
+use core::num::NonZeroU32;
 
 #[cfg(any(
     feature = "rustls-aws",
     feature = "rustls-ring",
     feature = "native-tls"
 ))]
-use std::string::{String, ToString};
-use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
-    num::NonZeroU32,
-    vec::Vec,
-};
+use alloc::string::{String, ToString};
+use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
+use std::io::{self, Read, Write};
 
 use imap_codec::imap_types::{
     core::{IString, NString, Vec1},
@@ -173,7 +171,7 @@ pub enum ImapClientStdError {
     MessageThread(#[from] ImapMessageThreadError),
 
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error(transparent)]
     StartTls(#[from] ImapStartTlsError),
     #[cfg(any(
@@ -211,13 +209,6 @@ pub enum ImapClientStdError {
     MissingContext,
 }
 
-/// Std-blocking IMAP client wrapping a single `Read + Write` stream
-/// plus the long-lived [`ImapContext`].
-pub struct ImapClientStd<S: Read + Write> {
-    stream: S,
-    context: Option<ImapContext>,
-}
-
 /// Run a coroutine to completion against `$self.stream`. The destructure
 /// pattern names whichever payload fields of the `Ok` variant the caller wants;
 /// `context` is bound and restored automatically. `$ret` is the expression
@@ -253,6 +244,14 @@ macro_rules! coroutine {
             }
         }
     }};
+}
+
+/// Std-blocking IMAP client wrapping a single `Read + Write` stream
+/// plus the long-lived [`ImapContext`].
+#[derive(Debug)]
+pub struct ImapClientStd<S: Read + Write> {
+    stream: S,
+    context: Option<ImapContext>,
 }
 
 impl<S: Read + Write> ImapClientStd<S> {
@@ -346,10 +345,10 @@ impl<S: Read + Write> ImapClientStd<S> {
     /// handshake is complete on return; the caller must now upgrade the
     /// underlying socket to TLS (consume the client via [`into_parts`], call
     /// `upgrade_tls`, then rebuild a client with [`with_context`]) and refresh
-    /// capabilities over the encrypted channel via [`capability`]. The
-    /// returned bytes are anything the coroutine pre-read past the tagged
-    /// response (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes
-    /// would be a classic STARTTLS-injection signal).
+    /// capabilities over the encrypted channel via [`capability`]. The returned
+    /// bytes are anything the coroutine pre-read past the tagged response
+    /// (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes would be a
+    /// classic STARTTLS-injection signal).
     ///
     /// [`into_parts`]: ImapClientStd::into_parts
     /// [`with_context`]: ImapClientStd::with_context
@@ -601,7 +600,7 @@ impl<S: Read + Write> ImapClientStd<S> {
     pub fn status(
         &mut self,
         mailbox: Mailbox<'static>,
-        item_names: impl Into<alloc::borrow::Cow<'static, [StatusDataItemName]>>,
+        item_names: impl Into<Cow<'static, [StatusDataItemName]>>,
     ) -> Result<Vec<StatusDataItem>, ImapClientStdError> {
         let context = self.take_context()?;
         coroutine!(

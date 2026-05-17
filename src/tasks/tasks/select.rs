@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroU64};
 
 use imap_next::imap_types::{
     command::CommandBody,
@@ -8,8 +8,7 @@ use imap_next::imap_types::{
 };
 use tracing::debug;
 
-use super::TaskError;
-use crate::tasks::Task;
+use crate::tasks::{Task, tasks::TaskError};
 
 #[derive(Clone, Debug, Default)]
 pub struct SelectDataUnvalidated {
@@ -25,7 +24,7 @@ pub struct SelectDataUnvalidated {
     pub uid_validity: Option<NonZeroU32>,
 
     // optional CONDSTORE response
-    pub highest_modseq: Option<std::num::NonZeroU64>,
+    pub highest_modseq: Option<NonZeroU64>,
 }
 
 impl SelectDataUnvalidated {

@@ -1,14 +1,17 @@
 //! I/O-free coroutine to watch IMAP mailbox changes using the IDLE
 //! extension.
 
+#[cfg(feature = "client")]
+use core::time::Duration;
 use core::{
     mem,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
-#[cfg(feature = "std")]
-use std::time::{Duration, Instant};
+
+#[cfg(feature = "client")]
+use std::time::Instant;
 
 use imap_codec::{
     CommandCodec, IdleDoneCodec, ResponseCodec,
@@ -27,7 +30,7 @@ use thiserror::Error;
 
 use crate::{context::ImapContext, send::*};
 
-#[cfg(feature = "std")]
+#[cfg(feature = "client")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 
 /// Errors that can occur during the coroutine progression.
@@ -99,7 +102,7 @@ pub struct ImapIdle {
     untagged: Vec<StatusBody<'static>>,
     bye: Option<Bye<'static>>,
     idle: ImapIdleDone,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "client")]
     timer: Option<Instant>,
 }
 
@@ -119,14 +122,14 @@ impl ImapIdle {
             untagged: Vec::new(),
             bye: None,
             idle: done,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "client")]
             timer: None,
         }
     }
 
     /// Advances the coroutine.
     pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapIdleResult {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "client")]
         if self.timer.is_none() {
             self.timer = Some(Instant::now());
         }
@@ -183,13 +186,13 @@ impl ImapIdle {
                 }
                 State::Read => {
                     let done = self.idle.is_done();
-                    #[cfg(feature = "std")]
+                    #[cfg(feature = "client")]
                     let timed_out = self
                         .timer
                         .as_ref()
                         .map(|t| t.elapsed() >= IDLE_DEFAULT_TIMEOUT)
                         .unwrap_or(false);
-                    #[cfg(not(feature = "std"))]
+                    #[cfg(not(feature = "client"))]
                     let timed_out = false;
 
                     if done || timed_out {
@@ -318,13 +321,13 @@ impl ImapIdle {
                         return ImapIdleResult::Err { context, err };
                     };
 
-                    #[cfg(feature = "std")]
+                    #[cfg(feature = "client")]
                     let timed_out = self
                         .timer
                         .take()
                         .map(|t| t.elapsed() >= IDLE_DEFAULT_TIMEOUT)
                         .unwrap_or(false);
-                    #[cfg(not(feature = "std"))]
+                    #[cfg(not(feature = "client"))]
                     let timed_out = false;
 
                     return match body.kind {

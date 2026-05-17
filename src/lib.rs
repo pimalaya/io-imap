@@ -4,7 +4,7 @@
 
 #[macro_use]
 extern crate alloc;
-#[cfg(feature = "std")]
+#[cfg(feature = "client")]
 extern crate std;
 
 #[cfg(feature = "client")]
