@@ -15,7 +15,11 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{
+    context::ImapContext,
+    rfc3501::mailbox::{decode_inplace, encode_inplace},
+    send::*,
+};
 
 /// Output of the IMAP `LIST` (and `LSUB`) command: one row per matched
 /// mailbox `(mailbox, hierarchy delimiter, attributes)`.
@@ -65,10 +69,11 @@ impl ImapMailboxList {
     /// Creates a new coroutine.
     pub fn new(
         mut context: ImapContext,
-        reference: Mailbox<'static>,
+        mut reference: Mailbox<'static>,
         mailbox_wildcard: ListMailbox<'static>,
     ) -> Self {
         trace!("list IMAP mailboxes: {reference:?} {mailbox_wildcard:?}");
+        encode_inplace(&mut reference);
 
         let body = CommandBody::List {
             reference,
@@ -122,6 +127,8 @@ impl ImapMailboxList {
                 mailbox,
             } = data
             {
+                let mut mailbox = mailbox;
+                decode_inplace(&mut mailbox);
                 mailboxes.push((mailbox, delimiter, items));
             }
         }

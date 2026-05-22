@@ -14,7 +14,11 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::copy::ImapCopyUid, send::*};
+use crate::{
+    context::ImapContext,
+    rfc3501::{copy::ImapCopyUid, mailbox::encode_inplace},
+    send::*,
+};
 
 /// Expand a `UidSet` into a sorted `Vec<u32>`.
 fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
@@ -81,9 +85,10 @@ impl ImapMessageMove {
     pub fn new(
         mut context: ImapContext,
         sequence_set: SequenceSet,
-        mailbox: Mailbox<'static>,
+        mut mailbox: Mailbox<'static>,
         uid: bool,
     ) -> Self {
+        encode_inplace(&mut mailbox);
         let body = CommandBody::Move {
             sequence_set,
             mailbox,

@@ -14,7 +14,7 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -56,10 +56,11 @@ impl ImapMailboxStatus {
     /// Creates a new coroutine.
     pub fn new(
         mut context: ImapContext,
-        mailbox: Mailbox<'static>,
+        mut mailbox: Mailbox<'static>,
         item_names: impl Into<Cow<'static, [StatusDataItemName]>>,
     ) -> Self {
         trace!("status IMAP mailbox: {mailbox:?}");
+        encode_inplace(&mut mailbox);
 
         let body = CommandBody::Status {
             mailbox,

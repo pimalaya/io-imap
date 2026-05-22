@@ -15,7 +15,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `APPEND` command: `EXISTS` count and
 /// `[APPENDUID uidvalidity uid]` response code (RFC 4315) if the server
@@ -66,11 +66,12 @@ impl ImapMessageAppend {
     /// Creates a new coroutine.
     pub fn new(
         mut context: ImapContext,
-        mailbox: Mailbox<'static>,
+        mut mailbox: Mailbox<'static>,
         flags: Vec<Flag<'static>>,
         date: Option<DateTime>,
         message: LiteralOrLiteral8<'static>,
     ) -> Self {
+        encode_inplace(&mut mailbox);
         let body = CommandBody::Append {
             mailbox,
             flags,

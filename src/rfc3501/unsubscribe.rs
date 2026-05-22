@@ -12,7 +12,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -51,7 +51,8 @@ pub struct ImapMailboxUnsubscribe {
 
 impl ImapMailboxUnsubscribe {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, mailbox: Mailbox<'static>) -> Self {
+    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
+        encode_inplace(&mut mailbox);
         let body = CommandBody::Unsubscribe { mailbox };
         // SAFETY: tag is always valid
         let command = Command::new(context.generate_tag(), body).unwrap();

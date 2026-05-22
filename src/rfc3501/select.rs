@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use crate::{
     context::{ImapContext, ImapCurrentMailboxState},
+    rfc3501::mailbox::encode_inplace,
     send::*,
 };
 
@@ -71,8 +72,11 @@ pub struct ImapMailboxSelect {
 
 impl ImapMailboxSelect {
     /// Creates a new coroutine for SELECT.
-    pub fn new(mut context: ImapContext, mailbox: Mailbox<'static>) -> Self {
+    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
+        // Stash the decoded form for the context, then encode the
+        // copy that goes on the wire.
         let select_state = ImapCurrentMailboxState::Selected(mailbox.clone());
+        encode_inplace(&mut mailbox);
 
         let body = CommandBody::Select {
             mailbox,
@@ -89,8 +93,9 @@ impl ImapMailboxSelect {
     }
 
     /// Creates a new coroutine for EXAMINE (read-only).
-    pub fn read_only(mut context: ImapContext, mailbox: Mailbox<'static>) -> Self {
+    pub fn read_only(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
         let select_state = ImapCurrentMailboxState::SelectedReadOnly(mailbox.clone());
+        encode_inplace(&mut mailbox);
 
         let body = CommandBody::Examine {
             mailbox,

@@ -14,7 +14,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `COPY` (and `MOVE`) command: the
 /// `[COPYUID uidvalidity src-uids dst-uids]` response code (RFC 4315) if the
@@ -87,9 +87,10 @@ impl ImapMessageCopy {
     pub fn new(
         mut context: ImapContext,
         sequence_set: SequenceSet,
-        mailbox: Mailbox<'static>,
+        mut mailbox: Mailbox<'static>,
         uid: bool,
     ) -> Self {
+        encode_inplace(&mut mailbox);
         let body = CommandBody::Copy {
             sequence_set,
             mailbox,

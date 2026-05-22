@@ -17,7 +17,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -59,11 +59,12 @@ impl ImapAppendUid {
     /// Creates a new coroutine.
     pub fn new(
         mut context: ImapContext,
-        mailbox: Mailbox<'static>,
+        mut mailbox: Mailbox<'static>,
         flags: Vec<Flag<'static>>,
         date: Option<DateTime>,
         message: LiteralOrLiteral8<'static>,
     ) -> Self {
+        encode_inplace(&mut mailbox);
         let body = CommandBody::Append {
             mailbox,
             flags,

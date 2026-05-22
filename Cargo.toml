@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 client = []
-scram = ["dep:base64", "dep:hmac", "dep:pbkdf2", "dep:rand", "dep:sha2"]
+scram = ["dep:hmac", "dep:pbkdf2", "dep:rand", "dep:sha2"]
 rustls-ring = ["client", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:url"]
 rustls-aws = ["client", "pimalaya-stream/rustls-aws", "dep:anyhow", "dep:url"]
 native-tls = ["client", "pimalaya-stream/native-tls", "dep:anyhow", "dep:url"]
@@ -31,7 +31,7 @@ env_logger = "0.11"
 
 [dependencies]
 anyhow = { version = "1", optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", optional = true }
 imap-codec = { version = "2.0.0-alpha.7", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
 log = "0.4"

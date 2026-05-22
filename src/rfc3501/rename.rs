@@ -12,7 +12,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -51,7 +51,13 @@ pub struct ImapMailboxRename {
 
 impl ImapMailboxRename {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, from: Mailbox<'static>, to: Mailbox<'static>) -> Self {
+    pub fn new(
+        mut context: ImapContext,
+        mut from: Mailbox<'static>,
+        mut to: Mailbox<'static>,
+    ) -> Self {
+        encode_inplace(&mut from);
+        encode_inplace(&mut to);
         let body = CommandBody::Rename { from, to };
         // SAFETY: tag is always valid
         let command = Command::new(context.generate_tag(), body).unwrap();

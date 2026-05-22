@@ -13,7 +13,14 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::list::ImapMailboxListing, send::*};
+use crate::{
+    context::ImapContext,
+    rfc3501::{
+        list::ImapMailboxListing,
+        mailbox::{decode_inplace, encode_inplace},
+    },
+    send::*,
+};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -55,10 +62,11 @@ impl ImapMailboxLsub {
     /// Creates a new coroutine.
     pub fn new(
         mut context: ImapContext,
-        reference: Mailbox<'static>,
+        mut reference: Mailbox<'static>,
         mailbox_wildcard: ListMailbox<'static>,
     ) -> Self {
         trace!("lsub IMAP mailboxes: {reference:?} {mailbox_wildcard:?}");
+        encode_inplace(&mut reference);
 
         let body = CommandBody::Lsub {
             reference,
@@ -112,6 +120,8 @@ impl ImapMailboxLsub {
                 mailbox,
             } = data
             {
+                let mut mailbox = mailbox;
+                decode_inplace(&mut mailbox);
                 mailboxes.push((mailbox, delimiter, items));
             }
         }
