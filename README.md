@@ -31,18 +31,19 @@ IMAP client library, written in Rust
 
 This library implements IMAP as I/O-agnostic coroutines: no sockets, no async runtime, no `std` required.
 
-| Module   | What it covers                                                                                                            |
-|----------|---------------------------------------------------------------------------------------------------------------------------|
-| [2177]   | IDLE: push notification extension                                                                                         |
-| [2971]   | ID: server/client identification extension                                                                                |
-| [3501]   | IMAP4rev1: greeting, capability, login, logout, select, list, fetch, store, search, copy, append, expunge, noop, starttls |
-| [3691]   | UNSELECT: discard mailbox state without expunge                                                                           |
-| [4315]   | UIDPLUS: APPENDUID and COPYUID response codes                                                                             |
-| [5161]   | ENABLE: capability activation extension                                                                                   |
-| [5256]   | SORT and THREAD: server-side message sorting and threading                                                                |
-| [6851]   | MOVE: atomic message move extension                                                                                       |
-| [7628]   | OAUTHBEARER: OAuth 2.0 bearer token SASL mechanism; also XOAUTH2                                                          |
-| [7677]   | SCRAM-SHA-256: SASL SCRAM-SHA-256 mechanism (feature `scram`)                                                             |
+| Module   | What it covers                                                                                                                                                                                                |
+|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [2177]   | IDLE: push notification extension                                                                                                                                                                             |
+| [2971]   | ID: server/client identification extension                                                                                                                                                                    |
+| [3501]   | IMAP4rev1: greeting, capability, login/logout, list/lsub/status, create/delete/rename/subscribe/unsubscribe, select/examine/close/check/expunge, fetch/store/search/copy/append, noop, starttls               |
+| [3691]   | UNSELECT: discard mailbox state without expunge                                                                                                                                                               |
+| [4315]   | UIDPLUS: APPENDUID and COPYUID response codes                                                                                                                                                                 |
+| [5161]   | ENABLE: capability activation extension                                                                                                                                                                       |
+| [5256]   | SORT and THREAD: server-side message sorting and threading                                                                                                                                                    |
+| [6851]   | MOVE: atomic message move extension                                                                                                                                                                           |
+| [7162]   | CONDSTORE / QRESYNC: CHANGEDSINCE / VANISHED FETCH modifiers and CONDSTORE / QRESYNC SELECT and EXAMINE parameters for fast incremental resync (obsoletes RFC 4551 CONDSTORE and original RFC 5162 QRESYNC)   |
+| [7628]   | OAUTHBEARER: OAuth 2.0 bearer token SASL mechanism; also XOAUTH2                                                                                                                                              |
+| [7677]   | SCRAM-SHA-256: SASL SCRAM-SHA-256 mechanism (feature `scram`)                                                                                                                                                 |
 
 [2177]: https://www.rfc-editor.org/rfc/rfc2177
 [2971]: https://www.rfc-editor.org/rfc/rfc2971
@@ -52,6 +53,7 @@ This library implements IMAP as I/O-agnostic coroutines: no sockets, no async ru
 [5161]: https://www.rfc-editor.org/rfc/rfc5161
 [5256]: https://www.rfc-editor.org/rfc/rfc5256
 [6851]: https://www.rfc-editor.org/rfc/rfc6851
+[7162]: https://www.rfc-editor.org/rfc/rfc7162
 [7628]: https://www.rfc-editor.org/rfc/rfc7628
 [7677]: https://www.rfc-editor.org/rfc/rfc7677
 

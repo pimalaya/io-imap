@@ -8,108 +8,47 @@
 
 use core::num::NonZeroU32;
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
     imap_types::{
         command::{Command, CommandBody},
-        core::Vec1,
-        fetch::MessageDataItem,
-        flag::{Flag, FlagPerm},
         mailbox::Mailbox,
         response::{Code, Data, StatusBody, StatusKind, Tagged},
         sequence::SequenceSet,
     },
 };
-use thiserror::Error;
 
 use crate::{
     context::{ImapContext, ImapCurrentMailboxState},
-    rfc3501::mailbox::encode_inplace,
+    rfc3501::{
+        mailbox::encode_inplace,
+        select::{ImapMailboxSelectError, ImapMailboxSelectResult, SelectData, SelectFetch},
+    },
     send::*,
 };
 
-/// Errors that can occur during the coroutine progression.
-#[derive(Clone, Debug, Error)]
-pub enum ImapMailboxSelectError {
-    #[error("IMAP SELECT NO error: {0}")]
-    No(String),
-    #[error("IMAP SELECT BAD error: {0}")]
-    Bad(String),
-    #[error("IMAP SELECT BYE error: {0}")]
-    Bye(String),
+pub type ImapMailboxExamineError = ImapMailboxSelectError;
+pub type ImapMailboxExamineResult = ImapMailboxSelectResult;
+pub type ExamineData = SelectData;
+pub type ExamineFetch = SelectFetch;
 
-    #[error("No IMAP SELECT tagged response returned by the server")]
-    MissingTagged,
-
-    #[error("Send IMAP SELECT command error")]
-    Send(#[from] SendImapCommandError),
-}
-
-/// Data collected from a SELECT or EXAMINE response.
-///
-/// `highest_mod_seq`, `vanished_earlier`, and `changed` populate only
-/// when CONDSTORE / QRESYNC was requested via a
-/// [`SelectParameter`](imap_codec::imap_types::command::SelectParameter);
-/// the base SELECT call returns them empty.
-#[derive(Clone, Debug, Default)]
-pub struct SelectData {
-    pub flags: Option<Vec<Flag<'static>>>,
-    pub exists: Option<u32>,
-    pub recent: Option<u32>,
-    pub unseen: Option<NonZeroU32>,
-    pub permanent_flags: Option<Vec<FlagPerm<'static>>>,
-    pub uid_next: Option<NonZeroU32>,
-    pub uid_validity: Option<NonZeroU32>,
-    /// `[HIGHESTMODSEQ n]` from the OK response, when CONDSTORE /
-    /// QRESYNC was requested or the server volunteers it.
-    pub highest_mod_seq: Option<u64>,
-    /// UIDs reported by an implicit `* VANISHED (EARLIER) <uid-set>`
-    /// response (QRESYNC only).
-    pub vanished_earlier: Vec<NonZeroU32>,
-    /// Implicit `* FETCH` payloads emitted by the server as part of
-    /// the QRESYNC resync.
-    pub changed: Vec<SelectFetch>,
-}
-
-/// One implicit `* FETCH` returned during SELECT (QRESYNC) for a
-/// message whose flags / mod-sequence changed since the checkpoint.
-#[derive(Clone, Debug)]
-pub struct SelectFetch {
-    pub seq: NonZeroU32,
-    pub items: Vec1<MessageDataItem<'static>>,
-}
-
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxSelectResult {
-    Ok {
-        context: ImapContext,
-        data: SelectData,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxSelectError,
-    },
-}
-
-/// I/O-free coroutine to send an IMAP SELECT or EXAMINE command.
-pub struct ImapMailboxSelect {
-    pub(crate) select_state: ImapCurrentMailboxState,
+/// I/O-free coroutine to send an IMAP EXAMINE or EXAMINE command.
+pub struct ImapMailboxExamine {
+    pub(crate) examine_state: ImapCurrentMailboxState,
     pub(crate) send: SendImapCommand<CommandCodec>,
 }
 
-impl ImapMailboxSelect {
-    /// Creates a new coroutine for SELECT with no parameters.
+impl ImapMailboxExamine {
+    /// Creates a new coroutine for EXAMINE with no parameters.
     pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
         // Stash the decoded form for the context, then encode the
         // copy that goes on the wire.
-        let select_state = ImapCurrentMailboxState::Selected(mailbox.clone());
+        let examine_state = ImapCurrentMailboxState::Selected(mailbox.clone());
         encode_inplace(&mut mailbox);
 
-        let body = CommandBody::Select {
+        let body = CommandBody::Examine {
             mailbox,
             parameters: vec![],
         };
@@ -118,17 +57,17 @@ impl ImapMailboxSelect {
         let command = Command::new(context.generate_tag(), body).unwrap();
 
         Self {
-            select_state,
+            examine_state,
             send: SendImapCommand::new(context, CommandCodec::new(), command),
         }
     }
 
     /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxSelectResult {
+    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxExamineResult {
         let (mut context, data, untagged, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxSelectResult::WantsRead,
+            SendImapCommandResult::WantsRead => return ImapMailboxExamineResult::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxSelectResult::WantsWrite(bytes);
+                return ImapMailboxExamineResult::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
                 context,
@@ -139,7 +78,7 @@ impl ImapMailboxSelect {
                 ..
             } => (context, data, untagged, tagged, bye),
             SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxSelectResult::Err {
+                return ImapMailboxExamineResult::Err {
                     context,
                     err: err.into(),
                 };
@@ -147,16 +86,16 @@ impl ImapMailboxSelect {
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxSelectError::Bye(bye.text.to_string());
-            return ImapMailboxSelectResult::Err { context, err };
+            let err = ImapMailboxExamineError::Bye(bye.text.to_string());
+            return ImapMailboxExamineResult::Err { context, err };
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxSelectError::MissingTagged;
-            return ImapMailboxSelectResult::Err { context, err };
+            let err = ImapMailboxExamineError::MissingTagged;
+            return ImapMailboxExamineResult::Err { context, err };
         };
 
-        let mut output = SelectData::default();
+        let mut output = ExamineData::default();
 
         for data in data {
             match data {
@@ -164,7 +103,7 @@ impl ImapMailboxSelect {
                 Data::Exists(count) => output.exists = Some(count),
                 Data::Recent(count) => output.recent = Some(count),
                 Data::Fetch { seq, items } => {
-                    output.changed.push(SelectFetch { seq, items });
+                    output.changed.push(ExamineFetch { seq, items });
                 }
                 Data::Vanished {
                     earlier,
@@ -193,7 +132,7 @@ impl ImapMailboxSelect {
 
         match body.kind {
             StatusKind::Ok => {
-                context.mailbox = self.select_state.clone();
+                context.mailbox = self.examine_state.clone();
                 context.flags = output
                     .flags
                     .clone()
@@ -206,18 +145,18 @@ impl ImapMailboxSelect {
                     .unwrap_or_default()
                     .into_iter()
                     .collect();
-                ImapMailboxSelectResult::Ok {
+                ImapMailboxExamineResult::Ok {
                     context,
                     data: output,
                 }
             }
-            StatusKind::No => ImapMailboxSelectResult::Err {
+            StatusKind::No => ImapMailboxExamineResult::Err {
                 context,
-                err: ImapMailboxSelectError::No(body.text.to_string()),
+                err: ImapMailboxExamineError::No(body.text.to_string()),
             },
-            StatusKind::Bad => ImapMailboxSelectResult::Err {
+            StatusKind::Bad => ImapMailboxExamineResult::Err {
                 context,
-                err: ImapMailboxSelectError::Bad(body.text.to_string()),
+                err: ImapMailboxExamineError::Bad(body.text.to_string()),
             },
         }
     }

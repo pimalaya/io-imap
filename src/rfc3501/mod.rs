@@ -5,6 +5,7 @@ pub mod close;
 pub mod copy;
 pub mod create;
 pub mod delete;
+pub mod examine;
 pub mod expunge;
 pub mod fetch;
 pub mod greeting;

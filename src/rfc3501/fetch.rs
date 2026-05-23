@@ -53,7 +53,7 @@ pub enum ImapMessageFetchResult {
 
 /// I/O-free coroutine to send an IMAP FETCH command.
 pub struct ImapMessageFetch {
-    send: SendImapCommand<CommandCodec>,
+    pub(crate) send: SendImapCommand<CommandCodec>,
 }
 
 impl ImapMessageFetch {

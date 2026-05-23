@@ -18,6 +18,7 @@ pub mod rfc4315;
 pub mod rfc5161;
 pub mod rfc5256;
 pub mod rfc6851;
+pub mod rfc7162;
 pub mod rfc7628;
 #[cfg(feature = "scram")]
 pub mod rfc7677;

@@ -13,7 +13,7 @@
 //! [`new`]: ImapClientStd::new
 //! [`connect`]: ImapClientStd::connect
 
-use core::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroU64};
 
 #[cfg(any(
     feature = "rustls-aws",
@@ -25,6 +25,7 @@ use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
 use std::io::{self, Read, Write};
 
 use imap_codec::imap_types::{
+    command::SelectParameter,
     core::{IString, NString, Vec1},
     datetime::DateTime,
     extensions::{
@@ -72,9 +73,10 @@ use crate::{
     context::ImapContext,
     rfc2971::id::*,
     rfc3501::{
-        append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, expunge::*,
-        fetch::*, greeting::*, list::*, login::*, logout::*, lsub::*, noop::*, rename::*,
-        search::*, select::*, starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
+        append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, examine::*,
+        expunge::*, fetch::*, greeting::*, list::*, login::*, logout::*, lsub::*, noop::*,
+        rename::*, search::*, select::*, starttls::*, status::*, store::*, subscribe::*,
+        unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc5161::enable::*,
@@ -207,6 +209,11 @@ pub enum ImapClientStdError {
 
     #[error("IMAP client missing context (poisoned by a prior error)")]
     MissingContext,
+
+    #[error("IMAP server does not advertise QRESYNC capability")]
+    QresyncNotSupported,
+    #[error("Invalid mod-sequence value: 0")]
+    InvalidModSeq,
 }
 
 /// Run a coroutine to completion against `$self.stream`. The destructure
@@ -279,6 +286,15 @@ impl<S: Read + Write> ImapClientStd<S> {
     /// Returns the current session context, if any.
     pub fn context(&self) -> Option<&ImapContext> {
         self.context.as_ref()
+    }
+
+    /// Returns the cached CAPABILITY list, or [`None`] if CAPABILITY
+    /// has not run yet (no greeting / login / explicit `CAPABILITY`).
+    pub fn capabilities(&self) -> Option<&[Capability<'static>]> {
+        self.context
+            .as_ref()
+            .map(|ctx| ctx.capability.as_slice())
+            .filter(|caps| !caps.is_empty())
     }
 
     /// Returns a shared reference to the underlying stream.
@@ -678,12 +694,56 @@ impl<S: Read + Write> ImapClientStd<S> {
         );
     }
 
-    /// Runs [`ImapMailboxSelect::read_only`] (`EXAMINE <mailbox>`).
+    /// Runs [`ImapMailboxExamine`] (`EXAMINE <mailbox>`).
     pub fn examine(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
         let context = self.take_context()?;
         coroutine!(
             self,
-            ImapMailboxSelect::read_only(context, mailbox),
+            ImapMailboxExamine::new(context, mailbox),
+            ImapMailboxExamineResult,
+            { data, .. } => data
+        );
+    }
+
+    /// Runs `SELECT <mailbox> (QRESYNC (<uidvalidity>
+    /// <highestmodseq>))` (RFC 7162). Delegates to
+    /// [`ImapMailboxSelect::with_parameters`]; the returned
+    /// [`SelectData`] carries the usual SELECT fields plus
+    /// `highest_mod_seq`, `vanished_earlier`, and `changed`. Errors
+    /// with [`ImapClientStdError::QresyncNotSupported`] when the
+    /// cached CAPABILITY list does not advertise QRESYNC, or with
+    /// [`ImapClientStdError::InvalidModSeq`] when `highest_mod_seq`
+    /// is 0.
+    pub fn select_qresync(
+        &mut self,
+        mailbox: Mailbox<'static>,
+        uid_validity: NonZeroU32,
+        highest_mod_seq: u64,
+    ) -> Result<SelectData, ImapClientStdError> {
+        let supports_qresync = self
+            .capabilities()
+            .map(|caps| caps.contains(&Capability::QResync))
+            .unwrap_or(false);
+
+        if !supports_qresync {
+            return Err(ImapClientStdError::QresyncNotSupported);
+        }
+
+        let Some(highest_mod_seq) = NonZeroU64::new(highest_mod_seq) else {
+            return Err(ImapClientStdError::InvalidModSeq);
+        };
+
+        let context = self.take_context()?;
+        let parameters = vec![SelectParameter::QResync {
+            uid_validity,
+            mod_sequence_value: highest_mod_seq,
+            known_uids: None,
+            seq_match_data: None,
+        }];
+
+        coroutine!(
+            self,
+            ImapMailboxSelect::with_parameters(context, mailbox, parameters),
             ImapMailboxSelectResult,
             { data, .. } => data
         );
