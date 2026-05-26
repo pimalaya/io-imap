@@ -255,10 +255,17 @@ macro_rules! coroutine {
 
 /// Std-blocking IMAP client wrapping a single `Read + Write` stream
 /// plus the long-lived [`ImapContext`].
+///
+/// `auto_select` is a public flag downstream wrappers read to decide whether
+/// to auto-issue a SELECT before each per-op command (STORE, FETCH, COPY, …).
+/// Default is `true`: per-op wrappers (io-email) self-select so the shared API
+/// works without a separate pre-select call. Sync engines (neverest) flip
+/// this off and pre-select once per mailbox batch to avoid a SELECT per hunk.
 #[derive(Debug)]
 pub struct ImapClientStd<S: Read + Write> {
     stream: S,
     context: Option<ImapContext>,
+    pub auto_select: bool,
 }
 
 impl<S: Read + Write> ImapClientStd<S> {
@@ -280,6 +287,7 @@ impl<S: Read + Write> ImapClientStd<S> {
         Self {
             stream,
             context: Some(context),
+            auto_select: true,
         }
     }
 
