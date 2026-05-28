@@ -325,10 +325,26 @@ impl<S: Read + Write> ImapClientStd<S> {
         (self.stream, self.context)
     }
 
-    fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
+    /// Moves the inner context out without consuming the client. Use
+    /// when handing the context to a coroutine the client does not
+    /// wrap directly (for example IDLE), and pair with
+    /// [`put_context`] to restore the client once the coroutine
+    /// returns.
+    ///
+    /// [`put_context`]: ImapClientStd::put_context
+    pub fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
         self.context
             .take()
             .ok_or(ImapClientStdError::MissingContext)
+    }
+
+    /// Re-installs a context previously extracted via
+    /// [`take_context`]. The client regains its full session state and
+    /// can be used normally again.
+    ///
+    /// [`take_context`]: ImapClientStd::take_context
+    pub fn put_context(&mut self, context: ImapContext) {
+        self.context = Some(context);
     }
 
     // ---- Session lifecycle ------------------------------------------------
