@@ -1,6 +1,7 @@
 use std::{
     env,
     io::{ErrorKind::*, Read, Write},
+    sync::{Arc, atomic::AtomicBool, atomic::Ordering},
     time::Duration,
 };
 
@@ -86,7 +87,7 @@ fn main() {
         }
     };
 
-    let idle = ImapIdleDone::new();
+    let idle = Arc::new(AtomicBool::new(false));
     let mut coroutine = ImapIdle::new(context, idle.clone());
     let mut arg: Option<Vec<u8>> = None;
 
@@ -100,7 +101,7 @@ fn main() {
         let idle = idle.clone();
         move || {
             println!("CTRL-C received, waiting for read to time out…");
-            idle.done()
+            idle.store(true, Ordering::SeqCst)
         }
     })
     .unwrap();
@@ -117,7 +118,7 @@ fn main() {
                 // 4. check for WouldBlock and TimedOut error
                 Err(err) if err.kind() == WouldBlock || err.kind() == TimedOut => {
                     // signal done so the coroutine transitions to IDLE DONE on next resume
-                    idle.done();
+                    idle.store(true, Ordering::SeqCst);
                 }
                 Err(err) => panic!("{err:?}"),
             },
@@ -129,7 +130,7 @@ fn main() {
                 println!("received IDLE data: {data:?}");
                 println!("received IDLE untagged: {untagged:?}");
                 // reset done flag so IDLE continues
-                idle.reset();
+                idle.store(false, Ordering::SeqCst);
             }
             ImapIdleResult::Ok { .. } => break,
             ImapIdleResult::Err { err, .. } => panic!("{err}"),

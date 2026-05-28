@@ -85,14 +85,19 @@ pub enum ImapIdleResult {
 enum State {
     /// Send the IDLE command and await the continuation request.
     Idle(SendImapCommand<CommandCodec>),
-    /// Read unilateral responses until [`ImapIdleDone::done`] is set
-    /// or the timeout elapses.
+    /// Read unilateral responses until the shutdown flag is set or the
+    /// internal refresh timeout elapses.
     Read,
     /// Send the DONE command and await the tagged response.
     Done(SendImapCommand<IdleDoneCodec>),
 }
 
 /// I/O-free coroutine to watch IMAP mailbox changes via IDLE.
+///
+/// Shutdown is cooperative: the caller flips the [`AtomicBool`]
+/// handed to [`ImapIdle::new`], the coroutine reads it on its next
+/// loop iteration and transitions from `Read` to `Done`, sending
+/// `DONE` cleanly before exiting.
 pub struct ImapIdle {
     context: Option<ImapContext>,
     state: State,
@@ -101,14 +106,19 @@ pub struct ImapIdle {
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
     bye: Option<Bye<'static>>,
-    idle: ImapIdleDone,
+    done: Arc<AtomicBool>,
     #[cfg(feature = "client")]
     timer: Option<Instant>,
 }
 
 impl ImapIdle {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, done: ImapIdleDone) -> Self {
+    ///
+    /// `done` is the shared shutdown flag: flip it to `true` to ask
+    /// the coroutine to wind down at its next chance (sends `DONE`
+    /// and returns [`ImapIdleResult::Ok`]). Pass `Arc::new(AtomicBool::new(false))`
+    /// when no external shutdown is needed.
+    pub fn new(mut context: ImapContext, done: Arc<AtomicBool>) -> Self {
         // SAFETY: tag is always valid
         let command = Command::new(context.generate_tag(), CommandBody::Idle).unwrap();
         let state = State::Idle(SendImapCommand::new(context, CommandCodec::new(), command));
@@ -121,7 +131,7 @@ impl ImapIdle {
             data: Vec::new(),
             untagged: Vec::new(),
             bye: None,
-            idle: done,
+            done,
             #[cfg(feature = "client")]
             timer: None,
         }
@@ -185,7 +195,7 @@ impl ImapIdle {
                     self.state = State::Read;
                 }
                 State::Read => {
-                    let done = self.idle.is_done();
+                    let done = self.done.load(Ordering::SeqCst);
                     #[cfg(feature = "client")]
                     let timed_out = self
                         .timer
@@ -356,32 +366,5 @@ impl ImapIdle {
                 }
             }
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ImapIdleDone(Arc<AtomicBool>);
-
-impl ImapIdleDone {
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    pub fn reset(&self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-
-    pub fn done(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for ImapIdleDone {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -13,7 +13,18 @@
 //! [`new`]: ImapClientStd::new
 //! [`connect`]: ImapClientStd::connect
 
-use core::num::{NonZeroU32, NonZeroU64};
+use core::{
+    num::{NonZeroU32, NonZeroU64},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+use std::{
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    },
+    thread::{self, JoinHandle},
+};
 
 #[cfg(any(
     feature = "rustls-aws",
@@ -21,7 +32,7 @@ use core::num::{NonZeroU32, NonZeroU64};
     feature = "native-tls"
 ))]
 use alloc::string::{String, ToString};
-use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
 use std::io::{self, Read, Write};
 
 use imap_codec::imap_types::{
@@ -84,6 +95,9 @@ use crate::{
     rfc6851::r#move::*,
     rfc7628::{auth_oauthbearer::*, auth_xoauth2::*},
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*},
+    watch::{
+        ImapMailboxWatch, ImapMailboxWatchError, ImapMailboxWatchEvent, ImapMailboxWatchResult,
+    },
 };
 
 const READ_BUFFER_SIZE: usize = 16 * 1024;
@@ -146,6 +160,8 @@ pub enum ImapClientStdError {
     MailboxUnsubscribe(#[from] ImapMailboxUnsubscribeError),
     #[error(transparent)]
     MailboxSelect(#[from] ImapMailboxSelectError),
+    #[error(transparent)]
+    MailboxWatch(#[from] ImapMailboxWatchError),
     #[error(transparent)]
     MailboxClose(#[from] ImapMailboxCloseError),
     #[error(transparent)]
@@ -325,26 +341,10 @@ impl<S: Read + Write> ImapClientStd<S> {
         (self.stream, self.context)
     }
 
-    /// Moves the inner context out without consuming the client. Use
-    /// when handing the context to a coroutine the client does not
-    /// wrap directly (for example IDLE), and pair with
-    /// [`put_context`] to restore the client once the coroutine
-    /// returns.
-    ///
-    /// [`put_context`]: ImapClientStd::put_context
-    pub fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
+    fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
         self.context
             .take()
             .ok_or(ImapClientStdError::MissingContext)
-    }
-
-    /// Re-installs a context previously extracted via
-    /// [`take_context`]. The client regains its full session state and
-    /// can be used normally again.
-    ///
-    /// [`take_context`]: ImapClientStd::take_context
-    pub fn put_context(&mut self, context: ImapContext) {
-        self.context = Some(context);
     }
 
     // ---- Session lifecycle ------------------------------------------------
@@ -943,6 +943,145 @@ impl<S: Read + Write> ImapClientStd<S> {
         );
     }
 }
+
+impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
+    /// Consumes the client and starts a long-running mailbox watcher.
+    ///
+    /// Spawns a thread that owns the IMAP connection and advances the
+    /// [`ImapMailboxWatch`] coroutine, forwarding each delta as one
+    /// [`ImapMailboxWatchEvent`] on the returned stream's mpsc
+    /// channel. Untagged-response wake-ups are resolved via SELECT
+    /// (QRESYNC). Dropping the stream (or calling
+    /// [`ImapMailboxWatchStream::close`]) flips the shutdown atomic;
+    /// the worker winds the running IDLE down cleanly and exits.
+    ///
+    /// Errors with [`ImapClientStdError::MailboxWatch`] +
+    /// `ImapMailboxWatchError::QresyncUnsupported` when the cached
+    /// CAPABILITY list does not advertise QRESYNC.
+    pub fn watch_mailbox(
+        mut self,
+        mailbox: Mailbox<'static>,
+    ) -> Result<ImapMailboxWatchStream, ImapClientStdError> {
+        let context = self.take_context()?;
+        let mut stream: Box<dyn ImapStream> = Box::new(self.stream);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut watcher = ImapMailboxWatch::new(context, mailbox, shutdown.clone())?;
+
+        let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientStdError>>(256);
+        let shutdown_handle = shutdown.clone();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; READ_BUFFER_SIZE];
+            let mut arg: Option<Vec<u8>> = None;
+
+            loop {
+                match watcher.resume(arg.as_deref()) {
+                    ImapMailboxWatchResult::Event(e) => {
+                        arg = None;
+                        if tx.send(Ok(e)).is_err() {
+                            return;
+                        }
+                    }
+                    ImapMailboxWatchResult::Ok { .. } => return,
+                    ImapMailboxWatchResult::WantsRead => match stream.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = tx.send(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "IMAP server closed the connection during watch",
+                            )
+                            .into()));
+                            return;
+                        }
+                        Ok(n) => arg = Some(buf[..n].to_vec()),
+                        Err(err) => {
+                            let _ = tx.send(Err(err.into()));
+                            return;
+                        }
+                    },
+                    ImapMailboxWatchResult::WantsWrite(bytes) => {
+                        if let Err(err) = stream.write_all(&bytes) {
+                            let _ = tx.send(Err(err.into()));
+                            return;
+                        }
+                        arg = None;
+                    }
+                    ImapMailboxWatchResult::Err { err, .. } => {
+                        let _ = tx.send(Err(err.into()));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ImapMailboxWatchStream {
+            rx,
+            handle: Some(handle),
+            shutdown: shutdown_handle,
+        })
+    }
+}
+
+/// Long-lived [`ImapMailboxWatchEvent`] stream backed by a background
+/// worker thread that owns the IMAP connection. Drop or
+/// [`Self::close`] to wind it down; the worker observes the shutdown
+/// atomic, sends `IDLE DONE`, returns its context and exits.
+pub struct ImapMailboxWatchStream {
+    rx: Receiver<Result<ImapMailboxWatchEvent, ImapClientStdError>>,
+    handle: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ImapMailboxWatchStream {
+    /// Non-blocking probe for the next event.
+    pub fn try_recv(
+        &self,
+    ) -> Result<Result<ImapMailboxWatchEvent, ImapClientStdError>, TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Waits up to `timeout` for the next event.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Result<ImapMailboxWatchEvent, ImapClientStdError>, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    /// Signals the worker to stop and joins it. Returns within the
+    /// IDLE refresh window (typically a few seconds).
+    pub fn close(mut self) -> Result<(), ImapClientStdError> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("IMAP watch worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for ImapMailboxWatchStream {
+    type Item = Result<ImapMailboxWatchEvent, ImapClientStdError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx.recv().ok()
+    }
+}
+
+impl Drop for ImapMailboxWatchStream {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Marker for every blocking, `Send` stream the watcher can run
+/// against; auto-implemented for any concrete `Read + Write + Send`
+/// type. Mirrors the same pattern as
+/// [`io_http::client::HttpClientStd`].
+trait ImapStream: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> ImapStream for T {}
 
 #[cfg(any(
     feature = "rustls-aws",

@@ -24,6 +24,7 @@ pub mod rfc7628;
 pub mod rfc7677;
 pub mod sasl;
 pub mod send;
+pub mod watch;
 
 pub use imap_codec as codec;
 pub use imap_codec::imap_types as types;
