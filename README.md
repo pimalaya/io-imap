@@ -17,6 +17,7 @@ This library is composed of 3 feature-gated layers:
   - [Light client](#light-client)
   - [Full client](#full-client)
 - [Examples](#examples)
+- [AI disclosure](#ai-disclosure)
 - [License](#license)
 - [Social](#social)
 - [Sponsoring](#sponsoring)
@@ -207,13 +208,33 @@ The `sasl` argument is `Option<impl Into<Sasl>>`, so any of the per-mechanism st
 
 See complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).
 
-Have a look at real-world projects built on top of this library:
+Have also a look at real-world projects built on top of this library:
 
 - [Himalaya CLI](https://github.com/pimalaya/himalaya): CLI to manage emails
 - [Himalaya TUI](https://github.com/pimalaya/himalaya-tui): TUI to manage emails
 - [Neverest](https://github.com/pimalaya/neverest): CLI to synchronize emails
 - [Mirador](https://github.com/pimalaya/mirador): CLI to watch mailbox changes and fire hooks on every event
 - [Sirup](https://github.com/pimalaya/sirup): CLI to spawn pre-authenticated IMAP/SMTP sessions and expose them via Unix sockets
+
+## AI disclosure
+
+This project is developed with AI assistance. This section documents how, so users and downstream packagers can make informed decisions.
+
+- **Tools**: Claude Code (Anthropic), Opus 4.7, invoked locally with a persistent project-scoped memory and a small set of repo-specific rules.
+
+- **Used for**: Refactors, mechanical multi-file edits, boilerplate (feature gates, error enums, derive macros, trait impls), test scaffolding, doc polish, exploratory design conversations.
+
+- **Not used for**: Engineering, critical code, git manipulation (commit, merge, rebase…), real-world tests.
+
+- **Verification**: Every AI-assisted change is read, compiled, tested, and formatted before commit (`nix develop --command cargo check / cargo test / cargo
+fmt`). Behavioural correctness is verified against the relevant RFC or upstream spec, not assumed from the model output. Tests are never adjusted to fit
+AI-generated code; the code is adjusted to fit correct behaviour.
+
+- **Limitations**: AI models occasionally produce code that compiles and passes tests but is subtly wrong: off-by-one errors, missed edge cases, plausible
+but nonexistent APIs, stale RFC references. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken
+seriously.
+
+- **Last reviewed**: 29/05/2026
 
 ## License
 
