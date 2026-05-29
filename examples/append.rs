@@ -5,7 +5,8 @@ use std::{
 
 use imap_codec::imap_types::{core::Literal, extensions::binary::LiteralOrLiteral8};
 use io_imap::{
-    context::ImapContext,
+    codec::fragmentizer::Fragmentizer,
+    coroutine::*,
     rfc3501::{append::*, greeting::*, login::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
@@ -28,67 +29,66 @@ fn main() {
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
 
     let mut buf = [0u8; 16 * 1024];
+    let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 
-    let mut context = ImapContext::new();
-    let mut coroutine = ImapGreetingGet::new(context, true);
+    let mut coroutine = ImapGreetingGet::new(true);
     let mut arg: Option<&[u8]> = None;
 
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::Ok { context } => break context,
-            ImapGreetingGetResult::WantsRead => {
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(_) => break,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingGetResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
+            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
-    };
+    }
 
     let params = ImapLoginParams::new(user, SecretString::from(pass)).unwrap();
-    let mut coroutine = ImapLogin::new(context, params, true);
+    let mut coroutine = ImapLogin::new(params, true);
     let mut arg: Option<&[u8]> = None;
 
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapLoginResult::Ok { context } => break context,
-            ImapLoginResult::WantsRead => {
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(_) => break,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapLoginResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapLoginResult::Err { err, .. } => panic!("{err}"),
+            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
-    };
+    }
 
-    let mut coroutine = ImapMailboxSelect::new(context, "INBOX".try_into().unwrap());
+    let mut coroutine = ImapMailboxSelect::new("INBOX".try_into().unwrap());
     let mut arg: Option<&[u8]> = None;
 
-    let (data, mut context) = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMailboxSelectResult::Ok { context, data } => break (data, context),
-            ImapMailboxSelectResult::WantsRead => {
+    let data = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(data) => break data,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapMailboxSelectResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapMailboxSelectResult::Err { err, .. } => panic!("{err:?}"),
+            ImapCoroutineState::Err(err) => panic!("{err:?}"),
         }
     };
 
     println!("select: {data:#?}");
 
     let mut coroutine = ImapMessageAppend::new(
-        context,
         mbox.try_into().unwrap(),
         Default::default(),
         None,
@@ -97,29 +97,19 @@ fn main() {
     let mut arg: Option<&[u8]> = None;
 
     let exists = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMessageAppendResult::Ok {
-                context: ctx,
-                exists,
-                ..
-            } => {
-                context = ctx;
-                break exists;
-            }
-            ImapMessageAppendResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done((exists, _appenduid)) => break exists,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapMessageAppendResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapMessageAppendResult::Err { err, .. } => panic!("{err:?}"),
+            ImapCoroutineState::Err(err) => panic!("{err:?}"),
         }
     };
 
     println!("exists: {exists:#?}");
-
-    println!();
-    println!("context: {context:#?}");
 }

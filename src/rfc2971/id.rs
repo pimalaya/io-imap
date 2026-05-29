@@ -4,15 +4,17 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::{IString, NString},
+        core::{IString, NString, TagGenerator},
         response::{Data, StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -31,20 +33,6 @@ pub enum ImapServerIdError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapServerIdResult {
-    Ok {
-        context: ImapContext,
-        server_id: Option<Vec<(IString<'static>, NString<'static>)>>,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapServerIdError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP ID command.
 pub struct ImapServerId {
     send: SendImapCommand<CommandCodec>,
@@ -52,52 +40,46 @@ pub struct ImapServerId {
 
 impl ImapServerId {
     /// Creates a new coroutine.
-    pub fn new(
-        mut context: ImapContext,
-        parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
-    ) -> Self {
+    pub fn new(parameters: Option<Vec<(IString<'static>, NString<'static>)>>) -> Self {
         let body = CommandBody::Id { parameters };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapServerIdResult {
-        let (context, data, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapServerIdResult::WantsRead,
+impl ImapCoroutine for ImapServerId {
+    type Output = Option<Vec<(IString<'static>, NString<'static>)>>;
+    type Error = ImapServerIdError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapServerIdResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
-                data,
-                tagged,
-                bye,
-                ..
-            } => (context, data, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapServerIdResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+                data, tagged, bye, ..
+            } => (data, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapServerIdError::Bye(bye.text.to_string());
-            return ImapServerIdResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapServerIdError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapServerIdError::MissingTagged;
-            return ImapServerIdResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapServerIdError::MissingTagged);
         };
 
         let mut server_id = None;
-
         for data in data {
             if let Data::Id { parameters } = data {
                 server_id = parameters;
@@ -105,15 +87,11 @@ impl ImapServerId {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapServerIdResult::Ok { context, server_id },
-            StatusKind::No => ImapServerIdResult::Err {
-                context,
-                err: ImapServerIdError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapServerIdResult::Err {
-                context,
-                err: ImapServerIdError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(server_id),
+            StatusKind::No => ImapCoroutineState::Err(ImapServerIdError::No(body.text.to_string())),
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapServerIdError::Bad(body.text.to_string()))
+            }
         }
     }
 }

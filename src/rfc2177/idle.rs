@@ -15,10 +15,11 @@ use std::time::Instant;
 
 use imap_codec::{
     CommandCodec, IdleDoneCodec, ResponseCodec,
-    fragmentizer::{DecodeMessageError, FragmentInfo},
+    fragmentizer::{DecodeMessageError, FragmentInfo, Fragmentizer},
     imap_types::{
         IntoStatic,
         command::{Command, CommandBody},
+        core::TagGenerator,
         extensions::idle::IdleDone,
         response::{Bye, Data, Response, Status, StatusBody, StatusKind, Tagged},
         secret::Secret,
@@ -28,7 +29,7 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::send::*;
 
 #[cfg(feature = "client")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
@@ -71,15 +72,10 @@ pub enum ImapIdleResult {
         untagged: Vec<StatusBody<'static>>,
         data: Vec<Data<'static>>,
     },
-    Ok {
-        context: ImapContext,
-    },
+    Ok,
     WantsRead,
     WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapIdleError,
-    },
+    Err(ImapIdleError),
 }
 
 enum State {
@@ -99,7 +95,7 @@ enum State {
 /// loop iteration and transitions from `Read` to `Done`, sending
 /// `DONE` cleanly before exiting.
 pub struct ImapIdle {
-    context: Option<ImapContext>,
+    tag: TagGenerator,
     state: State,
     wants_read: bool,
     codec: ResponseCodec,
@@ -118,13 +114,14 @@ impl ImapIdle {
     /// the coroutine to wind down at its next chance (sends `DONE`
     /// and returns [`ImapIdleResult::Ok`]). Pass `Arc::new(AtomicBool::new(false))`
     /// when no external shutdown is needed.
-    pub fn new(mut context: ImapContext, done: Arc<AtomicBool>) -> Self {
+    pub fn new(done: Arc<AtomicBool>) -> Self {
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), CommandBody::Idle).unwrap();
-        let state = State::Idle(SendImapCommand::new(context, CommandCodec::new(), command));
+        let command = Command::new(tag.generate(), CommandBody::Idle).unwrap();
+        let state = State::Idle(SendImapCommand::new(CommandCodec::new(), command));
 
         Self {
-            context: None, // context is owned by the state
+            tag,
             state,
             wants_read: false,
             codec: ResponseCodec::new(),
@@ -138,7 +135,11 @@ impl ImapIdle {
     }
 
     /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapIdleResult {
+    pub fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapIdleResult {
         #[cfg(feature = "client")]
         if self.timer.is_none() {
             self.timer = Some(Instant::now());
@@ -151,29 +152,24 @@ impl ImapIdle {
 
             match &mut self.state {
                 State::Idle(coroutine) => {
-                    let (context, tagged, cr, bye) = match coroutine.resume(arg.take()) {
+                    let (tagged, cr, bye) = match coroutine.resume(fragmentizer, arg.take()) {
                         SendImapCommandResult::WantsRead => return ImapIdleResult::WantsRead,
                         SendImapCommandResult::WantsWrite(bytes) => {
                             return ImapIdleResult::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             tagged,
                             continuation_request,
                             bye,
                             ..
-                        } => (context, tagged, continuation_request, bye),
-                        SendImapCommandResult::Err { context, err } => {
-                            return ImapIdleResult::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (tagged, continuation_request, bye),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapIdleResult::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapIdleError::Bye(bye.text.to_string());
-                        return ImapIdleResult::Err { context, err };
+                        return ImapIdleResult::Err(ImapIdleError::Bye(bye.text.to_string()));
                     }
 
                     if let Some(Tagged { body, .. }) = tagged {
@@ -183,15 +179,13 @@ impl ImapIdle {
                             StatusKind::No => ImapIdleError::No(text),
                             StatusKind::Bad => ImapIdleError::Bad(text),
                         };
-                        return ImapIdleResult::Err { context, err };
+                        return ImapIdleResult::Err(err);
                     }
 
                     if cr.is_none() {
-                        let err = ImapIdleError::ContinuationRequest;
-                        return ImapIdleResult::Err { context, err };
+                        return ImapIdleResult::Err(ImapIdleError::ContinuationRequest);
                     }
 
-                    self.context = Some(context);
                     self.state = State::Read;
                 }
                 State::Read => {
@@ -208,30 +202,18 @@ impl ImapIdle {
                     if done || timed_out {
                         trace!("idle done: {done}");
                         trace!("idle timed out: {timed_out}");
-                        // SAFETY: context is set when entering Read state
-                        let context = self.context.take().unwrap();
-                        self.state = State::Done(SendImapCommand::new(
-                            context,
-                            IdleDoneCodec::new(),
-                            IdleDone,
-                        ));
+                        self.state =
+                            State::Done(SendImapCommand::new(IdleDoneCodec::new(), IdleDone));
                         continue;
                     }
 
                     match arg.take() {
                         Some(&[]) => {
-                            // SAFETY: context is set when entering Read state
-                            let context = self.context.take().unwrap();
-                            return ImapIdleResult::Err {
-                                context,
-                                err: ImapIdleError::Eof,
-                            };
+                            return ImapIdleResult::Err(ImapIdleError::Eof);
                         }
                         Some(data) => {
-                            // SAFETY: context is set when entering Read state
-                            let context = self.context.as_mut().unwrap();
                             trace!("read bytes: {}", escape_byte_string(data));
-                            context.fragmentizer.enqueue_bytes(data);
+                            fragmentizer.enqueue_bytes(data);
                         }
                         None => {
                             self.wants_read = true;
@@ -239,20 +221,17 @@ impl ImapIdle {
                         }
                     }
 
-                    // SAFETY: context is set when entering Read state
-                    let context = self.context.as_mut().unwrap();
-
                     loop {
-                        match context.fragmentizer.progress() {
+                        match fragmentizer.progress() {
                             Some(info @ FragmentInfo::Line { .. }) => {
-                                let bytes = context.fragmentizer.fragment_bytes(info);
+                                let bytes = fragmentizer.fragment_bytes(info);
                                 trace!("read line fragment: {}", escape_byte_string(bytes));
 
-                                if !context.fragmentizer.is_message_complete() {
+                                if !fragmentizer.is_message_complete() {
                                     continue;
                                 }
 
-                                match context.fragmentizer.decode_message(&self.codec) {
+                                match fragmentizer.decode_message(&self.codec) {
                                     Ok(Response::Data(data)) => {
                                         self.data.push(data.into_static());
                                     }
@@ -269,7 +248,7 @@ impl ImapIdle {
                                         // ignore continuation request
                                     }
                                     Err(decode_err) => {
-                                        let bytes = context.fragmentizer.message_bytes();
+                                        let bytes = fragmentizer.message_bytes();
                                         let bytes = Secret::new(bytes.into());
                                         let err = match decode_err {
                                             DecodeMessageError::DecodingFailure(_)
@@ -283,13 +262,12 @@ impl ImapIdle {
                                                 ImapIdleError::MessageIsPoisoned(bytes)
                                             }
                                         };
-                                        let context = self.context.take().unwrap();
-                                        return ImapIdleResult::Err { context, err };
+                                        return ImapIdleResult::Err(err);
                                     }
                                 }
                             }
                             Some(info @ FragmentInfo::Literal { .. }) => {
-                                let bytes = context.fragmentizer.fragment_bytes(info);
+                                let bytes = fragmentizer.fragment_bytes(info);
                                 trace!("read literal fragment ({} bytes)", bytes.len());
                             }
                             None => {
@@ -302,33 +280,23 @@ impl ImapIdle {
                     }
                 }
                 State::Done(coroutine) => {
-                    let (mut context, tagged, bye) = match coroutine.resume(arg.take()) {
+                    let (tagged, bye) = match coroutine.resume(fragmentizer, arg.take()) {
                         SendImapCommandResult::WantsRead => return ImapIdleResult::WantsRead,
                         SendImapCommandResult::WantsWrite(bytes) => {
                             return ImapIdleResult::WantsWrite(bytes);
                         }
-                        SendImapCommandResult::Ok {
-                            context,
-                            tagged,
-                            bye,
-                            ..
-                        } => (context, tagged, bye),
-                        SendImapCommandResult::Err { context, err } => {
-                            return ImapIdleResult::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapIdleResult::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapIdleError::Bye(bye.text.to_string());
-                        return ImapIdleResult::Err { context, err };
+                        return ImapIdleResult::Err(ImapIdleError::Bye(bye.text.to_string()));
                     }
 
                     let Some(Tagged { body, .. }) = tagged else {
-                        let err = ImapIdleError::Tagged;
-                        return ImapIdleResult::Err { context, err };
+                        return ImapIdleResult::Err(ImapIdleError::Tagged);
                     };
 
                     #[cfg(feature = "client")]
@@ -345,22 +313,17 @@ impl ImapIdle {
                             trace!("reached timeout, starting a new IDLE command");
                             // SAFETY: tag is always valid
                             let command =
-                                Command::new(context.generate_tag(), CommandBody::Idle).unwrap();
-                            self.state = State::Idle(SendImapCommand::new(
-                                context,
-                                CommandCodec::new(),
-                                command,
-                            ));
+                                Command::new(self.tag.generate(), CommandBody::Idle).unwrap();
+                            self.state =
+                                State::Idle(SendImapCommand::new(CommandCodec::new(), command));
                             continue;
                         }
-                        StatusKind::Ok => ImapIdleResult::Ok { context },
+                        StatusKind::Ok => ImapIdleResult::Ok,
                         StatusKind::No => {
-                            let err = ImapIdleError::No(body.text.to_string());
-                            ImapIdleResult::Err { context, err }
+                            ImapIdleResult::Err(ImapIdleError::No(body.text.to_string()))
                         }
                         StatusKind::Bad => {
-                            let err = ImapIdleError::Bad(body.text.to_string());
-                            ImapIdleResult::Err { context, err }
+                            ImapIdleResult::Err(ImapIdleError::Bad(body.text.to_string()))
                         }
                     };
                 }

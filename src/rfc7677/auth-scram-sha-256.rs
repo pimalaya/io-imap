@@ -1,15 +1,18 @@
 //! I/O-free coroutine to authenticate via SCRAM-SHA-256 (RFC 7677).
 
+use core::mem;
+
 use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use imap_codec::{
     AuthenticateDataCodec, CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
-        core::Vec1,
+        core::TagGenerator,
         response::{
             Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
         },
@@ -21,7 +24,8 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::capability::*, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::capability::*, send::*};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -71,19 +75,6 @@ pub enum ImapAuthScramSha256Error {
     Capability(#[from] ImapCapabilityGetError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapAuthScramSha256Result {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapAuthScramSha256Error,
-    },
-}
-
 pub struct ImapAuthScramSha256Params {
     username: String,
     password: Secret<String>,
@@ -116,6 +107,7 @@ pub struct ImapAuthScramSha256 {
     password: Vec<u8>,
     client_first_bare: String,
     client_nonce: String,
+    observed: Vec<Capability<'static>>,
     expected_server_signature: Option<Vec<u8>>,
 }
 
@@ -223,7 +215,7 @@ fn extract_capabilities(
     tagged_body: StatusBody<'static>,
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
-) -> Result<Option<Vec1<Capability<'static>>>, ImapAuthScramSha256Error> {
+) -> Result<Vec<Capability<'static>>, ImapAuthScramSha256Error> {
     let code = match tagged_body.kind {
         StatusKind::Ok => tagged_body.code,
         StatusKind::No => {
@@ -252,7 +244,9 @@ fn extract_capabilities(
         }
     }
 
-    Ok(new_capability)
+    Ok(new_capability
+        .map(|c| c.into_iter().collect())
+        .unwrap_or_default())
 }
 
 impl ImapAuthScramSha256 {
@@ -260,11 +254,7 @@ impl ImapAuthScramSha256 {
     /// server did not piggyback a capability list on the AUTHENTICATE tagged
     /// response, the coroutine drives an extra `CAPABILITY` round-trip
     /// before completing.
-    pub fn new(
-        mut context: ImapContext,
-        params: ImapAuthScramSha256Params,
-        ensure_capabilities: bool,
-    ) -> Self {
+    pub fn new(params: ImapAuthScramSha256Params, ensure_capabilities: bool) -> Self {
         let client_nonce = generate_nonce();
         let escaped = escape_username(&params.username);
         let client_first_bare = format!("n={escaped},r={client_nonce}");
@@ -283,9 +273,10 @@ impl ImapAuthScramSha256 {
             initial_response,
         };
 
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
-        let send = SendImapCommand::new(context, CommandCodec::new(), command);
+        let command = Command::new(tag.generate(), body).unwrap();
+        let send = SendImapCommand::new(CommandCodec::new(), command);
 
         Self {
             state: State::SendAuthenticate(send),
@@ -294,6 +285,7 @@ impl ImapAuthScramSha256 {
             password: params.password.declassify().as_bytes().to_vec(),
             client_first_bare,
             client_nonce,
+            observed: Vec::new(),
             expected_server_signature: None,
         }
     }
@@ -302,7 +294,6 @@ impl ImapAuthScramSha256 {
     /// client-final-message.
     fn build_client_final(
         &mut self,
-        context: ImapContext,
         server_first_bytes: &[u8],
     ) -> Result<SendImapCommand<AuthenticateDataCodec>, ImapAuthScramSha256Error> {
         let server_first = String::from_utf8(server_first_bytes.to_vec())
@@ -330,11 +321,7 @@ impl ImapAuthScramSha256 {
         );
 
         let auth = AuthenticateData::r#continue(client_final.into_bytes());
-        Ok(SendImapCommand::new(
-            context,
-            AuthenticateDataCodec::new(),
-            auth,
-        ))
+        Ok(SendImapCommand::new(AuthenticateDataCodec::new(), auth))
     }
 
     /// Verifies the server-final-message contains a valid server
@@ -369,53 +356,57 @@ impl ImapAuthScramSha256 {
 
         Ok(())
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapAuthScramSha256Result {
+impl ImapCoroutine for ImapAuthScramSha256 {
+    type Output = Vec<Capability<'static>>;
+    type Error = ImapAuthScramSha256Error;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
         loop {
             match &mut self.state {
                 State::SendAuthenticate(send) => {
-                    let (context, bye, continuation_request) = match send.resume(arg.take()) {
+                    let (bye, continuation_request) = match send.resume(fragmentizer, arg.take()) {
                         SendImapCommandResult::WantsRead => {
-                            break ImapAuthScramSha256Result::WantsRead;
+                            return ImapCoroutineState::WantsRead;
                         }
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthScramSha256Result::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             bye,
                             continuation_request,
                             ..
-                        } => (context, bye, continuation_request),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthScramSha256Result::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (bye, continuation_request),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     let Some(cr) = continuation_request else {
-                        let err = ImapAuthScramSha256Error::MissingContinuationRequest;
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthScramSha256Error::MissingContinuationRequest,
+                        );
                     };
 
                     if self.ir {
                         // Continuation contains server-first-message
                         let challenge = match extract_challenge(cr) {
                             Ok(c) => c,
-                            Err(err) => {
-                                return ImapAuthScramSha256Result::Err { context, err };
-                            }
+                            Err(err) => return ImapCoroutineState::Err(err),
                         };
 
-                        let send = match self.build_client_final(context, &challenge) {
+                        let send = match self.build_client_final(&challenge) {
                             Ok(s) => s,
                             Err(_) => unreachable!(
                                 "build_client_final should not fail with valid server data"
@@ -428,50 +419,45 @@ impl ImapAuthScramSha256 {
                         let client_first = format!("n,,{}", self.client_first_bare);
                         let auth = AuthenticateData::r#continue(client_first.into_bytes());
                         let codec = AuthenticateDataCodec::new();
-                        self.state =
-                            State::SendClientFirst(SendImapCommand::new(context, codec, auth));
+                        self.state = State::SendClientFirst(SendImapCommand::new(codec, auth));
                     }
                 }
                 State::SendClientFirst(send) => {
-                    let (context, bye, continuation_request) = match send.resume(arg.take()) {
+                    let (bye, continuation_request) = match send.resume(fragmentizer, arg.take()) {
                         SendImapCommandResult::WantsRead => {
-                            break ImapAuthScramSha256Result::WantsRead;
+                            return ImapCoroutineState::WantsRead;
                         }
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthScramSha256Result::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             bye,
                             continuation_request,
                             ..
-                        } => (context, bye, continuation_request),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthScramSha256Result::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (bye, continuation_request),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     let Some(cr) = continuation_request else {
-                        let err = ImapAuthScramSha256Error::MissingContinuationRequest;
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthScramSha256Error::MissingContinuationRequest,
+                        );
                     };
 
                     let challenge = match extract_challenge(cr) {
                         Ok(c) => c,
-                        Err(err) => {
-                            return ImapAuthScramSha256Result::Err { context, err };
-                        }
+                        Err(err) => return ImapCoroutineState::Err(err),
                     };
 
-                    let send = match self.build_client_final(context, &challenge) {
+                    let send = match self.build_client_final(&challenge) {
                         Ok(s) => s,
                         Err(_) => unreachable!(
                             "build_client_final should not fail with valid server data"
@@ -481,146 +467,124 @@ impl ImapAuthScramSha256 {
                     self.state = State::SendClientFinal(send);
                 }
                 State::SendClientFinal(send) => {
-                    let (mut context, bye, continuation_request, tagged, data, untagged) =
-                        match send.resume(arg.take()) {
+                    let (bye, continuation_request, tagged, data, untagged) =
+                        match send.resume(fragmentizer, arg.take()) {
                             SendImapCommandResult::WantsRead => {
-                                break ImapAuthScramSha256Result::WantsRead;
+                                return ImapCoroutineState::WantsRead;
                             }
                             SendImapCommandResult::WantsWrite(bytes) => {
-                                break ImapAuthScramSha256Result::WantsWrite(bytes);
+                                return ImapCoroutineState::WantsWrite(bytes);
                             }
                             SendImapCommandResult::Ok {
-                                context,
                                 bye,
                                 continuation_request,
                                 tagged,
                                 data,
                                 untagged,
                                 ..
-                            } => (context, bye, continuation_request, tagged, data, untagged),
-                            SendImapCommandResult::Err { context, err } => {
-                                break ImapAuthScramSha256Result::Err {
-                                    context,
-                                    err: err.into(),
-                                };
+                            } => (bye, continuation_request, tagged, data, untagged),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Err(err.into());
                             }
                         };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if let Some(cr) = continuation_request {
                         // Continuation contains server-final-message
                         let challenge = match extract_challenge(cr) {
                             Ok(c) => c,
-                            Err(err) => {
-                                return ImapAuthScramSha256Result::Err { context, err };
-                            }
+                            Err(err) => return ImapCoroutineState::Err(err),
                         };
 
                         if let Err(err) = self.verify_server_final(&challenge) {
-                            return ImapAuthScramSha256Result::Err { context, err };
+                            return ImapCoroutineState::Err(err);
                         }
 
                         // Send empty response to acknowledge
                         let auth = AuthenticateData::r#continue(vec![]);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::Acknowledge(SendImapCommand::new(context, codec, auth));
+                        self.state = State::Acknowledge(SendImapCommand::new(codec, auth));
                         continue;
                     }
 
                     // Some servers send tagged OK directly with
                     // server-final in the response.
                     let Some(Tagged { body, .. }) = tagged else {
-                        let err = ImapAuthScramSha256Error::MissingTagged;
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::MissingTagged);
                     };
 
                     match extract_capabilities(body, data, untagged) {
-                        Ok(cap) => {
-                            if let Some(capability) = cap {
-                                context.capability = capability.into_iter().collect();
-                            }
-                            context.authenticated = true;
-                            if self.ensure_capabilities && context.capability.is_empty() {
-                                self.state = State::Capability(ImapCapabilityGet::new(context));
+                        Ok(capability) => {
+                            self.observed = capability;
+                            if self.ensure_capabilities && self.observed.is_empty() {
+                                self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapAuthScramSha256Result::Ok { context };
+                            return ImapCoroutineState::Done(mem::take(&mut self.observed));
                         }
-                        Err(err) => {
-                            return ImapAuthScramSha256Result::Err { context, err };
-                        }
+                        Err(err) => return ImapCoroutineState::Err(err),
                     }
                 }
                 State::Acknowledge(send) => {
-                    let (mut context, bye, tagged, data, untagged) = match send.resume(arg.take()) {
+                    let (bye, tagged, data, untagged) = match send.resume(fragmentizer, arg.take())
+                    {
                         SendImapCommandResult::WantsRead => {
-                            break ImapAuthScramSha256Result::WantsRead;
+                            return ImapCoroutineState::WantsRead;
                         }
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthScramSha256Result::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             bye,
                             tagged,
                             data,
                             untagged,
                             ..
-                        } => (context, bye, tagged, data, untagged),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthScramSha256Result::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (bye, tagged, data, untagged),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     let Some(Tagged { body, .. }) = tagged else {
-                        let err = ImapAuthScramSha256Error::MissingTagged;
-                        return ImapAuthScramSha256Result::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthScramSha256Error::MissingTagged);
                     };
 
                     match extract_capabilities(body, data, untagged) {
-                        Ok(cap) => {
-                            if let Some(capability) = cap {
-                                context.capability = capability.into_iter().collect();
-                            }
-                            context.authenticated = true;
-                            if self.ensure_capabilities && context.capability.is_empty() {
-                                self.state = State::Capability(ImapCapabilityGet::new(context));
+                        Ok(capability) => {
+                            self.observed = capability;
+                            if self.ensure_capabilities && self.observed.is_empty() {
+                                self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapAuthScramSha256Result::Ok { context };
+                            return ImapCoroutineState::Done(mem::take(&mut self.observed));
                         }
-                        Err(err) => {
-                            return ImapAuthScramSha256Result::Err { context, err };
-                        }
+                        Err(err) => return ImapCoroutineState::Err(err),
                     }
                 }
-                State::Capability(coroutine) => match coroutine.resume(arg.take()) {
-                    ImapCapabilityGetResult::WantsRead => {
-                        break ImapAuthScramSha256Result::WantsRead;
+                State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => {
+                        return ImapCoroutineState::WantsRead;
                     }
-                    ImapCapabilityGetResult::WantsWrite(bytes) => {
-                        break ImapAuthScramSha256Result::WantsWrite(bytes);
+                    ImapCoroutineState::WantsWrite(bytes) => {
+                        return ImapCoroutineState::WantsWrite(bytes);
                     }
-                    ImapCapabilityGetResult::Ok { context } => {
-                        break ImapAuthScramSha256Result::Ok { context };
+                    ImapCoroutineState::Done(capability) => {
+                        return ImapCoroutineState::Done(capability);
                     }
-                    ImapCapabilityGetResult::Err { context, err } => {
-                        break ImapAuthScramSha256Result::Err {
-                            context,
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapCoroutineState::Err(err.into());
                     }
                 },
             }

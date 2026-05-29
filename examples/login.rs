@@ -4,7 +4,8 @@ use std::{
 };
 
 use io_imap::{
-    context::ImapContext,
+    codec::fragmentizer::Fragmentizer,
+    coroutine::*,
     rfc3501::{greeting::*, login::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
@@ -26,47 +27,47 @@ fn main() {
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
 
     let mut buf = [0u8; 16 * 1024];
+    let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 
-    let mut context = ImapContext::new();
-    let mut coroutine = ImapGreetingGet::new(context, true);
+    let mut coroutine = ImapGreetingGet::new(true);
     let mut arg: Option<&[u8]> = None;
 
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::Ok { context } => break context,
-            ImapGreetingGetResult::WantsRead => {
+    let capability = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => break capability,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingGetResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
+            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     };
 
-    println!("capability pre login: {:#?}", context.capability);
+    println!("capability pre login: {capability:#?}");
 
     let params = ImapLoginParams::new(user, SecretString::from(pass)).unwrap();
-    let mut coroutine = ImapLogin::new(context, params, true);
+    let mut coroutine = ImapLogin::new(params, true);
     let mut arg: Option<&[u8]> = None;
 
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapLoginResult::Ok { context } => break context,
-            ImapLoginResult::WantsRead => {
+    let capability = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(capability) => break capability,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapLoginResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapLoginResult::Err { err, .. } => panic!("{err}"),
+            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     };
 
     println!();
-    println!("capability post login: {:#?}", context.capability);
+    println!("capability post login: {capability:#?}");
 }

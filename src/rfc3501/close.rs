@@ -1,20 +1,20 @@
 //! I/O-free coroutine to send an IMAP CLOSE command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{
-    context::{ImapContext, ImapCurrentMailboxState},
-    send::*,
-};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -33,19 +33,6 @@ pub enum ImapMailboxCloseError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxCloseResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxCloseError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP CLOSE command.
 pub struct ImapMailboxClose {
     send: SendImapCommand<CommandCodec>,
@@ -53,58 +40,56 @@ pub struct ImapMailboxClose {
 
 impl ImapMailboxClose {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext) -> Self {
+    pub fn new() -> Self {
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), CommandBody::Close).unwrap();
+        let command = Command::new(tag.generate(), CommandBody::Close).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxCloseResult {
-        let (mut context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxCloseResult::WantsRead,
+impl ImapCoroutine for ImapMailboxClose {
+    type Output = ();
+    type Error = ImapMailboxCloseError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxCloseResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxCloseResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxCloseError::Bye(bye.text.to_string());
-            return ImapMailboxCloseResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxCloseError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxCloseError::MissingTagged;
-            return ImapMailboxCloseResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxCloseError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => {
-                context.mailbox = ImapCurrentMailboxState::NotSelected;
-                ImapMailboxCloseResult::Ok { context }
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxCloseError::No(body.text.to_string()))
             }
-            StatusKind::No => ImapMailboxCloseResult::Err {
-                context,
-                err: ImapMailboxCloseError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxCloseResult::Err {
-                context,
-                err: ImapMailboxCloseError::Bad(body.text.to_string()),
-            },
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxCloseError::Bad(body.text.to_string()))
+            }
         }
+    }
+}
+
+impl Default for ImapMailboxClose {
+    fn default() -> Self {
+        Self::new()
     }
 }

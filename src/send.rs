@@ -1,21 +1,22 @@
 //! I/O-free coroutine to send an IMAP command and receive a response.
 //!
-//! This is the base coroutine that all higher-level IMAP coroutines
-//! delegate to. It serialises the command via `imap_codec`, drives
-//! the read/write cycle via [`SendImapCommandResult::WantsRead`] /
-//! [`SendImapCommandResult::WantsWrite`], and feeds the response
-//! bytes back through the [`Fragmentizer`] from [`ImapContext`].
+//! This is the base coroutine that all higher-level IMAP coroutines delegate
+//! to. It serialises the command via `imap_codec`, drives the read/write cycle
+//! via [`SendImapCommandResult::WantsRead`] /
+//! [`SendImapCommandResult::WantsWrite`], and feeds the response bytes back
+//! through a borrowed [`Fragmentizer`].
 //!
 //! Callers drive the coroutine in a loop:
 //!
 //! ```rust,ignore
-//! let mut send = SendImapCommand::new(context, codec, message);
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut send = SendImapCommand::new(codec, message);
 //! let mut arg: Option<&[u8]> = None;
 //!
 //! loop {
-//!     match send.resume(arg.take()) {
-//!         SendImapCommandResult::Ok { context, .. } => break context,
-//!         SendImapCommandResult::Err { err, .. } => panic!("{err}"),
+//!     match send.resume(&mut fragmentizer, arg.take()) {
+//!         SendImapCommandResult::Ok { .. } => break,
+//!         SendImapCommandResult::Err(err) => panic!("{err}"),
 //!         SendImapCommandResult::WantsRead => {
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
@@ -34,7 +35,7 @@ use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use imap_codec::{
     ResponseCodec,
     encode::{Encoder, Fragment},
-    fragmentizer::{DecodeMessageError, FragmentInfo},
+    fragmentizer::{DecodeMessageError, FragmentInfo, Fragmentizer},
     imap_types::{
         IntoStatic,
         core::LiteralMode,
@@ -46,14 +47,11 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::context::ImapContext;
-
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
 pub enum SendImapCommandError {
     #[error("Reached unexpected EOF on IMAP stream")]
     Eof,
-
     #[error("Decode IMAP response error")]
     DecodingFailure(Secret<Box<[u8]>>),
     #[error("Parse IMAP response error: message is poisoned")]
@@ -66,7 +64,6 @@ pub enum SendImapCommandError {
 pub enum SendImapCommandResult<T: Encoder> {
     /// The coroutine has successfully terminated its execution.
     Ok {
-        context: ImapContext,
         message: T::Message<'static>,
         data: Vec<Data<'static>>,
         untagged: Vec<StatusBody<'static>>,
@@ -79,10 +76,7 @@ pub enum SendImapCommandResult<T: Encoder> {
     /// The coroutine wants the given bytes to be written to the IMAP stream.
     WantsWrite(Vec<u8>),
     /// The coroutine encountered an error.
-    Err {
-        context: ImapContext,
-        err: SendImapCommandError,
-    },
+    Err(SendImapCommandError),
 }
 
 #[derive(Debug)]
@@ -99,7 +93,6 @@ enum State {
 
 /// I/O-free coroutine to send an IMAP command and receive a response.
 pub struct SendImapCommand<T: Encoder> {
-    context: Option<ImapContext>,
     message: Option<T::Message<'static>>,
     state: State,
     wants_read: bool,
@@ -117,11 +110,10 @@ pub struct SendImapCommand<T: Encoder> {
 
 impl<T: Encoder> SendImapCommand<T> {
     /// Creates a new coroutine for the given message.
-    pub fn new(context: ImapContext, encoder: T, message: T::Message<'static>) -> Self {
+    pub fn new(encoder: T, message: T::Message<'static>) -> Self {
         let fragments = encoder.encode(&message).collect();
 
         Self {
-            context: Some(context),
             message: Some(message),
             codec: ResponseCodec::new(),
             state: State::Serialize,
@@ -144,7 +136,11 @@ impl<T: Encoder> SendImapCommand<T> {
     /// after a write). Pass `Some(data)` with bytes read from the
     /// stream after a [`SendImapCommandResult::WantsRead`]. Pass
     /// `Some(&[])` to signal EOF.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> SendImapCommandResult<T> {
+    pub fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> SendImapCommandResult<T> {
         loop {
             if let Some(bytes) = self.wants_write.take() {
                 return SendImapCommandResult::WantsWrite(bytes);
@@ -192,103 +188,86 @@ impl<T: Encoder> SendImapCommand<T> {
                 }
                 State::Read => match arg.take() {
                     Some(&[]) => {
-                        // SAFETY: context always exists during a resume cycle
-                        let context = self.context.take().unwrap();
-                        return SendImapCommandResult::Err {
-                            context,
-                            err: SendImapCommandError::Eof,
-                        };
+                        return SendImapCommandResult::Err(SendImapCommandError::Eof);
                     }
                     Some(data) => {
                         trace!("read bytes: {}", escape_byte_string(data));
-                        // SAFETY: context always exists during a resume cycle
-                        self.context
-                            .as_mut()
-                            .unwrap()
-                            .fragmentizer
-                            .enqueue_bytes(data);
+                        fragmentizer.enqueue_bytes(data);
                         self.state = State::Deserialize;
                     }
                     None => {
                         self.wants_read = true;
                     }
                 },
-                State::Deserialize => {
-                    // SAFETY: context always exists during a resume cycle
-                    let context = self.context.as_mut().unwrap();
+                State::Deserialize => match fragmentizer.progress() {
+                    Some(info @ FragmentInfo::Line { .. }) => {
+                        let bytes = fragmentizer.fragment_bytes(info);
+                        trace!("read line fragment: {}", escape_byte_string(bytes));
 
-                    match context.fragmentizer.progress() {
-                        Some(info @ FragmentInfo::Line { .. }) => {
-                            let bytes = context.fragmentizer.fragment_bytes(info);
-                            trace!("read line fragment: {}", escape_byte_string(bytes));
+                        if !fragmentizer.is_message_complete() {
+                            continue;
+                        }
 
-                            if !context.fragmentizer.is_message_complete() {
-                                continue;
+                        match fragmentizer.decode_message(&self.codec) {
+                            Ok(Response::Data(data)) => {
+                                self.data.push(data.into_static());
                             }
-
-                            match context.fragmentizer.decode_message(&self.codec) {
-                                Ok(Response::Data(data)) => {
-                                    self.data.push(data.into_static());
-                                }
-                                Ok(Response::Status(Status::Untagged(status))) => {
-                                    self.untagged.push(status.into_static());
-                                }
-                                Ok(Response::Status(Status::Tagged(tagged))) => {
-                                    self.tagged.replace(tagged.into_static());
-                                    self.done = true;
-                                }
-                                Ok(Response::Status(Status::Bye(bye))) => {
-                                    self.bye.replace(bye.into_static());
-                                    self.done = true;
-                                }
-                                Ok(Response::CommandContinuationRequest(cr)) => {
-                                    self.cr.replace(cr.into_static());
-                                    self.done = self.limbo_literal.is_none();
-                                }
-                                Err(decode_err) => {
-                                    let bytes = context.fragmentizer.message_bytes();
-                                    let bytes = Secret::new(bytes.into());
-                                    let err = match decode_err {
-                                        DecodeMessageError::DecodingFailure(_)
-                                        | DecodeMessageError::DecodingRemainder { .. } => {
-                                            SendImapCommandError::DecodingFailure(bytes)
-                                        }
-                                        DecodeMessageError::MessageTooLong { .. } => {
-                                            SendImapCommandError::MessageTooLong(bytes)
-                                        }
-                                        DecodeMessageError::MessagePoisoned { .. } => {
-                                            SendImapCommandError::MessageIsPoisoned(bytes)
-                                        }
-                                    };
-                                    let context = self.context.take().unwrap();
-                                    return SendImapCommandResult::Err { context, err };
-                                }
+                            Ok(Response::Status(Status::Untagged(status))) => {
+                                self.untagged.push(status.into_static());
                             }
-                        }
-                        Some(info @ FragmentInfo::Literal { .. }) => {
-                            let bytes = context.fragmentizer.fragment_bytes(info);
-                            trace!("read literal fragment ({} bytes)", bytes.len());
-                        }
-                        None if self.done => {
-                            // SAFETY: context and message always exist during a resume cycle
-                            return SendImapCommandResult::Ok {
-                                context: self.context.take().unwrap(),
-                                message: self.message.take().unwrap(),
-                                data: mem::take(&mut self.data),
-                                untagged: mem::take(&mut self.untagged),
-                                tagged: self.tagged.take(),
-                                bye: self.bye.take(),
-                                continuation_request: self.cr.take(),
-                            };
-                        }
-                        None if self.limbo_literal.is_some() => {
-                            self.state = State::Serialize;
-                        }
-                        None => {
-                            self.state = State::Read;
+                            Ok(Response::Status(Status::Tagged(tagged))) => {
+                                self.tagged.replace(tagged.into_static());
+                                self.done = true;
+                            }
+                            Ok(Response::Status(Status::Bye(bye))) => {
+                                self.bye.replace(bye.into_static());
+                                self.done = true;
+                            }
+                            Ok(Response::CommandContinuationRequest(cr)) => {
+                                self.cr.replace(cr.into_static());
+                                self.done = self.limbo_literal.is_none();
+                            }
+                            Err(decode_err) => {
+                                let bytes = fragmentizer.message_bytes();
+                                let bytes = Secret::new(bytes.into());
+                                let err = match decode_err {
+                                    DecodeMessageError::DecodingFailure(_)
+                                    | DecodeMessageError::DecodingRemainder { .. } => {
+                                        SendImapCommandError::DecodingFailure(bytes)
+                                    }
+                                    DecodeMessageError::MessageTooLong { .. } => {
+                                        SendImapCommandError::MessageTooLong(bytes)
+                                    }
+                                    DecodeMessageError::MessagePoisoned { .. } => {
+                                        SendImapCommandError::MessageIsPoisoned(bytes)
+                                    }
+                                };
+                                return SendImapCommandResult::Err(err);
+                            }
                         }
                     }
-                }
+                    Some(info @ FragmentInfo::Literal { .. }) => {
+                        let bytes = fragmentizer.fragment_bytes(info);
+                        trace!("read literal fragment ({} bytes)", bytes.len());
+                    }
+                    None if self.done => {
+                        // SAFETY: message always exists during a resume cycle
+                        return SendImapCommandResult::Ok {
+                            message: self.message.take().unwrap(),
+                            data: mem::take(&mut self.data),
+                            untagged: mem::take(&mut self.untagged),
+                            tagged: self.tagged.take(),
+                            bye: self.bye.take(),
+                            continuation_request: self.cr.take(),
+                        };
+                    }
+                    None if self.limbo_literal.is_some() => {
+                        self.state = State::Serialize;
+                    }
+                    None => {
+                        self.state = State::Read;
+                    }
+                },
             }
         }
     }

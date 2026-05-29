@@ -1,18 +1,21 @@
 //! I/O-free coroutine to send an IMAP DELETE command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         mailbox::Mailbox,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -31,19 +34,6 @@ pub enum ImapMailboxDeleteError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxDeleteResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxDeleteError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP DELETE command.
 pub struct ImapMailboxDelete {
     send: SendImapCommand<CommandCodec>,
@@ -51,57 +41,52 @@ pub struct ImapMailboxDelete {
 
 impl ImapMailboxDelete {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
+    pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
         let body = CommandBody::Delete { mailbox };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxDeleteResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxDeleteResult::WantsRead,
+impl ImapCoroutine for ImapMailboxDelete {
+    type Output = ();
+    type Error = ImapMailboxDeleteError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxDeleteResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxDeleteResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxDeleteError::Bye(bye.text.to_string());
-            return ImapMailboxDeleteResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxDeleteError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxDeleteError::MissingTagged;
-            return ImapMailboxDeleteResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxDeleteError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapMailboxDeleteResult::Ok { context },
-            StatusKind::No => ImapMailboxDeleteResult::Err {
-                context,
-                err: ImapMailboxDeleteError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxDeleteResult::Err {
-                context,
-                err: ImapMailboxDeleteError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxDeleteError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxDeleteError::Bad(body.text.to_string()))
+            }
         }
     }
 }

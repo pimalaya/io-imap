@@ -6,17 +6,22 @@ use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     AuthenticateDataCodec, CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
-        response::{Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged},
+        core::TagGenerator,
+        response::{
+            Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
+        },
         secret::Secret,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::capability::*, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -48,19 +53,6 @@ pub enum ImapAuthOAuthBearerError {
 
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
-}
-
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapAuthOAuthBearerResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapAuthOAuthBearerError,
-    },
 }
 
 pub struct ImapAuthOAuthBearerParams {
@@ -101,20 +93,14 @@ pub struct ImapAuthOAuthBearer {
     state: State,
     payload: String,
     ir: bool,
+    observed: Vec<Capability<'static>>,
     ensure_capabilities: bool,
     error: Option<String>,
 }
 
 impl ImapAuthOAuthBearer {
-    /// Creates a new coroutine. When `ensure_capabilities` is true and the
-    /// server did not piggyback a capability list on the AUTHENTICATE tagged
-    /// response, the coroutine drives an extra `CAPABILITY` round-trip
-    /// before completing.
-    pub fn new(
-        mut context: ImapContext,
-        params: ImapAuthOAuthBearerParams,
-        ensure_capabilities: bool,
-    ) -> Self {
+    /// Creates a new coroutine.
+    pub fn new(params: ImapAuthOAuthBearerParams, ensure_capabilities: bool) -> Self {
         let username = &params.username;
         let host = &params.host;
         let port = params.port;
@@ -133,57 +119,61 @@ impl ImapAuthOAuthBearer {
             initial_response,
         };
 
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
-        let send = SendImapCommand::new(context, CommandCodec::new(), command);
+        let command = Command::new(tag.generate(), body).unwrap();
+        let send = SendImapCommand::new(CommandCodec::new(), command);
 
         Self {
             state: State::Send(send),
             payload,
             ir: params.ir,
+            observed: Vec::new(),
             ensure_capabilities,
             error: None,
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapAuthOAuthBearerResult {
+impl ImapCoroutine for ImapAuthOAuthBearer {
+    type Output = Vec<Capability<'static>>;
+    type Error = ImapAuthOAuthBearerError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
         loop {
             match &mut self.state {
                 State::Send(send) => {
-                    let (context, bye, continuation_request, tagged) = match send.resume(arg.take())
-                    {
-                        SendImapCommandResult::WantsRead => {
-                            break ImapAuthOAuthBearerResult::WantsRead;
-                        }
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthOAuthBearerResult::WantsWrite(bytes);
-                        }
-                        SendImapCommandResult::Ok {
-                            context,
-                            bye,
-                            continuation_request,
-                            tagged,
-                            ..
-                        } => (context, bye, continuation_request, tagged),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthOAuthBearerResult::Err {
-                                context,
-                                err: err.into(),
-                            };
-                        }
-                    };
+                    let (bye, continuation_request, tagged) =
+                        match send.resume(fragmentizer, arg.take()) {
+                            SendImapCommandResult::WantsRead => {
+                                return ImapCoroutineState::WantsRead;
+                            }
+                            SendImapCommandResult::WantsWrite(bytes) => {
+                                return ImapCoroutineState::WantsWrite(bytes);
+                            }
+                            SendImapCommandResult::Ok {
+                                bye,
+                                continuation_request,
+                                tagged,
+                                ..
+                            } => (bye, continuation_request, tagged),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Err(err.into());
+                            }
+                        };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthOAuthBearerError::Bye(bye.text.to_string());
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthOAuthBearerError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if let Some(cr) = continuation_request {
                         if self.ir {
-                            // Server rejected our IR and sent an error in
-                            // the continuation request. Acknowledge with
-                            // a single SOH byte (RFC 7628 §3.2.3).
                             self.error.replace(match cr {
                                 CommandContinuationRequest::Basic(err) => err.text().to_string(),
                                 CommandContinuationRequest::Base64(err) => {
@@ -193,14 +183,12 @@ impl ImapAuthOAuthBearer {
 
                             let auth = AuthenticateData::r#continue(vec![0x01]);
                             let codec = AuthenticateDataCodec::new();
-                            self.state =
-                                State::AcknowledgeError(SendImapCommand::new(context, codec, auth));
+                            self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
                         } else {
                             let payload = mem::take(&mut self.payload).into_bytes();
                             let auth = AuthenticateData::r#continue(payload);
                             let codec = AuthenticateDataCodec::new();
-                            self.state =
-                                State::Continue(SendImapCommand::new(context, codec, auth));
+                            self.state = State::Continue(SendImapCommand::new(codec, auth));
                         }
 
                         continue;
@@ -213,50 +201,46 @@ impl ImapAuthOAuthBearer {
                             StatusKind::Bad => ImapAuthOAuthBearerError::Bad(body.text.to_string()),
                         };
 
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(err);
                     }
 
                     if !self.ir {
-                        let err = ImapAuthOAuthBearerError::ExpectedContinuationRequest;
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthOAuthBearerError::ExpectedContinuationRequest,
+                        );
                     }
 
                     unreachable!();
                 }
                 State::Continue(send) => {
-                    let (mut context, bye, continuation_request, tagged, data, untagged) =
-                        match send.resume(arg.take()) {
+                    let (bye, continuation_request, tagged, data, untagged) =
+                        match send.resume(fragmentizer, arg.take()) {
                             SendImapCommandResult::WantsRead => {
-                                break ImapAuthOAuthBearerResult::WantsRead;
+                                return ImapCoroutineState::WantsRead;
                             }
                             SendImapCommandResult::WantsWrite(bytes) => {
-                                break ImapAuthOAuthBearerResult::WantsWrite(bytes);
+                                return ImapCoroutineState::WantsWrite(bytes);
                             }
                             SendImapCommandResult::Ok {
-                                context,
                                 bye,
                                 continuation_request,
                                 tagged,
                                 data,
                                 untagged,
                                 ..
-                            } => (context, bye, continuation_request, tagged, data, untagged),
-                            SendImapCommandResult::Err { context, err } => {
-                                break ImapAuthOAuthBearerResult::Err {
-                                    context,
-                                    err: err.into(),
-                                };
+                            } => (bye, continuation_request, tagged, data, untagged),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Err(err.into());
                             }
                         };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthOAuthBearerError::Bye(bye.text.to_string());
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthOAuthBearerError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if let Some(cr) = continuation_request {
-                        // Server sent an error in continuation after
-                        // receiving our payload. Acknowledge with SOH.
                         self.error.replace(match cr {
                             CommandContinuationRequest::Basic(err) => err.text().to_string(),
                             CommandContinuationRequest::Base64(err) => {
@@ -266,25 +250,25 @@ impl ImapAuthOAuthBearer {
 
                         let auth = AuthenticateData::r#continue(vec![0x01]);
                         let codec = AuthenticateDataCodec::new();
-                        self.state =
-                            State::AcknowledgeError(SendImapCommand::new(context, codec, auth));
+                        self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
                         continue;
                     }
 
                     let Some(Tagged { body, .. }) = tagged else {
-                        let err = ImapAuthOAuthBearerError::MissingTagged;
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthOAuthBearerError::MissingTagged);
                     };
 
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthOAuthBearerError::No(body.text.to_string());
-                            return ImapAuthOAuthBearerResult::Err { context, err };
+                            return ImapCoroutineState::Err(ImapAuthOAuthBearerError::No(
+                                body.text.to_string(),
+                            ));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthOAuthBearerError::Bad(body.text.to_string());
-                            return ImapAuthOAuthBearerResult::Err { context, err };
+                            return ImapCoroutineState::Err(ImapAuthOAuthBearerError::Bad(
+                                body.text.to_string(),
+                            ));
                         }
                     };
 
@@ -307,56 +291,47 @@ impl ImapAuthOAuthBearer {
                     }
 
                     if let Some(capability) = new_capability {
-                        context.capability = capability.into_iter().collect();
+                        self.observed = capability.into_iter().collect();
                     }
 
-                    context.authenticated = true;
-
-                    if self.ensure_capabilities && context.capability.is_empty() {
-                        self.state = State::Capability(ImapCapabilityGet::new(context));
+                    if self.ensure_capabilities && self.observed.is_empty() {
+                        self.state = State::Capability(ImapCapabilityGet::new());
                         continue;
                     }
 
-                    return ImapAuthOAuthBearerResult::Ok { context };
+                    return ImapCoroutineState::Done(mem::take(&mut self.observed));
                 }
                 State::AcknowledgeError(send) => {
-                    let (context, bye, tagged) = match send.resume(arg.take()) {
+                    let (bye, tagged) = match send.resume(fragmentizer, arg.take()) {
                         SendImapCommandResult::WantsRead => {
-                            break ImapAuthOAuthBearerResult::WantsRead;
+                            return ImapCoroutineState::WantsRead;
                         }
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthOAuthBearerResult::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
-                        SendImapCommandResult::Ok {
-                            context,
-                            bye,
-                            tagged,
-                            ..
-                        } => (context, bye, tagged),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthOAuthBearerResult::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        SendImapCommandResult::Ok { bye, tagged, .. } => (bye, tagged),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthOAuthBearerError::Bye(bye.text.to_string());
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthOAuthBearerError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     let Some(Tagged { body, .. }) = tagged else {
-                        let err = ImapAuthOAuthBearerError::MissingTagged;
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthOAuthBearerError::MissingTagged);
                     };
 
                     let StatusKind::No = body.kind else {
-                        let err = ImapAuthOAuthBearerError::UnexpectedStatus {
-                            kind: body.kind,
-                            info: body.text.to_string(),
-                        };
-                        return ImapAuthOAuthBearerResult::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthOAuthBearerError::UnexpectedStatus {
+                                kind: body.kind,
+                                info: body.text.to_string(),
+                            },
+                        );
                     };
 
                     let info = body.text.to_string();
@@ -365,23 +340,20 @@ impl ImapAuthOAuthBearer {
                         None => ImapAuthOAuthBearerError::No(info),
                     };
 
-                    return ImapAuthOAuthBearerResult::Err { context, err };
+                    return ImapCoroutineState::Err(err);
                 }
-                State::Capability(coroutine) => match coroutine.resume(arg.take()) {
-                    ImapCapabilityGetResult::WantsRead => {
-                        break ImapAuthOAuthBearerResult::WantsRead;
+                State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => {
+                        return ImapCoroutineState::WantsRead;
                     }
-                    ImapCapabilityGetResult::WantsWrite(bytes) => {
-                        break ImapAuthOAuthBearerResult::WantsWrite(bytes);
+                    ImapCoroutineState::WantsWrite(bytes) => {
+                        return ImapCoroutineState::WantsWrite(bytes);
                     }
-                    ImapCapabilityGetResult::Ok { context } => {
-                        break ImapAuthOAuthBearerResult::Ok { context };
+                    ImapCoroutineState::Done(capability) => {
+                        return ImapCoroutineState::Done(capability);
                     }
-                    ImapCapabilityGetResult::Err { context, err } => {
-                        break ImapAuthOAuthBearerResult::Err {
-                            context,
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapCoroutineState::Err(err.into());
                     }
                 },
             }

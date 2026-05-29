@@ -4,14 +4,17 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        response::{Code, Data, StatusBody, StatusKind, Tagged},
+        core::TagGenerator,
+        response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -32,19 +35,6 @@ pub enum ImapCapabilityGetError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapCapabilityGetResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapCapabilityGetError,
-    },
-}
-
 /// I/O-free coroutine to get capabilities of an IMAP server.
 pub struct ImapCapabilityGet {
     send: SendImapCommand<CommandCodec>,
@@ -52,57 +42,56 @@ pub struct ImapCapabilityGet {
 
 impl ImapCapabilityGet {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext) -> Self {
+    pub fn new() -> Self {
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), CommandBody::Capability).unwrap();
+        let command = Command::new(tag.generate(), CommandBody::Capability).unwrap();
 
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapCapabilityGetResult {
-        let (mut context, bye, tagged, data, untagged) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapCapabilityGetResult::WantsRead,
+impl ImapCoroutine for ImapCapabilityGet {
+    type Output = Vec<Capability<'static>>;
+    type Error = ImapCapabilityGetError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (bye, tagged, data, untagged) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCapabilityGetResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
                 bye,
                 tagged,
                 data,
                 untagged,
                 ..
-            } => (context, bye, tagged, data, untagged),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapCapabilityGetResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            } => (bye, tagged, data, untagged),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapCapabilityGetError::Bye(bye.text.to_string());
-            return ImapCapabilityGetResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapCapabilityGetError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapCapabilityGetError::ExpectedTagged;
-            return ImapCapabilityGetResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapCapabilityGetError::ExpectedTagged);
         };
 
         let code = match body.kind {
             StatusKind::Ok => body.code,
             StatusKind::No => {
-                let err = ImapCapabilityGetError::No(body.text.to_string());
-                return ImapCapabilityGetResult::Err { context, err };
+                return ImapCoroutineState::Err(ImapCapabilityGetError::No(body.text.to_string()));
             }
             StatusKind::Bad => {
-                let err = ImapCapabilityGetError::Bad(body.text.to_string());
-                return ImapCapabilityGetResult::Err { context, err };
+                return ImapCoroutineState::Err(ImapCapabilityGetError::Bad(body.text.to_string()));
             }
         };
 
@@ -125,12 +114,15 @@ impl ImapCapabilityGet {
         }
 
         let Some(capability) = new_capability else {
-            let err = ImapCapabilityGetError::ExpectedCapability;
-            return ImapCapabilityGetResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapCapabilityGetError::ExpectedCapability);
         };
 
-        context.capability = capability.into_iter().collect();
+        ImapCoroutineState::Done(capability.into_iter().collect())
+    }
+}
 
-        ImapCapabilityGetResult::Ok { context }
+impl Default for ImapCapabilityGet {
+    fn default() -> Self {
+        Self::new()
     }
 }

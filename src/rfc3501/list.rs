@@ -4,9 +4,10 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::QuotedChar,
+        core::{QuotedChar, TagGenerator},
         flag::FlagNameAttribute,
         mailbox::{ListMailbox, Mailbox},
         response::{Data, StatusKind, Tagged},
@@ -15,8 +16,8 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
 use crate::{
-    context::ImapContext,
     rfc3501::mailbox::{decode_inplace, encode_inplace},
     send::*,
 };
@@ -46,20 +47,6 @@ pub enum ImapMailboxListError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxListResult {
-    Ok {
-        context: ImapContext,
-        mailboxes: ImapMailboxListing,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxListError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP LIST command.
 pub struct ImapMailboxList {
     send: SendImapCommand<CommandCodec>,
@@ -67,11 +54,7 @@ pub struct ImapMailboxList {
 
 impl ImapMailboxList {
     /// Creates a new coroutine.
-    pub fn new(
-        mut context: ImapContext,
-        mut reference: Mailbox<'static>,
-        mailbox_wildcard: ListMailbox<'static>,
-    ) -> Self {
+    pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
         trace!("list IMAP mailboxes: {reference:?} {mailbox_wildcard:?}");
         encode_inplace(&mut reference);
 
@@ -79,43 +62,41 @@ impl ImapMailboxList {
             reference,
             mailbox_wildcard,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxListResult {
-        let (context, data, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxListResult::WantsRead,
+impl ImapCoroutine for ImapMailboxList {
+    type Output = ImapMailboxListing;
+    type Error = ImapMailboxListError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxListResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
-                data,
-                tagged,
-                bye,
-                ..
-            } => (context, data, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxListResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+                data, tagged, bye, ..
+            } => (data, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxListError::Bye(bye.text.to_string());
-            return ImapMailboxListResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxListError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxListError::MissingTagged;
-            return ImapMailboxListResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxListError::MissingTagged);
         };
 
         let mut mailboxes = Vec::new();
@@ -134,15 +115,13 @@ impl ImapMailboxList {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapMailboxListResult::Ok { context, mailboxes },
-            StatusKind::No => ImapMailboxListResult::Err {
-                context,
-                err: ImapMailboxListError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxListResult::Err {
-                context,
-                err: ImapMailboxListError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(mailboxes),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxListError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxListError::Bad(body.text.to_string()))
+            }
         }
     }
 }

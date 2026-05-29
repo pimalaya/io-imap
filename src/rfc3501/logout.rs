@@ -1,20 +1,20 @@
 //! I/O-free coroutine to send an IMAP LOGOUT command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{
-    context::{ImapContext, ImapCurrentMailboxState},
-    send::*,
-};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -33,19 +33,6 @@ pub enum ImapLogoutError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapLogoutResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapLogoutError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP LOGOUT command.
 pub struct ImapLogout {
     send: SendImapCommand<CommandCodec>,
@@ -53,59 +40,52 @@ pub struct ImapLogout {
 
 impl ImapLogout {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext) -> Self {
+    pub fn new() -> Self {
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), CommandBody::Logout).unwrap();
+        let command = Command::new(tag.generate(), CommandBody::Logout).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapLogoutResult {
-        let (mut context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapLogoutResult::WantsRead,
+impl ImapCoroutine for ImapLogout {
+    type Output = ();
+    type Error = ImapLogoutError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapLogoutResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapLogoutResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if bye.is_none() {
-            let err = ImapLogoutError::MissingBye;
-            return ImapLogoutResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapLogoutError::MissingBye);
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapLogoutError::MissingTagged;
-            return ImapLogoutResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapLogoutError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => {
-                context.authenticated = false;
-                context.mailbox = ImapCurrentMailboxState::NotSelected;
-                ImapLogoutResult::Ok { context }
-            }
-            StatusKind::No => ImapLogoutResult::Err {
-                context,
-                err: ImapLogoutError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapLogoutResult::Err {
-                context,
-                err: ImapLogoutError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => ImapCoroutineState::Err(ImapLogoutError::No(body.text.to_string())),
+            StatusKind::Bad => ImapCoroutineState::Err(ImapLogoutError::Bad(body.text.to_string())),
         }
+    }
+}
+
+impl Default for ImapLogout {
+    fn default() -> Self {
+        Self::new()
     }
 }

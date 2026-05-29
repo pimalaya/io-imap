@@ -12,11 +12,14 @@
 use std::io::{Read, Write};
 
 use io_imap::{
-    context::ImapContext,
+    codec::fragmentizer::Fragmentizer,
+    coroutine::*,
     rfc3501::{greeting::*, login::*, logout::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
 use secrecy::SecretString;
+
+const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// A shared end-to-end IMAP test flow.
 ///
@@ -40,86 +43,86 @@ pub fn run_imap(host: &str, port: u16, username: &str, password: &str) {
 
 fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     let mut buf = [0u8; 16 * 1024];
-    let mut context = ImapContext::new();
+    let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
 
     // ── GREETING + CAPABILITY ─────────────────────────────────────────────────
 
-    let mut coroutine = ImapGreetingGet::new(context, true);
+    let mut coroutine = ImapGreetingGet::new(true);
     let mut arg: Option<&[u8]> = None;
 
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::Ok { context } => break context,
-            ImapGreetingGetResult::WantsRead => {
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(_) => break,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).expect("greeting read");
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingGetResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).expect("greeting write");
                 arg = None;
             }
-            ImapGreetingGetResult::Err { err, .. } => panic!("GREETING: {err}"),
+            ImapCoroutineState::Err(err) => panic!("GREETING: {err}"),
         }
-    };
+    }
 
     // ── LOGIN ─────────────────────────────────────────────────────────────────
 
     let params = ImapLoginParams::new(username, SecretString::from(password.to_owned())).unwrap();
-    let mut coroutine = ImapLogin::new(context, params, true);
-    let mut arg: Option<&[u8]> = None;
-
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapLoginResult::Ok { context } => break context,
-            ImapLoginResult::WantsRead => {
-                let n = stream.read(&mut buf).expect("login read");
-                arg = Some(&buf[..n]);
-            }
-            ImapLoginResult::WantsWrite(bytes) => {
-                stream.write_all(&bytes).expect("login write");
-                arg = None;
-            }
-            ImapLoginResult::Err { err, .. } => panic!("LOGIN: {err}"),
-        }
-    };
-
-    // ── SELECT INBOX ──────────────────────────────────────────────────────────
-
-    let mut coroutine = ImapMailboxSelect::new(context, "INBOX".try_into().unwrap());
-    let mut arg: Option<&[u8]> = None;
-
-    context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMailboxSelectResult::Ok { context, .. } => break context,
-            ImapMailboxSelectResult::WantsRead => {
-                let n = stream.read(&mut buf).expect("select read");
-                arg = Some(&buf[..n]);
-            }
-            ImapMailboxSelectResult::WantsWrite(bytes) => {
-                stream.write_all(&bytes).expect("select write");
-                arg = None;
-            }
-            ImapMailboxSelectResult::Err { err, .. } => panic!("SELECT: {err:?}"),
-        }
-    };
-
-    // ── LOGOUT ────────────────────────────────────────────────────────────────
-
-    let mut coroutine = ImapLogout::new(context);
+    let mut coroutine = ImapLogin::new(params, true);
     let mut arg: Option<&[u8]> = None;
 
     loop {
-        match coroutine.resume(arg.take()) {
-            ImapLogoutResult::Ok { .. } => break,
-            ImapLogoutResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(_) => break,
+            ImapCoroutineState::WantsRead => {
+                let n = stream.read(&mut buf).expect("login read");
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::WantsWrite(bytes) => {
+                stream.write_all(&bytes).expect("login write");
+                arg = None;
+            }
+            ImapCoroutineState::Err(err) => panic!("LOGIN: {err}"),
+        }
+    }
+
+    // ── SELECT INBOX ──────────────────────────────────────────────────────────
+
+    let mut coroutine = ImapMailboxSelect::new("INBOX".try_into().unwrap());
+    let mut arg: Option<&[u8]> = None;
+
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(_) => break,
+            ImapCoroutineState::WantsRead => {
+                let n = stream.read(&mut buf).expect("select read");
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::WantsWrite(bytes) => {
+                stream.write_all(&bytes).expect("select write");
+                arg = None;
+            }
+            ImapCoroutineState::Err(err) => panic!("SELECT: {err:?}"),
+        }
+    }
+
+    // ── LOGOUT ────────────────────────────────────────────────────────────────
+
+    let mut coroutine = ImapLogout::new();
+    let mut arg: Option<&[u8]> = None;
+
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(()) => break,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).expect("logout read");
                 arg = Some(&buf[..n]);
             }
-            ImapLogoutResult::WantsWrite(bytes) => {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 stream.write_all(&bytes).expect("logout write");
                 arg = None;
             }
-            ImapLogoutResult::Err { err, .. } => panic!("LOGOUT: {err}"),
+            ImapCoroutineState::Err(err) => panic!("LOGOUT: {err}"),
         }
     }
 }

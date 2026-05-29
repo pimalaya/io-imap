@@ -6,8 +6,10 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         datetime::DateTime,
         extensions::binary::LiteralOrLiteral8,
         flag::Flag,
@@ -17,7 +19,11 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::{
+    coroutine::{ImapCoroutine, ImapCoroutineState},
+    rfc3501::mailbox::encode_inplace,
+    send::*,
+};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -36,20 +42,6 @@ pub enum ImapAppendUidError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapAppendUidResult {
-    Ok {
-        context: ImapContext,
-        uid_pair: Option<(NonZeroU32, NonZeroU32)>,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapAppendUidError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP APPEND command and extract the APPENDUID response code.
 pub struct ImapAppendUid {
     send: SendImapCommand<CommandCodec>,
@@ -58,7 +50,6 @@ pub struct ImapAppendUid {
 impl ImapAppendUid {
     /// Creates a new coroutine.
     pub fn new(
-        mut context: ImapContext,
         mut mailbox: Mailbox<'static>,
         flags: Vec<Flag<'static>>,
         date: Option<DateTime>,
@@ -71,42 +62,39 @@ impl ImapAppendUid {
             date,
             message,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapAppendUidResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapAppendUidResult::WantsRead,
+impl ImapCoroutine for ImapAppendUid {
+    type Output = Option<(NonZeroU32, NonZeroU32)>;
+    type Error = ImapAppendUidError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapAppendUidResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapAppendUidResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapAppendUidError::Bye(bye.text.to_string());
-            return ImapAppendUidResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapAppendUidError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapAppendUidError::MissingTagged;
-            return ImapAppendUidResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapAppendUidError::MissingTagged);
         };
 
         match body.kind {
@@ -116,16 +104,14 @@ impl ImapAppendUid {
                 } else {
                     None
                 };
-                ImapAppendUidResult::Ok { context, uid_pair }
+                ImapCoroutineState::Done(uid_pair)
             }
-            StatusKind::No => ImapAppendUidResult::Err {
-                context,
-                err: ImapAppendUidError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapAppendUidResult::Err {
-                context,
-                err: ImapAppendUidError::Bad(body.text.to_string()),
-            },
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapAppendUidError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapAppendUidError::Bad(body.text.to_string()))
+            }
         }
     }
 }

@@ -27,7 +27,7 @@
 //! connection is dedicated. Shutdown is cooperative: flip the
 //! [`AtomicBool`] handed to [`ImapMailboxWatch::new`] and the
 //! coroutine winds the running IDLE down at its next loop iteration,
-//! returning [`ImapMailboxWatchResult::Ok`] with the IMAP context.
+//! returning [`ImapMailboxWatchResult::Ok`].
 
 use core::{
     mem,
@@ -43,23 +43,26 @@ use alloc::{
     vec::Vec,
 };
 
-use imap_codec::imap_types::{
-    command::SelectParameter,
-    fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
-    flag::{Flag, FlagFetch},
-    mailbox::Mailbox,
-    response::Capability,
-    sequence::SequenceSet,
+use imap_codec::{
+    fragmentizer::Fragmentizer,
+    imap_types::{
+        command::SelectParameter,
+        fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
+        flag::{Flag, FlagFetch},
+        mailbox::Mailbox,
+        response::Capability,
+        sequence::SequenceSet,
+    },
 };
 use log::trace;
 use thiserror::Error;
 
 use crate::{
-    context::ImapContext,
+    coroutine::{ImapCoroutine, ImapCoroutineState},
     rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleResult},
     rfc3501::{
-        fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchResult},
-        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult, SelectData},
+        fetch::{ImapMessageFetch, ImapMessageFetchError},
+        select::{ImapMailboxSelect, ImapMailboxSelectError, SelectData},
     },
 };
 
@@ -116,16 +119,11 @@ pub enum ImapMailboxWatchResult {
     /// drain any further events still queued.
     Event(ImapMailboxWatchEvent),
     /// The shutdown flag was observed; the IDLE was wound down
-    /// cleanly and the context is returned to the caller.
-    Ok {
-        context: ImapContext,
-    },
+    /// cleanly.
+    Ok,
     WantsRead,
     WantsWrite(Vec<u8>),
-    Err {
-        context: Option<ImapContext>,
-        err: ImapMailboxWatchError,
-    },
+    Err(ImapMailboxWatchError),
 }
 
 enum State {
@@ -143,8 +141,7 @@ enum State {
     /// Drain `pending` one event at a time, returning each as
     /// `Event(...)`. When empty, transition back to `BeginIdle`.
     EmitDeltas,
-    /// Terminal: the context is owned at the struct level and
-    /// returned via `Ok` on the next `resume` call.
+    /// Terminal state.
     Terminal,
 }
 
@@ -163,8 +160,6 @@ pub struct ImapMailboxWatch {
     /// response. Decides whether to pull a QRESYNC delta or just
     /// re-enter IDLE after the current one ends.
     idle_saw_data: bool,
-    /// Context lives here while no sub-coroutine owns it.
-    context: Option<ImapContext>,
     mailbox: Mailbox<'static>,
     uid_validity: Option<NonZeroU32>,
     highest_mod_seq: u64,
@@ -183,27 +178,26 @@ impl ImapMailboxWatch {
     /// [`ImapMailboxWatchResult::Ok`].
     ///
     /// Errors with [`ImapMailboxWatchError::QresyncUnsupported`] when
-    /// the cached CAPABILITY list does not advertise `QRESYNC`. Run
-    /// `CAPABILITY` (or `LOGIN` / `AUTHENTICATE` with
-    /// `ensure_capabilities`) before calling this constructor.
+    /// `capability` does not advertise `QRESYNC`. Run `CAPABILITY` (or
+    /// `LOGIN` / `AUTHENTICATE` with `ensure_capabilities`) before
+    /// calling this constructor.
     pub fn new(
-        context: ImapContext,
+        capability: &[Capability<'static>],
         mailbox: Mailbox<'static>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, ImapMailboxWatchError> {
-        if !context.capability.contains(&Capability::QResync) {
+        if !capability.contains(&Capability::QResync) {
             return Err(ImapMailboxWatchError::QresyncUnsupported);
         }
 
         let parameters = vec![SelectParameter::CondStore];
-        let select = ImapMailboxSelect::with_parameters(context, mailbox.clone(), parameters);
+        let select = ImapMailboxSelect::with_parameters(mailbox.clone(), parameters);
 
         Ok(Self {
             state: State::SelectInitial(select),
             shutdown,
             idle_done: Arc::new(AtomicBool::new(false)),
             idle_saw_data: false,
-            context: None,
             mailbox,
             uid_validity: None,
             highest_mod_seq: 0,
@@ -213,7 +207,11 @@ impl ImapMailboxWatch {
     }
 
     /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapMailboxWatchResult {
+    pub fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapMailboxWatchResult {
         if self.shutdown.load(Ordering::SeqCst) {
             self.idle_done.store(true, Ordering::SeqCst);
         }
@@ -222,27 +220,25 @@ impl ImapMailboxWatch {
             let state = mem::replace(&mut self.state, State::Terminal);
 
             match state {
-                State::SelectInitial(mut select) => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
+                State::SelectInitial(mut select) => match select.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => {
                         self.state = State::SelectInitial(select);
                         return ImapMailboxWatchResult::WantsRead;
                     }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
+                    ImapCoroutineState::WantsWrite(bytes) => {
                         self.state = State::SelectInitial(select);
                         return ImapMailboxWatchResult::WantsWrite(bytes);
                     }
-                    ImapMailboxSelectResult::Ok { context, data } => {
+                    ImapCoroutineState::Done(data) => {
                         let Some(uid_validity) = data.uid_validity else {
-                            return ImapMailboxWatchResult::Err {
-                                context: Some(context),
-                                err: ImapMailboxWatchError::MissingUidValidity,
-                            };
+                            return ImapMailboxWatchResult::Err(
+                                ImapMailboxWatchError::MissingUidValidity,
+                            );
                         };
                         let Some(highest_mod_seq) = data.highest_mod_seq else {
-                            return ImapMailboxWatchResult::Err {
-                                context: Some(context),
-                                err: ImapMailboxWatchError::MissingHighestModSeq,
-                            };
+                            return ImapMailboxWatchResult::Err(
+                                ImapMailboxWatchError::MissingHighestModSeq,
+                            );
                         };
 
                         self.uid_validity = Some(uid_validity);
@@ -256,37 +252,33 @@ impl ImapMailboxWatch {
                         let sequence_set: SequenceSet = match "1:*".try_into() {
                             Ok(s) => s,
                             Err(_) => {
-                                return ImapMailboxWatchResult::Err {
-                                    context: Some(context),
-                                    err: ImapMailboxWatchError::InvalidSequenceSet("1:*".into()),
-                                };
+                                return ImapMailboxWatchResult::Err(
+                                    ImapMailboxWatchError::InvalidSequenceSet("1:*".into()),
+                                );
                             }
                         };
                         let item_names = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
                             MessageDataItemName::Uid,
                             MessageDataItemName::Flags,
                         ]);
-                        let fetch = ImapMessageFetch::new(context, sequence_set, item_names, false);
+                        let fetch = ImapMessageFetch::new(sequence_set, item_names, false);
                         self.state = State::FetchBaseline(fetch);
                     }
-                    ImapMailboxSelectResult::Err { context, err } => {
-                        return ImapMailboxWatchResult::Err {
-                            context: Some(context),
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapMailboxWatchResult::Err(err.into());
                     }
                 },
 
-                State::FetchBaseline(mut fetch) => match fetch.resume(arg.take()) {
-                    ImapMessageFetchResult::WantsRead => {
+                State::FetchBaseline(mut fetch) => match fetch.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => {
                         self.state = State::FetchBaseline(fetch);
                         return ImapMailboxWatchResult::WantsRead;
                     }
-                    ImapMessageFetchResult::WantsWrite(bytes) => {
+                    ImapCoroutineState::WantsWrite(bytes) => {
                         self.state = State::FetchBaseline(fetch);
                         return ImapMailboxWatchResult::WantsWrite(bytes);
                     }
-                    ImapMessageFetchResult::Ok { context, data } => {
+                    ImapCoroutineState::Done(data) => {
                         for (_seq, items) in data {
                             let items_vec = items.into_inner();
                             if let (Some(uid), flags) = extract_uid_flags(&items_vec) {
@@ -297,40 +289,25 @@ impl ImapMailboxWatch {
                             "watch: baseline shadow seeded with {} uids",
                             self.shadow.len(),
                         );
-                        self.context = Some(context);
                         self.state = State::BeginIdle;
                     }
-                    ImapMessageFetchResult::Err { context, err } => {
-                        return ImapMailboxWatchResult::Err {
-                            context: Some(context),
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapMailboxWatchResult::Err(err.into());
                     }
                 },
 
                 State::BeginIdle => {
                     if self.shutdown.load(Ordering::SeqCst) {
-                        let context = self.context.take();
-                        return match context {
-                            Some(context) => ImapMailboxWatchResult::Ok { context },
-                            None => ImapMailboxWatchResult::Err {
-                                context: None,
-                                err: ImapMailboxWatchError::QresyncUnsupported,
-                            },
-                        };
+                        return ImapMailboxWatchResult::Ok;
                     }
 
-                    let Some(context) = self.context.take() else {
-                        self.state = State::Terminal;
-                        continue;
-                    };
                     self.idle_done.store(false, Ordering::SeqCst);
                     self.idle_saw_data = false;
-                    let idle = ImapIdle::new(context, self.idle_done.clone());
+                    let idle = ImapIdle::new(self.idle_done.clone());
                     self.state = State::Idle(idle);
                 }
 
-                State::Idle(mut idle) => match idle.resume(arg.take()) {
+                State::Idle(mut idle) => match idle.resume(fragmentizer, arg.take()) {
                     ImapIdleResult::Data { .. } => {
                         trace!("watch: IDLE saw untagged data");
                         self.idle_saw_data = true;
@@ -345,16 +322,12 @@ impl ImapMailboxWatch {
                         self.state = State::Idle(idle);
                         return ImapMailboxWatchResult::WantsWrite(bytes);
                     }
-                    ImapIdleResult::Ok { context } => {
-                        self.context = Some(context);
-
+                    ImapIdleResult::Ok => {
                         if self.shutdown.load(Ordering::SeqCst) {
-                            let context = self.context.take().unwrap();
-                            return ImapMailboxWatchResult::Ok { context };
+                            return ImapMailboxWatchResult::Ok;
                         }
 
                         if self.idle_saw_data {
-                            let context = self.context.take().unwrap();
                             // SAFETY: uid_validity is set by SelectInitial
                             let uid_validity = self.uid_validity.unwrap();
                             let modseq = NonZeroU64::new(self.highest_mod_seq)
@@ -366,7 +339,6 @@ impl ImapMailboxWatch {
                                 seq_match_data: None,
                             }];
                             let select = ImapMailboxSelect::with_parameters(
-                                context,
                                 self.mailbox.clone(),
                                 parameters,
                             );
@@ -376,36 +348,29 @@ impl ImapMailboxWatch {
                             self.state = State::BeginIdle;
                         }
                     }
-                    ImapIdleResult::Err { context, err } => {
-                        return ImapMailboxWatchResult::Err {
-                            context: Some(context),
-                            err: err.into(),
-                        };
+                    ImapIdleResult::Err(err) => {
+                        return ImapMailboxWatchResult::Err(err.into());
                     }
                 },
 
-                State::SelectQresync(mut select) => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
+                State::SelectQresync(mut select) => match select.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => {
                         self.state = State::SelectQresync(select);
                         return ImapMailboxWatchResult::WantsRead;
                     }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
+                    ImapCoroutineState::WantsWrite(bytes) => {
                         self.state = State::SelectQresync(select);
                         return ImapMailboxWatchResult::WantsWrite(bytes);
                     }
-                    ImapMailboxSelectResult::Ok { context, data } => {
+                    ImapCoroutineState::Done(data) => {
                         self.compute_deltas(&data);
                         if let Some(new_modseq) = data.highest_mod_seq {
                             self.highest_mod_seq = new_modseq;
                         }
-                        self.context = Some(context);
                         self.state = State::EmitDeltas;
                     }
-                    ImapMailboxSelectResult::Err { context, err } => {
-                        return ImapMailboxWatchResult::Err {
-                            context: Some(context),
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapMailboxWatchResult::Err(err.into());
                     }
                 },
 
@@ -419,13 +384,7 @@ impl ImapMailboxWatch {
 
                 State::Terminal => {
                     self.state = State::Terminal;
-                    return match self.context.take() {
-                        Some(context) => ImapMailboxWatchResult::Ok { context },
-                        None => ImapMailboxWatchResult::Err {
-                            context: None,
-                            err: ImapMailboxWatchError::QresyncUnsupported,
-                        },
-                    };
+                    return ImapMailboxWatchResult::Ok;
                 }
             }
         }

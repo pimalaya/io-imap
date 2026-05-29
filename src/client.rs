@@ -1,14 +1,21 @@
 //! # Standard, blocking IMAP client
 //!
-//! Holds a single stream (any blocking `Read + Write` impl) plus the long-lived
-//! [`ImapContext`], and exposes one method per common coroutine.  The bare
-//! [`new`] constructor takes a pre-connected stream; callers handle TCP and TLS
-//! themselves. With one of the TLS feature flags enabled (`rustls-ring`,
-//! `rustls-aws`, `native-tls`), [`connect`] is also available and produces a
-//! ready-to-use authenticated client end-to-end: it opens the transport (plain
-//! TCP for `imap://`, implicit TLS for `imaps://`), optionally performs the
-//! STARTTLS upgrade, reads the greeting and capability list, then runs the
-//! chosen SASL mechanism if one was provided.
+//! Holds a single stream (any blocking `Read + Write` impl) plus a
+//! per-connection [`Fragmentizer`], and exposes one method per common
+//! coroutine. The bare [`new`] constructor takes a pre-connected stream;
+//! callers handle TCP and TLS themselves. With one of the TLS feature flags
+//! enabled (`rustls-ring`, `rustls-aws`, `native-tls`), [`connect`] is also
+//! available and produces a ready-to-use authenticated client end-to-end:
+//! it opens the transport (plain TCP for `imap://`, implicit TLS for
+//! `imaps://`), optionally performs the STARTTLS upgrade, reads the
+//! greeting and capability list, then runs the chosen SASL mechanism if
+//! one was provided.
+//!
+//! Session state (current mailbox, authenticated flag, cached
+//! capability) is intentionally NOT stored on the client: it desyncs
+//! too easily from server state. Methods that observe a fresh
+//! capability list return it; callers that want a cached copy keep it
+//! themselves.
 //!
 //! [`new`]: ImapClientStd::new
 //! [`connect`]: ImapClientStd::connect
@@ -18,13 +25,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use std::{
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
-    },
-    thread::{self, JoinHandle},
-};
 
 #[cfg(any(
     feature = "rustls-aws",
@@ -33,25 +33,36 @@ use std::{
 ))]
 use alloc::string::{String, ToString};
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
-use std::io::{self, Read, Write};
 
-use imap_codec::imap_types::{
-    command::SelectParameter,
-    core::{IString, NString, Vec1},
-    datetime::DateTime,
-    extensions::{
-        binary::LiteralOrLiteral8,
-        enable::CapabilityEnable,
-        sort::SortCriterion,
-        thread::{Thread, ThreadingAlgorithm},
+use std::{
+    io::{self, Read, Write},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
-    fetch::{MacroOrMessageDataItemNames, MessageDataItem},
-    flag::{Flag, StoreType},
-    mailbox::{ListMailbox, Mailbox},
-    response::Capability,
-    search::SearchKey,
-    sequence::SequenceSet,
-    status::{StatusDataItem, StatusDataItemName},
+    thread::{self, JoinHandle},
+};
+
+use imap_codec::{
+    fragmentizer::Fragmentizer,
+    imap_types::{
+        command::SelectParameter,
+        core::{IString, NString, Vec1},
+        datetime::DateTime,
+        extensions::{
+            binary::LiteralOrLiteral8,
+            enable::CapabilityEnable,
+            sort::SortCriterion,
+            thread::{Thread, ThreadingAlgorithm},
+        },
+        fetch::{MacroOrMessageDataItemNames, MessageDataItem},
+        flag::{Flag, StoreType},
+        mailbox::{ListMailbox, Mailbox},
+        response::Capability,
+        search::SearchKey,
+        sequence::SequenceSet,
+        status::{StatusDataItem, StatusDataItemName},
+    },
 };
 #[cfg(feature = "scram")]
 #[cfg(any(
@@ -81,7 +92,7 @@ use url::Url;
 #[cfg(feature = "scram")]
 use crate::rfc7677::auth_scram_sha_256::*;
 use crate::{
-    context::ImapContext,
+    coroutine::*,
     rfc2971::id::*,
     rfc3501::{
         append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, examine::*,
@@ -95,12 +106,11 @@ use crate::{
     rfc6851::r#move::*,
     rfc7628::{auth_oauthbearer::*, auth_xoauth2::*},
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*},
-    watch::{
-        ImapMailboxWatch, ImapMailboxWatchError, ImapMailboxWatchEvent, ImapMailboxWatchResult,
-    },
+    watch::*,
 };
 
 const READ_BUFFER_SIZE: usize = 16 * 1024;
+const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Errors returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
@@ -223,102 +233,29 @@ pub enum ImapClientStdError {
     #[error("Invalid IMAP LOGIN credentials")]
     InvalidLoginCredentials(#[from] imap_codec::imap_types::error::ValidationError),
 
-    #[error("IMAP client missing context (poisoned by a prior error)")]
-    MissingContext,
-
     #[error("IMAP server does not advertise QRESYNC capability")]
     QresyncNotSupported,
     #[error("Invalid mod-sequence value: 0")]
     InvalidModSeq,
 }
 
-/// Run a coroutine to completion against `$self.stream`. The destructure
-/// pattern names whichever payload fields of the `Ok` variant the caller wants;
-/// `context` is bound and restored automatically. `$ret` is the expression
-/// returned on success. Defaults to `{ .. } => ()` when the destructure /
-/// return clause is omitted.
-macro_rules! coroutine {
-    ($self:ident, $coroutine:expr, $Result:ident) => {
-        coroutine!($self, $coroutine, $Result, { .. } => ())
-    };
-    ($self:ident, $coroutine:expr, $Result:ident, { $($field:tt)* } => $ret:expr) => {{
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut arg = None;
-        let mut coroutine = $coroutine;
-
-        loop {
-            match coroutine.resume(arg) {
-                $Result::Ok { context, $($field)* } => {
-                    $self.context = Some(context);
-                    return Ok($ret);
-                }
-                $Result::WantsRead => {
-                    let n = $self.stream.read(&mut buf)?;
-                    arg = Some(&buf[..n]);
-                }
-                $Result::WantsWrite(bytes) => {
-                    $self.stream.write_all(&bytes)?;
-                    arg = None;
-                }
-                $Result::Err { context, err } => {
-                    $self.context = Some(context);
-                    return Err(err.into());
-                }
-            }
-        }
-    }};
-}
-
-/// Std-blocking IMAP client wrapping a single `Read + Write` stream
-/// plus the long-lived [`ImapContext`].
-///
-/// `auto_select` is a public flag downstream wrappers read to decide whether
-/// to auto-issue a SELECT before each per-op command (STORE, FETCH, COPY, …).
-/// Default is `true`: per-op wrappers (io-email) self-select so the shared API
-/// works without a separate pre-select call. Sync engines (neverest) flip
-/// this off and pre-select once per mailbox batch to avoid a SELECT per hunk.
+/// Std-blocking IMAP client wrapping a single `Read + Write` stream plus a
+/// per-connection [`Fragmentizer`].
 #[derive(Debug)]
 pub struct ImapClientStd<S: Read + Write> {
     stream: S,
-    context: Option<ImapContext>,
-    pub auto_select: bool,
+    fragmentizer: Fragmentizer,
 }
 
-impl<S: Read + Write> ImapClientStd<S> {
-    /// Builds a client around `stream` with a fresh [`ImapContext`]. The caller
-    /// is responsible for opening the connection (TCP, TLS handshake if needed,
-    /// STARTTLS upgrade if needed). Pair with [`with_context`] when bringing
-    /// over an already-progressed session.
-    ///
-    /// [`with_context`]: ImapClientStd::with_context
+impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
+    /// Builds a client around `stream`. The caller is responsible for opening
+    /// the connection (TCP, TLS handshake if needed, STARTTLS upgrade if
+    /// needed).
     pub fn new(stream: S) -> Self {
-        Self::with_context(stream, ImapContext::new())
-    }
-
-    /// Builds a client around `stream` and adopts `context` as its inner state.
-    /// Useful when handing the stream off post-greeting / post-auth: the caller
-    /// runs the early coroutines, then transfers the resulting context into
-    /// the client.
-    pub fn with_context(stream: S, context: ImapContext) -> Self {
         Self {
             stream,
-            context: Some(context),
-            auto_select: true,
+            fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
         }
-    }
-
-    /// Returns the current session context, if any.
-    pub fn context(&self) -> Option<&ImapContext> {
-        self.context.as_ref()
-    }
-
-    /// Returns the cached CAPABILITY list, or [`None`] if CAPABILITY
-    /// has not run yet (no greeting / login / explicit `CAPABILITY`).
-    pub fn capabilities(&self) -> Option<&[Capability<'static>]> {
-        self.context
-            .as_ref()
-            .map(|ctx| ctx.capability.as_slice())
-            .filter(|caps| !caps.is_empty())
     }
 
     /// Returns a shared reference to the underlying stream.
@@ -331,80 +268,83 @@ impl<S: Read + Write> ImapClientStd<S> {
         &mut self.stream
     }
 
-    /// Consumes the client and returns its underlying stream plus the inner
-    /// context (if still present). Useful after [`starttls`] to perform a TLS
-    /// upgrade on the raw stream before rebuilding a fresh client around the
-    /// upgraded stream while preserving the negotiated context.
+    /// Consumes the client and returns its underlying stream. Useful
+    /// after [`starttls`] to perform a TLS upgrade on the raw stream
+    /// before rebuilding a fresh client around the upgraded stream.
     ///
     /// [`starttls`]: ImapClientStd::starttls
-    pub fn into_parts(self) -> (S, Option<ImapContext>) {
-        (self.stream, self.context)
+    pub fn into_stream(self) -> S {
+        self.stream
     }
 
-    fn take_context(&mut self) -> Result<ImapContext, ImapClientStdError> {
-        self.context
-            .take()
-            .ok_or(ImapClientStdError::MissingContext)
+    /// Drives any [`ImapCoroutine`] against this client's stream +
+    /// fragmentizer until it terminates. Each command method on
+    /// [`ImapClientStd`] is a one-liner around `run`; downstream
+    /// callers can also use it to drive custom coroutines.
+    pub fn run<C>(&mut self, mut coroutine: C) -> Result<C::Output, ImapClientStdError>
+    where
+        C: ImapCoroutine,
+        ImapClientStdError: From<C::Error>,
+    {
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        let mut arg = None;
+
+        loop {
+            match coroutine.resume(&mut self.fragmentizer, arg) {
+                ImapCoroutineState::Done(out) => return Ok(out),
+                ImapCoroutineState::WantsRead => {
+                    let n = self.stream.read(&mut buf)?;
+                    arg = Some(&buf[..n]);
+                }
+                ImapCoroutineState::WantsWrite(bytes) => {
+                    self.stream.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     // ---- Session lifecycle ------------------------------------------------
 
     /// Runs [`ImapGreetingGet`] with `ensure_capabilities` set to `true`:
-    /// consumes the initial server greeting and populates the capability list.
-    /// Call this once after [`new`] / [`connect`]. Returns the freshly
-    /// negotiated capability list.
+    /// consumes the initial server greeting and reports the capability
+    /// list. Call this once after [`new`] / [`connect`].
     ///
     /// [`new`]: ImapClientStd::new
     /// [`connect`]: ImapClientStd::connect
-    pub fn greeting(&mut self) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapGreetingGet::new(context, true),
-            ImapGreetingGetResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    pub fn greeting(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        Ok(self.run(ImapGreetingGet::new(true))?.capability)
     }
 
-    /// Runs [`ImapLogin`] (`LOGIN`) with the `ensure_capabilities` flag set
-    /// so the capability list is always refreshed before returning.
+    /// Runs [`ImapLogin`] (`LOGIN`) with the `ensure_capabilities` flag
+    /// set so the capability list is always refreshed before returning.
     pub fn login(
         &mut self,
         params: ImapLoginParams,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapLogin::new(context, params, true),
-            ImapLoginResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapLogin::new(params, true))
     }
 
     /// Runs [`ImapStartTls`] (`STARTTLS`, RFC 3501 §6.2.1). The IMAP-layer
     /// handshake is complete on return; the caller must now upgrade the
-    /// underlying socket to TLS (consume the client via [`into_parts`], call
-    /// `upgrade_tls`, then rebuild a client with [`with_context`]) and refresh
-    /// capabilities over the encrypted channel via [`capability`]. The returned
-    /// bytes are anything the coroutine pre-read past the tagged response
-    /// (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes would be a
-    /// classic STARTTLS-injection signal).
+    /// underlying socket to TLS (consume the client via [`into_stream`],
+    /// call `upgrade_tls`, then rebuild a client) and refresh capabilities
+    /// over the encrypted channel via [`capability`]. The returned bytes
+    /// are anything the coroutine pre-read past the tagged response
+    /// (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes would
+    /// be a classic STARTTLS-injection signal).
     ///
-    /// [`into_parts`]: ImapClientStd::into_parts
-    /// [`with_context`]: ImapClientStd::with_context
+    /// [`into_stream`]: ImapClientStd::into_stream
     /// [`capability`]: ImapClientStd::capability
     pub fn starttls(&mut self) -> Result<Vec<u8>, ImapClientStdError> {
-        let context = self.take_context()?;
-        let mut coroutine = ImapStartTls::new(context);
+        let mut coroutine = ImapStartTls::new();
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
 
         loop {
             match coroutine.resume(arg) {
-                ImapStartTlsResult::WantsStartTls { context, remaining } => {
-                    self.context = Some(context);
-                    return Ok(remaining);
-                }
+                ImapStartTlsResult::Ok { remaining } => return Ok(remaining),
                 ImapStartTlsResult::WantsRead => {
                     let n = self.stream.read(&mut buf)?;
                     arg = Some(&buf[..n]);
@@ -413,10 +353,7 @@ impl<S: Read + Write> ImapClientStd<S> {
                     self.stream.write_all(&bytes)?;
                     arg = None;
                 }
-                ImapStartTlsResult::Err { context, err } => {
-                    self.context = Some(context);
-                    return Err(err.into());
-                }
+                ImapStartTlsResult::Err(err) => return Err(err.into()),
             }
         }
     }
@@ -427,14 +364,8 @@ impl<S: Read + Write> ImapClientStd<S> {
     pub fn auth_anonymous(
         &mut self,
         params: ImapAuthAnonymousParams,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthAnonymous::new(context, params, true),
-            ImapAuthAnonymousResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthAnonymous::new(params, true))
     }
 
     /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy two-prompt
@@ -446,14 +377,8 @@ impl<S: Read + Write> ImapClientStd<S> {
     pub fn auth_login(
         &mut self,
         params: ImapAuthLoginParams,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthLogin::new(context, params, true),
-            ImapAuthLoginResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthLogin::new(params, true))
     }
 
     /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616) with
@@ -461,51 +386,33 @@ impl<S: Read + Write> ImapClientStd<S> {
     pub fn auth_plain(
         &mut self,
         params: ImapAuthPlainParams,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthPlain::new(context, params, true),
-            ImapAuthPlainResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthPlain::new(params, true))
     }
 
     /// Runs [`ImapAuthOAuthBearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
-    /// RFC 7628) with `ensure_capabilities=true`. The `token` is an OAuth 2.0
-    /// bearer access token: the connection **must** be TLS-protected before
-    /// calling this method.
+    /// RFC 7628) with `ensure_capabilities=true`. The `token` is an
+    /// OAuth 2.0 bearer access token: the connection must be
+    /// TLS-protected before calling this method.
     pub fn auth_oauthbearer(
         &mut self,
         params: ImapAuthOAuthBearerParams,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthOAuthBearer::new(context, params, true),
-            ImapAuthOAuthBearerResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthOAuthBearer::new(params, true))
     }
 
     /// Runs [`ImapAuthXOAuth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
-    /// pre-standard OAuth 2.0 mechanism) with `ensure_capabilities=true`. The
-    /// `token` is an OAuth 2.0 bearer access token: the connection **must**
-    /// be TLS-protected. Prefer [`auth_oauthbearer`] on servers that support
-    /// both.
+    /// pre-standard OAuth 2.0 mechanism) with `ensure_capabilities=true`.
+    /// The `token` is an OAuth 2.0 bearer access token: the connection
+    /// must be TLS-protected. Prefer [`auth_oauthbearer`] on servers that
+    /// support both.
     ///
     /// [`auth_oauthbearer`]: ImapClientStd::auth_oauthbearer
     pub fn auth_xoauth2(
         &mut self,
         params: ImapAuthXOAuth2Params,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthXOAuth2::new(context, params, true),
-            ImapAuthXOAuth2Result,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthXOAuth2::new(params, true))
     }
 
     /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
@@ -514,65 +421,25 @@ impl<S: Read + Write> ImapClientStd<S> {
     pub fn auth_scram_sha256(
         &mut self,
         params: ImapAuthScramSha256Params,
-    ) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapAuthScramSha256::new(context, params, true),
-            ImapAuthScramSha256Result,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapAuthScramSha256::new(params, true))
     }
 
-    /// Runs [`ImapLogout`] (`LOGOUT`). Drops the session context after
-    /// a successful logout; subsequent calls return
-    /// [`ImapClientStdError::MissingContext`].
+    /// Runs [`ImapLogout`] (`LOGOUT`).
     pub fn logout(&mut self) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        let mut coroutine = ImapLogout::new(context);
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut arg: Option<&[u8]> = None;
-
-        loop {
-            match coroutine.resume(arg) {
-                ImapLogoutResult::Ok { .. } => return Ok(()),
-                ImapLogoutResult::WantsRead => {
-                    let n = self.stream.read(&mut buf)?;
-                    arg = Some(&buf[..n]);
-                }
-                ImapLogoutResult::WantsWrite(bytes) => {
-                    self.stream.write_all(&bytes)?;
-                    arg = None;
-                }
-                ImapLogoutResult::Err { context, err } => {
-                    self.context = Some(context);
-                    return Err(err.into());
-                }
-            }
-        }
+        self.run(ImapLogout::new())
     }
 
     // ---- State / introspection -------------------------------------------
 
-    /// Runs [`ImapCapabilityGet`] (`CAPABILITY`). Returns the refreshed
-    /// capability list.
-    pub fn capability(&mut self) -> Result<&[Capability<'static>], ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapCapabilityGet::new(context),
-            ImapCapabilityGetResult,
-            { .. } => self.context.as_ref().unwrap().capability.as_slice()
-        );
+    /// Runs [`ImapCapabilityGet`] (`CAPABILITY`).
+    pub fn capability(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
+        self.run(ImapCapabilityGet::new())
     }
 
-    /// Runs [`ImapNoop`] (`NOOP`). Any untagged updates the server pushes back
-    /// are applied to the inner [`ImapContext`]; inspect via [`context`].
-    ///
-    /// [`context`]: ImapClientStd::context
+    /// Runs [`ImapNoop`] (`NOOP`).
     pub fn noop(&mut self) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(self, ImapNoop::new(context), ImapNoopResult);
+        self.run(ImapNoop::new())
     }
 
     /// Runs [`ImapServerId`] (`ID`, RFC 2971). Pass [`None`] to send the
@@ -581,13 +448,7 @@ impl<S: Read + Write> ImapClientStd<S> {
         &mut self,
         parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<Option<Vec<(IString<'static>, NString<'static>)>>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapServerId::new(context, parameters),
-            ImapServerIdResult,
-            { server_id, .. } => server_id
-        );
+        self.run(ImapServerId::new(parameters))
     }
 
     /// Runs [`ImapExtensionEnable`] (`ENABLE`, RFC 5161).
@@ -595,13 +456,7 @@ impl<S: Read + Write> ImapClientStd<S> {
         &mut self,
         capabilities: Vec1<CapabilityEnable<'static>>,
     ) -> Result<Option<Vec<CapabilityEnable<'static>>>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapExtensionEnable::new(context, capabilities),
-            ImapExtensionEnableResult,
-            { enabled, .. } => enabled
-        );
+        self.run(ImapExtensionEnable::new(capabilities))
     }
 
     // ---- Mailbox structure -----------------------------------------------
@@ -612,13 +467,7 @@ impl<S: Read + Write> ImapClientStd<S> {
         reference: Mailbox<'static>,
         pattern: ListMailbox<'static>,
     ) -> Result<ImapMailboxListing, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxList::new(context, reference, pattern),
-            ImapMailboxListResult,
-            { mailboxes, .. } => mailboxes
-        );
+        self.run(ImapMailboxList::new(reference, pattern))
     }
 
     /// Runs [`ImapMailboxLsub`] (`LSUB <reference> <pattern>`).
@@ -627,13 +476,7 @@ impl<S: Read + Write> ImapClientStd<S> {
         reference: Mailbox<'static>,
         pattern: ListMailbox<'static>,
     ) -> Result<ImapMailboxListing, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxLsub::new(context, reference, pattern),
-            ImapMailboxLsubResult,
-            { mailboxes, .. } => mailboxes
-        );
+        self.run(ImapMailboxLsub::new(reference, pattern))
     }
 
     /// Runs [`ImapMailboxStatus`] (`STATUS <mailbox> <items>`).
@@ -642,33 +485,17 @@ impl<S: Read + Write> ImapClientStd<S> {
         mailbox: Mailbox<'static>,
         item_names: impl Into<Cow<'static, [StatusDataItemName]>>,
     ) -> Result<Vec<StatusDataItem>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxStatus::new(context, mailbox, item_names),
-            ImapMailboxStatusResult,
-            { items, .. } => items
-        );
+        self.run(ImapMailboxStatus::new(mailbox, item_names))
     }
 
     /// Runs [`ImapMailboxCreate`] (`CREATE <mailbox>`).
     pub fn create(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxCreate::new(context, mailbox),
-            ImapMailboxCreateResult
-        );
+        self.run(ImapMailboxCreate::new(mailbox))
     }
 
     /// Runs [`ImapMailboxDelete`] (`DELETE <mailbox>`).
     pub fn delete(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxDelete::new(context, mailbox),
-            ImapMailboxDeleteResult
-        );
+        self.run(ImapMailboxDelete::new(mailbox))
     }
 
     /// Runs [`ImapMailboxRename`] (`RENAME <from> <to>`).
@@ -677,79 +504,45 @@ impl<S: Read + Write> ImapClientStd<S> {
         from: Mailbox<'static>,
         to: Mailbox<'static>,
     ) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxRename::new(context, from, to),
-            ImapMailboxRenameResult
-        );
+        self.run(ImapMailboxRename::new(from, to))
     }
 
     /// Runs [`ImapMailboxSubscribe`] (`SUBSCRIBE <mailbox>`).
     pub fn subscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxSubscribe::new(context, mailbox),
-            ImapMailboxSubscribeResult
-        );
+        self.run(ImapMailboxSubscribe::new(mailbox))
     }
 
     /// Runs [`ImapMailboxUnsubscribe`] (`UNSUBSCRIBE <mailbox>`).
     pub fn unsubscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxUnsubscribe::new(context, mailbox),
-            ImapMailboxUnsubscribeResult
-        );
+        self.run(ImapMailboxUnsubscribe::new(mailbox))
     }
 
     // ---- Mailbox selection -----------------------------------------------
 
     /// Runs [`ImapMailboxSelect`] (`SELECT <mailbox>`).
     pub fn select(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxSelect::new(context, mailbox),
-            ImapMailboxSelectResult,
-            { data, .. } => data
-        );
+        self.run(ImapMailboxSelect::new(mailbox))
     }
 
     /// Runs [`ImapMailboxExamine`] (`EXAMINE <mailbox>`).
     pub fn examine(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxExamine::new(context, mailbox),
-            ImapMailboxExamineResult,
-            { data, .. } => data
-        );
+        self.run(ImapMailboxExamine::new(mailbox))
     }
 
-    /// Runs `SELECT <mailbox> (QRESYNC (<uidvalidity>
-    /// <highestmodseq>))` (RFC 7162). Delegates to
-    /// [`ImapMailboxSelect::with_parameters`]; the returned
-    /// [`SelectData`] carries the usual SELECT fields plus
-    /// `highest_mod_seq`, `vanished_earlier`, and `changed`. Errors
-    /// with [`ImapClientStdError::QresyncNotSupported`] when the
-    /// cached CAPABILITY list does not advertise QRESYNC, or with
-    /// [`ImapClientStdError::InvalidModSeq`] when `highest_mod_seq`
-    /// is 0.
+    /// Runs `SELECT <mailbox> (QRESYNC (<uidvalidity> <highestmodseq>))`
+    /// (RFC 7162). The caller must have observed `QRESYNC` in the
+    /// `capability` slice; otherwise this errors with
+    /// [`ImapClientStdError::QresyncNotSupported`]. Errors with
+    /// [`ImapClientStdError::InvalidModSeq`] when `highest_mod_seq` is
+    /// 0.
     pub fn select_qresync(
         &mut self,
         mailbox: Mailbox<'static>,
         uid_validity: NonZeroU32,
         highest_mod_seq: u64,
+        capability: &[Capability<'static>],
     ) -> Result<SelectData, ImapClientStdError> {
-        let supports_qresync = self
-            .capabilities()
-            .map(|caps| caps.contains(&Capability::QResync))
-            .unwrap_or(false);
-
-        if !supports_qresync {
+        if !capability.contains(&Capability::QResync) {
             return Err(ImapClientStdError::QresyncNotSupported);
         }
 
@@ -757,7 +550,6 @@ impl<S: Read + Write> ImapClientStd<S> {
             return Err(ImapClientStdError::InvalidModSeq);
         };
 
-        let context = self.take_context()?;
         let parameters = vec![SelectParameter::QResync {
             uid_validity,
             mod_sequence_value: highest_mod_seq,
@@ -765,207 +557,54 @@ impl<S: Read + Write> ImapClientStd<S> {
             seq_match_data: None,
         }];
 
-        coroutine!(
-            self,
-            ImapMailboxSelect::with_parameters(context, mailbox, parameters),
-            ImapMailboxSelectResult,
-            { data, .. } => data
-        );
+        self.run(ImapMailboxSelect::with_parameters(mailbox, parameters))
     }
 
     /// Runs [`ImapMailboxClose`] (`CLOSE`).
     pub fn close(&mut self) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(self, ImapMailboxClose::new(context), ImapMailboxCloseResult);
+        self.run(ImapMailboxClose::new())
     }
 
     /// Runs [`ImapMailboxUnselect`] (`UNSELECT`, RFC 3691).
     pub fn unselect(&mut self) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxUnselect::new(context),
-            ImapMailboxUnselectResult
-        );
+        self.run(ImapMailboxUnselect::new())
     }
 
     /// Runs [`ImapMailboxCheck`] (`CHECK`).
     pub fn check(&mut self) -> Result<(), ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(self, ImapMailboxCheck::new(context), ImapMailboxCheckResult);
+        self.run(ImapMailboxCheck::new())
     }
 
-    /// Runs [`ImapMailboxExpunge`] (`EXPUNGE`). Returns the sequence numbers
-    /// of expunged messages.
+    /// Runs [`ImapMailboxExpunge`] (`EXPUNGE`). Returns the sequence
+    /// numbers of expunged messages.
     pub fn expunge(&mut self) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxExpunge::new(context),
-            ImapMailboxExpungeResult,
-            { expunged, .. } => expunged
-        );
+        self.run(ImapMailboxExpunge::new())
     }
 
-    // ---- Messages --------------------------------------------------------
-
-    /// Runs [`ImapMessageFetch`] (`FETCH` or `UID FETCH`).
-    pub fn fetch(
-        &mut self,
-        sequence_set: SequenceSet,
-        items: MacroOrMessageDataItemNames<'static>,
-        uid: bool,
-    ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageFetch::new(context, sequence_set, items, uid),
-            ImapMessageFetchResult,
-            { data, .. } => data
-        );
-    }
-
-    /// Runs [`ImapMessageSearch`] (`SEARCH` or `UID SEARCH`).
-    pub fn search(
-        &mut self,
-        criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
-    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageSearch::new(context, criteria, uid),
-            ImapMessageSearchResult,
-            { ids, .. } => ids
-        );
-    }
-
-    /// Runs [`ImapMessageStore`] (`STORE` or `UID STORE`). Returns the updated
-    /// message data items the server reported back.
-    pub fn store(
-        &mut self,
-        sequence_set: SequenceSet,
-        kind: StoreType,
-        flags: Vec<Flag<'static>>,
-        uid: bool,
-    ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageStore::new(context, sequence_set, kind, flags, uid),
-            ImapMessageStoreResult,
-            { data, .. } => data
-        );
-    }
-
-    /// Runs [`ImapMessageCopy`] (`COPY` or `UID COPY`).
-    pub fn copy(
-        &mut self,
-        sequence_set: SequenceSet,
-        mailbox: Mailbox<'static>,
-        uid: bool,
-    ) -> Result<ImapCopyUid, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageCopy::new(context, sequence_set, mailbox, uid),
-            ImapMessageCopyResult,
-            { copyuid, .. } => copyuid
-        );
-    }
-
-    /// Runs [`ImapMessageMove`] (`MOVE` or `UID MOVE`, RFC 6851).
-    pub fn r#move(
-        &mut self,
-        sequence_set: SequenceSet,
-        mailbox: Mailbox<'static>,
-        uid: bool,
-    ) -> Result<ImapCopyUid, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageMove::new(context, sequence_set, mailbox, uid),
-            ImapMessageMoveResult,
-            { copyuid, .. } => copyuid
-        );
-    }
-
-    /// Runs [`ImapMessageAppend`] (`APPEND <mailbox> [flags] [date]
-    /// <message>`). Returns the optional `EXISTS` count and the
-    /// `[APPENDUID uidvalidity uid]` response code (RFC 4315).
-    pub fn append(
-        &mut self,
-        mailbox: Mailbox<'static>,
-        flags: Vec<Flag<'static>>,
-        date: Option<DateTime>,
-        message: LiteralOrLiteral8<'static>,
-    ) -> Result<ImapAppendOutput, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageAppend::new(context, mailbox, flags, date, message),
-            ImapMessageAppendResult,
-            { exists, appenduid, .. } => (exists, appenduid)
-        );
-    }
-
-    // ---- RFC 5256: SORT / THREAD ------------------------------------------
-
-    /// Runs [`ImapMailboxSort`] (`SORT` or `UID SORT`, RFC 5256).
-    pub fn sort(
-        &mut self,
-        sort_criteria: Vec1<SortCriterion>,
-        search_criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
-    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMailboxSort::new(context, sort_criteria, search_criteria, uid),
-            ImapMailboxSortResult,
-            { ids, .. } => ids
-        );
-    }
-
-    /// Runs [`ImapMessageThread`] (`THREAD` or `UID THREAD`, RFC 5256).
-    pub fn thread(
-        &mut self,
-        algorithm: ThreadingAlgorithm<'static>,
-        search_criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
-    ) -> Result<Vec<Thread>, ImapClientStdError> {
-        let context = self.take_context()?;
-        coroutine!(
-            self,
-            ImapMessageThread::new(context, algorithm, search_criteria, uid),
-            ImapMessageThreadResult,
-            { threads, .. } => threads
-        );
-    }
-}
-
-impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
     /// Consumes the client and starts a long-running mailbox watcher.
     ///
     /// Spawns a thread that owns the IMAP connection and advances the
     /// [`ImapMailboxWatch`] coroutine, forwarding each delta as one
-    /// [`ImapMailboxWatchEvent`] on the returned stream's mpsc
-    /// channel. Untagged-response wake-ups are resolved via SELECT
-    /// (QRESYNC). Dropping the stream (or calling
-    /// [`ImapMailboxWatchStream::close`]) flips the shutdown atomic;
-    /// the worker winds the running IDLE down cleanly and exits.
+    /// [`ImapMailboxWatchEvent`] on the returned stream's mpsc channel.
+    /// Untagged-response wake-ups are resolved via SELECT (QRESYNC).  Dropping
+    /// the stream (or calling [`ImapMailboxWatchStream::close`]) flips the
+    /// shutdown atomic; the worker winds the running IDLE down cleanly and
+    /// exits.
     ///
-    /// Errors with [`ImapClientStdError::MailboxWatch`] +
-    /// `ImapMailboxWatchError::QresyncUnsupported` when the cached
-    /// CAPABILITY list does not advertise QRESYNC.
+    /// `capability` is the most recently observed capability list; pass
+    /// the slice returned by `greeting()` / `login()` / `auth_*()` or
+    /// `capability()`. Errors with [`ImapClientStdError::MailboxWatch`]
+    /// + `ImapMailboxWatchError::QresyncUnsupported` when QRESYNC is
+    /// absent.
     pub fn watch_mailbox(
-        mut self,
+        self,
         mailbox: Mailbox<'static>,
+        capability: &[Capability<'static>],
     ) -> Result<ImapMailboxWatchStream, ImapClientStdError> {
-        let context = self.take_context()?;
-        let mut stream: Box<dyn ImapStream> = Box::new(self.stream);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut watcher = ImapMailboxWatch::new(context, mailbox, shutdown.clone())?;
+        let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone())?;
+        let mut fragmentizer = self.fragmentizer;
+        let mut stream: Box<dyn ImapStream> = Box::new(self.stream);
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientStdError>>(256);
         let shutdown_handle = shutdown.clone();
@@ -974,38 +613,36 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
             let mut arg: Option<Vec<u8>> = None;
 
             loop {
-                match watcher.resume(arg.as_deref()) {
+                match watcher.resume(&mut fragmentizer, arg.as_deref()) {
                     ImapMailboxWatchResult::Event(e) => {
                         arg = None;
                         if tx.send(Ok(e)).is_err() {
                             return;
                         }
                     }
-                    ImapMailboxWatchResult::Ok { .. } => return,
+                    ImapMailboxWatchResult::Ok => return,
                     ImapMailboxWatchResult::WantsRead => match stream.read(&mut buf) {
                         Ok(0) => {
-                            let _ = tx.send(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "IMAP server closed the connection during watch",
-                            )
-                            .into()));
+                            let eof = io::ErrorKind::UnexpectedEof;
+                            let err = "IMAP server closed the connection during watch";
+                            tx.send(Err(io::Error::new(eof, err).into())).ok();
                             return;
                         }
                         Ok(n) => arg = Some(buf[..n].to_vec()),
                         Err(err) => {
-                            let _ = tx.send(Err(err.into()));
+                            tx.send(Err(err.into())).ok();
                             return;
                         }
                     },
                     ImapMailboxWatchResult::WantsWrite(bytes) => {
                         if let Err(err) = stream.write_all(&bytes) {
-                            let _ = tx.send(Err(err.into()));
+                            tx.send(Err(err.into())).ok();
                             return;
                         }
                         arg = None;
                     }
-                    ImapMailboxWatchResult::Err { err, .. } => {
-                        let _ = tx.send(Err(err.into()));
+                    ImapMailboxWatchResult::Err(err) => {
+                        tx.send(Err(err.into())).ok();
                         return;
                     }
                 }
@@ -1018,12 +655,100 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
             shutdown: shutdown_handle,
         })
     }
+
+    // ---- Messages --------------------------------------------------------
+
+    /// Runs [`ImapMessageFetch`] (`FETCH` or `UID FETCH`).
+    pub fn fetch(
+        &mut self,
+        sequence_set: SequenceSet,
+        items: MacroOrMessageDataItemNames<'static>,
+        uid: bool,
+    ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
+        self.run(ImapMessageFetch::new(sequence_set, items, uid))
+    }
+
+    /// Runs [`ImapMessageSearch`] (`SEARCH` or `UID SEARCH`).
+    pub fn search(
+        &mut self,
+        criteria: Vec1<SearchKey<'static>>,
+        uid: bool,
+    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
+        self.run(ImapMessageSearch::new(criteria, uid))
+    }
+
+    /// Runs [`ImapMessageStore`] (`STORE` or `UID STORE`). Returns the
+    /// updated message data items the server reported back.
+    pub fn store(
+        &mut self,
+        sequence_set: SequenceSet,
+        kind: StoreType,
+        flags: Vec<Flag<'static>>,
+        uid: bool,
+    ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
+        self.run(ImapMessageStore::new(sequence_set, kind, flags, uid))
+    }
+
+    /// Runs [`ImapMessageCopy`] (`COPY` or `UID COPY`).
+    pub fn copy(
+        &mut self,
+        sequence_set: SequenceSet,
+        mailbox: Mailbox<'static>,
+        uid: bool,
+    ) -> Result<ImapCopyUid, ImapClientStdError> {
+        self.run(ImapMessageCopy::new(sequence_set, mailbox, uid))
+    }
+
+    /// Runs [`ImapMessageMove`] (`MOVE` or `UID MOVE`, RFC 6851).
+    pub fn r#move(
+        &mut self,
+        sequence_set: SequenceSet,
+        mailbox: Mailbox<'static>,
+        uid: bool,
+    ) -> Result<ImapCopyUid, ImapClientStdError> {
+        self.run(ImapMessageMove::new(sequence_set, mailbox, uid))
+    }
+
+    /// Runs [`ImapMessageAppend`] (`APPEND <mailbox> [flags] [date]
+    /// <message>`). Returns the optional `EXISTS` count and the
+    /// `[APPENDUID uidvalidity uid]` response code (RFC 4315).
+    pub fn append(
+        &mut self,
+        mailbox: Mailbox<'static>,
+        flags: Vec<Flag<'static>>,
+        date: Option<DateTime>,
+        message: LiteralOrLiteral8<'static>,
+    ) -> Result<ImapAppendOutput, ImapClientStdError> {
+        self.run(ImapMessageAppend::new(mailbox, flags, date, message))
+    }
+
+    // ---- RFC 5256: SORT / THREAD ------------------------------------------
+
+    /// Runs [`ImapMailboxSort`] (`SORT` or `UID SORT`, RFC 5256).
+    pub fn sort(
+        &mut self,
+        sort_criteria: Vec1<SortCriterion>,
+        search_criteria: Vec1<SearchKey<'static>>,
+        uid: bool,
+    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
+        self.run(ImapMailboxSort::new(sort_criteria, search_criteria, uid))
+    }
+
+    /// Runs [`ImapMessageThread`] (`THREAD` or `UID THREAD`, RFC 5256).
+    pub fn thread(
+        &mut self,
+        algorithm: ThreadingAlgorithm<'static>,
+        search_criteria: Vec1<SearchKey<'static>>,
+        uid: bool,
+    ) -> Result<Vec<Thread>, ImapClientStdError> {
+        self.run(ImapMessageThread::new(algorithm, search_criteria, uid))
+    }
 }
 
 /// Long-lived [`ImapMailboxWatchEvent`] stream backed by a background
 /// worker thread that owns the IMAP connection. Drop or
 /// [`Self::close`] to wind it down; the worker observes the shutdown
-/// atomic, sends `IDLE DONE`, returns its context and exits.
+/// atomic, sends `IDLE DONE`, and exits.
 pub struct ImapMailboxWatchStream {
     rx: Receiver<Result<ImapMailboxWatchEvent, ImapClientStdError>>,
     handle: Option<JoinHandle<()>>,
@@ -1070,18 +795,12 @@ impl Iterator for ImapMailboxWatchStream {
 impl Drop for ImapMailboxWatchStream {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.join().ok();
         }
     }
 }
-
-/// Marker for every blocking, `Send` stream the watcher can run
-/// against; auto-implemented for any concrete `Read + Write + Send`
-/// type. Mirrors the same pattern as
-/// [`io_http::client::HttpClientStd`].
-trait ImapStream: Read + Write + Send {}
-impl<T: Read + Write + Send + ?Sized> ImapStream for T {}
 
 #[cfg(any(
     feature = "rustls-aws",
@@ -1089,32 +808,33 @@ impl<T: Read + Write + Send + ?Sized> ImapStream for T {}
     feature = "native-tls"
 ))]
 impl ImapClientStd<StreamStd> {
-    /// Connects to `url`, optionally performs the STARTTLS upgrade, reads the
-    /// greeting + capability list, then runs the chosen SASL mechanism.
+    /// Connects to `url`, optionally performs the STARTTLS upgrade, reads
+    /// the greeting + capability list, then runs the chosen SASL
+    /// mechanism.
     ///
     /// - `imap://`  goes through plain TCP (port defaults to 143).
     /// - `imaps://` goes through implicit TLS (port defaults to 993).
     /// - `starttls = true` (only valid on `imap://`) performs the IMAP
     ///   `STARTTLS` upgrade and refreshes capabilities over TLS before
     ///   authenticating.
-    /// - `sasl` is the optional SASL mechanism. Accepts anything that converts
-    ///   into a [`Sasl`], so callers can pass the per-mechanism struct
-    ///   directly (e.g. `Some(SaslLogin { .. })`) without wrapping it in a
-    ///   [`Sasl`] variant. Supported mechanisms: [`SaslLogin`] (mapped to
-    ///   the IMAP `LOGIN` command, RFC 3501 §6.2.3), [`SaslPlain`] (RFC
-    ///   4616), [`SaslAnonymous`] (RFC 4505), [`SaslOauthbearer`] (RFC
-    ///   7628), [`SaslXoauth2`] (Google), and [`SaslScramSha256`] (RFC
-    ///   7677, behind the `scram` cargo feature). Pass [`None`] to skip
-    ///   authentication.
+    /// - `sasl` is the optional SASL mechanism. Accepts anything that
+    ///   converts into a [`Sasl`], so callers can pass the per-mechanism
+    ///   struct directly (e.g. `Some(SaslLogin { .. })`) without wrapping
+    ///   it in a [`Sasl`] variant. Supported mechanisms: [`SaslLogin`]
+    ///   (mapped to the IMAP `LOGIN` command, RFC 3501 §6.2.3),
+    ///   [`SaslPlain`] (RFC 4616), [`SaslAnonymous`] (RFC 4505),
+    ///   [`SaslOauthbearer`] (RFC 7628), [`SaslXoauth2`] (Google), and
+    ///   [`SaslScramSha256`] (RFC 7677, behind the `scram` cargo
+    ///   feature). Pass [`None`] to skip authentication.
     ///
-    /// Returns a fully authenticated client ready to issue further
-    /// commands.
+    /// Returns a fully authenticated client paired with the latest
+    /// observed capability list, ready to issue further commands.
     pub fn connect(
         url: &Url,
         tls: &Tls,
         starttls: bool,
         sasl: Option<impl Into<Sasl>>,
-    ) -> Result<Self, ImapClientStdError> {
+    ) -> Result<(Self, Vec<Capability<'static>>), ImapClientStdError> {
         let Some(host) = url.host_str() else {
             return Err(ImapClientStdError::UrlMissingHost(url.to_string()));
         };
@@ -1141,30 +861,27 @@ impl ImapClientStd<StreamStd> {
 
         let mut client = Self::new(stream);
 
-        if starttls {
+        let mut capability = if starttls {
             client.starttls()?;
-            let (raw, context) = client.into_parts();
+            let raw = client.into_stream();
             let upgraded = raw.upgrade_tls(tls)?;
-            client = Self::with_context(upgraded, context.unwrap_or_else(ImapContext::new));
-            client.capability()?;
+            client = Self::new(upgraded);
+            client.capability()?
         } else {
-            client.greeting()?;
-        }
+            client.greeting()?
+        };
 
         if let Some(sasl) = sasl.map(Into::into) {
-            let ir = client
-                .context()
-                .map(|ctx| ctx.capability.contains(&Capability::SaslIr))
-                .unwrap_or(false);
+            let ir = capability.contains(&Capability::SaslIr);
 
-            match sasl {
+            capability = match sasl {
                 Sasl::Anonymous(SaslAnonymous { message }) => {
                     let params = ImapAuthAnonymousParams::new(message.unwrap_or_default(), ir);
-                    client.auth_anonymous(params)?;
+                    client.auth_anonymous(params)?
                 }
                 Sasl::Login(SaslLogin { username, password }) => {
                     let params = ImapLoginParams::new(username, password)?;
-                    client.login(params)?;
+                    client.login(params)?
                 }
                 Sasl::Plain(SaslPlain {
                     authzid,
@@ -1172,7 +889,7 @@ impl ImapClientStd<StreamStd> {
                     passwd,
                 }) => {
                     let params = ImapAuthPlainParams::new(authzid, authcid, passwd, ir);
-                    client.auth_plain(params)?;
+                    client.auth_plain(params)?
                 }
                 Sasl::Oauthbearer(SaslOauthbearer {
                     username,
@@ -1181,24 +898,31 @@ impl ImapClientStd<StreamStd> {
                     token,
                 }) => {
                     let params = ImapAuthOAuthBearerParams::new(username, host, port, token, ir);
-                    client.auth_oauthbearer(params)?;
+                    client.auth_oauthbearer(params)?
                 }
                 Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
                     let params = ImapAuthXOAuth2Params::new(username, token, ir);
-                    client.auth_xoauth2(params)?;
+                    client.auth_xoauth2(params)?
                 }
                 #[cfg(feature = "scram")]
                 Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
                     let params = ImapAuthScramSha256Params::new(username, password, ir);
-                    client.auth_scram_sha256(params)?;
+                    client.auth_scram_sha256(params)?
                 }
                 #[cfg(not(feature = "scram"))]
                 Sasl::ScramSha256(_) => {
                     return Err(ImapClientStdError::ScramSha256NotEnabled);
                 }
-            }
+            };
         }
 
-        Ok(client)
+        Ok((client, capability))
     }
 }
+
+/// Marker for every blocking, `Send` stream the watcher can run
+/// against; auto-implemented for any concrete `Read + Write + Send`
+/// type. Mirrors the same pattern as
+/// [`io_http::client::HttpClientStd`].
+trait ImapStream: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> ImapStream for T {}

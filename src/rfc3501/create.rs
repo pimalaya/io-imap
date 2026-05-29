@@ -1,18 +1,21 @@
 //! I/O-free coroutine to send an IMAP CREATE command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         mailbox::Mailbox,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -31,19 +34,6 @@ pub enum ImapMailboxCreateError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxCreateResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxCreateError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP CREATE command.
 pub struct ImapMailboxCreate {
     send: SendImapCommand<CommandCodec>,
@@ -51,57 +41,52 @@ pub struct ImapMailboxCreate {
 
 impl ImapMailboxCreate {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
+    pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
         let body = CommandBody::Create { mailbox };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxCreateResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxCreateResult::WantsRead,
+impl ImapCoroutine for ImapMailboxCreate {
+    type Output = ();
+    type Error = ImapMailboxCreateError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxCreateResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxCreateResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxCreateError::Bye(bye.text.to_string());
-            return ImapMailboxCreateResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxCreateError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxCreateError::MissingTagged;
-            return ImapMailboxCreateResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxCreateError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapMailboxCreateResult::Ok { context },
-            StatusKind::No => ImapMailboxCreateResult::Err {
-                context,
-                err: ImapMailboxCreateError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxCreateResult::Err {
-                context,
-                err: ImapMailboxCreateError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxCreateError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxCreateError::Bad(body.text.to_string()))
+            }
         }
     }
 }

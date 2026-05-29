@@ -4,8 +4,10 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         extensions::uidplus::{UidElement, UidSet},
         mailbox::Mailbox,
         response::{Code, StatusKind, Tagged},
@@ -14,7 +16,8 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `COPY` (and `MOVE`) command: the
 /// `[COPYUID uidvalidity src-uids dst-uids]` response code (RFC 4315) if the
@@ -23,7 +26,7 @@ use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
 pub type ImapCopyUid = Option<(u32, Vec<u32>, Vec<u32>)>;
 
 /// Expand a `UidSet` into a sorted `Vec<u32>`.
-fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
+pub(crate) fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
     let mut uids = Vec::new();
 
     for elem in uid_set.0 {
@@ -63,20 +66,6 @@ pub enum ImapMessageCopyError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMessageCopyResult {
-    Ok {
-        context: ImapContext,
-        copyuid: ImapCopyUid,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMessageCopyError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP COPY command.
 pub struct ImapMessageCopy {
     send: SendImapCommand<CommandCodec>,
@@ -84,54 +73,46 @@ pub struct ImapMessageCopy {
 
 impl ImapMessageCopy {
     /// Creates a new coroutine.
-    pub fn new(
-        mut context: ImapContext,
-        sequence_set: SequenceSet,
-        mut mailbox: Mailbox<'static>,
-        uid: bool,
-    ) -> Self {
+    pub fn new(sequence_set: SequenceSet, mut mailbox: Mailbox<'static>, uid: bool) -> Self {
         encode_inplace(&mut mailbox);
         let body = CommandBody::Copy {
             sequence_set,
             mailbox,
             uid,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMessageCopyResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMessageCopyResult::WantsRead,
+impl ImapCoroutine for ImapMessageCopy {
+    type Output = ImapCopyUid;
+    type Error = ImapMessageCopyError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMessageCopyResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMessageCopyResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMessageCopyError::Bye(bye.text.to_string());
-            return ImapMessageCopyResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageCopyError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMessageCopyError::MissingTagged;
-            return ImapMessageCopyResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageCopyError::MissingTagged);
         };
 
         match body.kind {
@@ -150,16 +131,14 @@ impl ImapMessageCopy {
                 } else {
                     None
                 };
-                ImapMessageCopyResult::Ok { context, copyuid }
+                ImapCoroutineState::Done(copyuid)
             }
-            StatusKind::No => ImapMessageCopyResult::Err {
-                context,
-                err: ImapMessageCopyError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMessageCopyResult::Err {
-                context,
-                err: ImapMessageCopyError::Bad(body.text.to_string()),
-            },
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMessageCopyError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMessageCopyError::Bad(body.text.to_string()))
+            }
         }
     }
 }

@@ -1,11 +1,5 @@
 //! I/O-free coroutine to authenticate an IMAP mailbox via the SASL
 //! `LOGIN` mechanism.
-//!
-//! Distinct from the RFC 3501 `LOGIN` command: the SASL `LOGIN`
-//! mechanism is a legacy two-prompt scheme invoked via
-//! `AUTHENTICATE LOGIN`; the server requests the username and the
-//! password in turn through base64-encoded continuation challenges.
-//! It was never RFC-standardized but is widely implemented.
 
 use core::mem;
 
@@ -13,16 +7,19 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     AuthenticateDataCodec, CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
-        response::{Code, Data, StatusBody, StatusKind, Tagged},
+        core::TagGenerator,
+        response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::capability::*, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -47,19 +44,6 @@ pub enum ImapAuthLoginError {
 
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
-}
-
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapAuthLoginResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapAuthLoginError,
-    },
 }
 
 pub struct ImapAuthLoginParams {
@@ -89,180 +73,169 @@ pub struct ImapAuthLogin {
     state: State,
     username: String,
     password: String,
+    observed: Vec<Capability<'static>>,
     ensure_capabilities: bool,
 }
 
 impl ImapAuthLogin {
-    /// Creates a new coroutine. When `ensure_capabilities` is true and the
-    /// server did not piggyback a capability list on the AUTHENTICATE tagged
-    /// response, the coroutine drives an extra `CAPABILITY` round-trip
-    /// before completing.
-    pub fn new(
-        mut context: ImapContext,
-        params: ImapAuthLoginParams,
-        ensure_capabilities: bool,
-    ) -> Self {
+    /// Creates a new coroutine.
+    pub fn new(params: ImapAuthLoginParams, ensure_capabilities: bool) -> Self {
         let body = CommandBody::Authenticate {
             mechanism: AuthMechanism::Login,
             initial_response: None,
         };
 
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
-        let send = SendImapCommand::new(context, CommandCodec::new(), command);
+        let command = Command::new(tag.generate(), body).unwrap();
+        let send = SendImapCommand::new(CommandCodec::new(), command);
 
         Self {
             state: State::Send(send),
             username: params.username,
             password: params.password,
+            observed: Vec::new(),
             ensure_capabilities,
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapAuthLoginResult {
+impl ImapCoroutine for ImapAuthLogin {
+    type Output = Vec<Capability<'static>>;
+    type Error = ImapAuthLoginError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
         loop {
             match &mut self.state {
                 State::Send(coroutine) => {
-                    let (context, bye, continuation_request) = match coroutine.resume(arg.take()) {
-                        SendImapCommandResult::WantsRead => {
-                            break ImapAuthLoginResult::WantsRead;
-                        }
+                    let (bye, continuation_request) = match coroutine
+                        .resume(fragmentizer, arg.take())
+                    {
+                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthLoginResult::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             bye,
                             continuation_request,
                             ..
-                        } => (context, bye, continuation_request),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthLoginResult::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (bye, continuation_request),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthLoginError::Bye(bye.text.to_string());
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if continuation_request.is_none() {
-                        let err = ImapAuthLoginError::MissingContinuationRequest;
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthLoginError::MissingContinuationRequest,
+                        );
                     }
 
                     let username = mem::take(&mut self.username).into_bytes();
                     let auth = AuthenticateData::r#continue(username);
                     let codec = AuthenticateDataCodec::new();
-                    self.state =
-                        State::ContinueUsername(SendImapCommand::new(context, codec, auth));
+                    self.state = State::ContinueUsername(SendImapCommand::new(codec, auth));
                 }
                 State::ContinueUsername(coroutine) => {
-                    let (context, bye, continuation_request) = match coroutine.resume(arg.take()) {
-                        SendImapCommandResult::WantsRead => {
-                            break ImapAuthLoginResult::WantsRead;
-                        }
+                    let (bye, continuation_request) = match coroutine
+                        .resume(fragmentizer, arg.take())
+                    {
+                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            break ImapAuthLoginResult::WantsWrite(bytes);
+                            return ImapCoroutineState::WantsWrite(bytes);
                         }
                         SendImapCommandResult::Ok {
-                            context,
                             bye,
                             continuation_request,
                             ..
-                        } => (context, bye, continuation_request),
-                        SendImapCommandResult::Err { context, err } => {
-                            break ImapAuthLoginResult::Err {
-                                context,
-                                err: err.into(),
-                            };
+                        } => (bye, continuation_request),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
                         }
                     };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthLoginError::Bye(bye.text.to_string());
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if continuation_request.is_none() {
-                        let err = ImapAuthLoginError::MissingContinuationRequest;
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthLoginError::MissingContinuationRequest,
+                        );
                     }
 
                     let password = mem::take(&mut self.password).into_bytes();
                     let auth = AuthenticateData::r#continue(password);
                     let codec = AuthenticateDataCodec::new();
-                    self.state =
-                        State::ContinuePassword(SendImapCommand::new(context, codec, auth));
+                    self.state = State::ContinuePassword(SendImapCommand::new(codec, auth));
                 }
                 State::ContinuePassword(coroutine) => {
-                    let (context, bye, continuation_request, tagged, data, untagged) =
-                        match coroutine.resume(arg.take()) {
-                            SendImapCommandResult::WantsRead => {
-                                break ImapAuthLoginResult::WantsRead;
-                            }
-                            SendImapCommandResult::WantsWrite(bytes) => {
-                                break ImapAuthLoginResult::WantsWrite(bytes);
-                            }
-                            SendImapCommandResult::Ok {
-                                context,
-                                bye,
-                                continuation_request,
-                                tagged,
-                                data,
-                                untagged,
-                                ..
-                            } => (context, bye, continuation_request, tagged, data, untagged),
-                            SendImapCommandResult::Err { context, err } => {
-                                break ImapAuthLoginResult::Err {
-                                    context,
-                                    err: err.into(),
-                                };
-                            }
-                        };
+                    let (bye, continuation_request, tagged, data, untagged) = match coroutine
+                        .resume(fragmentizer, arg.take())
+                    {
+                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+                        SendImapCommandResult::WantsWrite(bytes) => {
+                            return ImapCoroutineState::WantsWrite(bytes);
+                        }
+                        SendImapCommandResult::Ok {
+                            bye,
+                            continuation_request,
+                            tagged,
+                            data,
+                            untagged,
+                            ..
+                        } => (bye, continuation_request, tagged, data, untagged),
+                        SendImapCommandResult::Err(err) => {
+                            return ImapCoroutineState::Err(err.into());
+                        }
+                    };
 
                     if let Some(bye) = bye {
-                        let err = ImapAuthLoginError::Bye(bye.text.to_string());
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                            bye.text.to_string(),
+                        ));
                     }
 
                     if continuation_request.is_some() {
-                        let err = ImapAuthLoginError::UnexpectedContinuationRequest;
-                        return ImapAuthLoginResult::Err { context, err };
+                        return ImapCoroutineState::Err(
+                            ImapAuthLoginError::UnexpectedContinuationRequest,
+                        );
                     }
 
-                    match finish(context, tagged, data, untagged) {
-                        Ok(context) => {
-                            if self.ensure_capabilities && context.capability.is_empty() {
-                                self.state = State::Capability(ImapCapabilityGet::new(context));
+                    match finish(tagged, data, untagged) {
+                        Ok(capability) => {
+                            self.observed = capability;
+                            if self.ensure_capabilities && self.observed.is_empty() {
+                                self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapAuthLoginResult::Ok { context };
+                            return ImapCoroutineState::Done(mem::take(&mut self.observed));
                         }
-                        Err((context, err)) => {
-                            return ImapAuthLoginResult::Err { context, err };
-                        }
+                        Err(err) => return ImapCoroutineState::Err(err),
                     }
                 }
-                State::Capability(coroutine) => match coroutine.resume(arg.take()) {
-                    ImapCapabilityGetResult::WantsRead => {
-                        break ImapAuthLoginResult::WantsRead;
+                State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::WantsRead => return ImapCoroutineState::WantsRead,
+                    ImapCoroutineState::WantsWrite(bytes) => {
+                        return ImapCoroutineState::WantsWrite(bytes);
                     }
-                    ImapCapabilityGetResult::WantsWrite(bytes) => {
-                        break ImapAuthLoginResult::WantsWrite(bytes);
+                    ImapCoroutineState::Done(capability) => {
+                        return ImapCoroutineState::Done(capability);
                     }
-                    ImapCapabilityGetResult::Ok { context } => {
-                        break ImapAuthLoginResult::Ok { context };
-                    }
-                    ImapCapabilityGetResult::Err { context, err } => {
-                        break ImapAuthLoginResult::Err {
-                            context,
-                            err: err.into(),
-                        };
+                    ImapCoroutineState::Err(err) => {
+                        return ImapCoroutineState::Err(err.into());
                     }
                 },
             }
@@ -271,51 +244,36 @@ impl ImapAuthLogin {
 }
 
 fn finish(
-    mut context: ImapContext,
     tagged: Option<Tagged<'static>>,
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
-) -> Result<ImapContext, (ImapContext, ImapAuthLoginError)> {
+) -> Result<Vec<Capability<'static>>, ImapAuthLoginError> {
     let Some(Tagged { body, .. }) = tagged else {
-        let err = ImapAuthLoginError::MissingTagged;
-        return Err((context, err));
+        return Err(ImapAuthLoginError::MissingTagged);
     };
 
     let code = match body.kind {
         StatusKind::Ok => body.code,
-        StatusKind::No => {
-            let err = ImapAuthLoginError::No(body.text.to_string());
-            return Err((context, err));
-        }
-        StatusKind::Bad => {
-            let err = ImapAuthLoginError::Bad(body.text.to_string());
-            return Err((context, err));
-        }
+        StatusKind::No => return Err(ImapAuthLoginError::No(body.text.to_string())),
+        StatusKind::Bad => return Err(ImapAuthLoginError::Bad(body.text.to_string())),
     };
 
     let mut new_capability = None;
-
     if let Some(Code::Capability(capability)) = code {
         new_capability.replace(capability);
     }
-
     for data in data {
         if let Data::Capability(capability) = data {
             new_capability.replace(capability);
         }
     }
-
     for StatusBody { code, .. } in untagged {
         if let Some(Code::Capability(capability)) = code {
             new_capability.replace(capability);
         }
     }
 
-    if let Some(capability) = new_capability {
-        context.capability = capability.into_iter().collect();
-    }
-
-    context.authenticated = true;
-
-    Ok(context)
+    Ok(new_capability
+        .map(|c| c.into_iter().collect())
+        .unwrap_or_default())
 }

@@ -2,34 +2,42 @@
 
 IMAP client library, written in Rust
 
+This library is composed of 3 feature-gated layers:
+
+- Low-level **I/O-free** coroutines: these `no_std`-compatible state machines contain the whole IMAP logic and can be used anywhere
+- Mid-level **light client**: a standard, blocking IMAP client using a `Stream: Read + Write`
+- High-level **full client**: light client + TCP connections and TLS negotiations handled for you
+
 ## Table of contents
 
 - [Features](#features)
 - [RFC coverage](#rfc-coverage)
+- [Usage](#usage)
+  - [I/O-free coroutines](#io-free-coroutines)
+  - [Light client](#light-client)
+  - [Full client](#full-client)
 - [Examples](#examples)
-  - [As a no-std coroutine library](#as-a-no-std-coroutine-library)
-  - [As a light std client (BYO stream)](#as-a-light-std-client-byo-stream)
-  - [As a full std client (TCP + TLS)](#as-a-full-std-client-tcp--tls)
-- [More examples](#more-examples)
 - [License](#license)
 - [Social](#social)
 - [Sponsoring](#sponsoring)
 
 ## Features
 
-- **I/O-free** coroutines: every IMAP command is exposed as a `resume(arg: Option<&[u8]>)` state machine. No sockets, no async runtime, no `std` required. Drive against any blocking, async, or fuzz harness.
-- **Standard, blocking client**:
-  - Light client (requires `client` feature): `ImapClientStd::new(stream)` wraps a connected `Read + Write` stream and exposes one method per coroutine, with the long-lived `ImapContext` managed for you. You still own TCP / TLS / STARTTLS.
-  - Full std client (requires `rustls-ring`, `rustls-aws`, or `native-tls` feature): `ImapClientStd::connect(url, tls, starttls, sasl)` opens `imap://` / `imaps://` URLs via [pimalaya/stream](https://github.com/pimalaya/stream), drives the optional STARTTLS upgrade, and runs the chosen SASL mechanism, returning a ready-to-use authenticated client.
+- **I/O-free** coroutines: `no_std` state machines; no sockets, no async runtime, no `std` required, drive against any blocking, async, or fuzz harness.
+- Light standard, blocking client (requires `client` feature)
+- Full standard, blocking client with **TLS** support:
+  - [Rustls](https://crates.io/crates/rustls) with ring crypto (requires `rustls-ring` feature)
+  - [Rustls](https://crates.io/crates/rustls) with aws crypto (requires `rustls-aws` feature)
+  - [Native TLS](https://crates.io/crates/native-tls) (requires `native-tls` feature)
 - **SASL mechanisms**:
-  - `LOGIN`, `PLAIN`, `ANONYMOUS`, `XOAUTH2` and `OAUTHBEARER` built-in
+  - `ANONYMOUS`, `LOGIN`, `PLAIN`, `XOAUTH2` and `OAUTHBEARER` built-in
   - `SCRAM-SHA-256` (requires `scram` feature)
+- IMAP extensions: `IDLE`, `CONDSTORE`, `QRESYNC` etc (see [RFC coverage](#rfc-coverage))
 
-*The `io-imap` library is written in [Rust](https://www.rust-lang.org/), and relies on [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to enable or disable functionalities. Default features can be found in the `features` section of the [`Cargo.toml`](https://github.com/pimalaya/io-imap/blob/master/Cargo.toml), or on [docs.rs](https://docs.rs/crate/io-imap/latest/features).*
+> [!TIP]
+> I/O IMAP is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate backend support. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-imap/latest/features).
 
 ## RFC coverage
-
-This library implements IMAP as I/O-agnostic coroutines: no sockets, no async runtime, no `std` required.
 
 | Module   | What it covers                                                                                                                                                                                                |
 |----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -57,18 +65,18 @@ This library implements IMAP as I/O-agnostic coroutines: no sockets, no async ru
 [7628]: https://www.rfc-editor.org/rfc/rfc7628
 [7677]: https://www.rfc-editor.org/rfc/rfc7677
 
-## Examples
+## Usage
 
-`io-imap` can be consumed three ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
+I/O-IMAP can be consumed three ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
 
-Whichever mode you pick, every coroutine exposes `resume(arg: Option<&[u8]>)` returning a result enum with four shapes:
+Whichever mode you pick, every standard-shape coroutine implements the `ImapCoroutine` trait. Its `resume(&mut Fragmentizer, Option<&[u8]>)` method returns an `ImapCoroutineState<Output, Error>` with four shapes:
 
 - `WantsRead`: caller reads more bytes from the socket and feeds them back on the next call. Pass `Some(&[])` to signal EOF.
 - `WantsWrite(Vec<u8>)`: caller writes these bytes to the socket. The next call typically passes `None`.
-- `Ok { … }`: terminal success.
-- `Err { … }`: terminal failure.
+- `Done(Output)`: terminal success carrying the coroutine's `Output` associated type.
+- `Err(Error)`: terminal failure carrying the coroutine's `Error` associated type.
 
-### As a no-std coroutine library
+### I/O-free coroutines
 
 No features required: works in `#![no_std]`, no sockets, no async runtime. You own the loop and the bytes; the library only produces command bytes and consumes server responses.
 
@@ -77,23 +85,24 @@ Read the IMAP greeting against a blocking TCP socket (the same shape works under
 ```rust,ignore
 use std::{io::Read, net::TcpStream};
 
-use io_imap::{context::ImapContext, rfc3501::greeting::*};
+use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::greeting::*};
 
 let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
 let mut buf = [0u8; 16 * 1024];
+let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 
-let mut coroutine = ImapGreetingGet::new(ImapContext::new(), false);
+let mut coroutine = ImapGreetingGet::new(true);
 let mut arg: Option<&[u8]> = None;
 
-let context = loop {
-    match coroutine.resume(arg.take()) {
-        ImapGreetingGetResult::Ok { context } => break context,
-        ImapGreetingGetResult::WantsRead => {
+let capability = loop {
+    match coroutine.resume(&mut fragmentizer, arg.take()) {
+        ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => break capability,
+        ImapCoroutineState::WantsRead => {
             let n = stream.read(&mut buf).unwrap();
             arg = Some(&buf[..n]);
         }
-        ImapGreetingGetResult::WantsWrite(_) => unreachable!(),
-        ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
+        ImapCoroutineState::WantsWrite(_) => unreachable!(),
+        ImapCoroutineState::Err(err) => panic!("{err}"),
     }
 };
 ```
@@ -104,28 +113,28 @@ Drive a multi-step command (LIST) the same way:
 use std::{io::{Read, Write}, net::TcpStream};
 
 use imap_codec::imap_types::mailbox::{ListMailbox, Mailbox};
-use io_imap::{context::ImapContext, rfc3501::list::*};
+use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::list::*};
 
 # let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
 # let mut buf = [0u8; 16 * 1024];
-# let context = ImapContext::new();
+# let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 let reference = Mailbox::try_from("").unwrap();
 let pattern = ListMailbox::try_from("*").unwrap();
-let mut coroutine = ImapMailboxList::new(context, reference, pattern);
+let mut coroutine = ImapMailboxList::new(reference, pattern);
 let mut arg: Option<&[u8]> = None;
 
 let mailboxes = loop {
-    match coroutine.resume(arg.take()) {
-        ImapMailboxListResult::Ok { mailboxes, .. } => break mailboxes,
-        ImapMailboxListResult::WantsRead => {
+    match coroutine.resume(&mut fragmentizer, arg.take()) {
+        ImapCoroutineState::Done(mailboxes) => break mailboxes,
+        ImapCoroutineState::WantsRead => {
             let n = stream.read(&mut buf).unwrap();
             arg = Some(&buf[..n]);
         }
-        ImapMailboxListResult::WantsWrite(bytes) => {
+        ImapCoroutineState::WantsWrite(bytes) => {
             stream.write_all(&bytes).unwrap();
             arg = None;
         }
-        ImapMailboxListResult::Err { err, .. } => panic!("{err}"),
+        ImapCoroutineState::Err(err) => panic!("{err}"),
     }
 };
 
@@ -134,9 +143,9 @@ for (mailbox, _delimiter, _flags) in mailboxes {
 }
 ```
 
-### As a light std client (BYO stream)
+### Light client
 
-Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Read + Write` and exposes one method per IMAP command. You still open the TCP socket, run TLS / STARTTLS yourself, and hand over a ready-to-talk stream; the client takes it from there.
+Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Read + Write` and exposes one method per IMAP command. You still open the TCP socket, run TLS / STARTTLS yourself, authenticate, and hand over a ready-to-talk stream; the client takes it from there.
 
 ```toml,ignore
 [dependencies]
@@ -162,13 +171,13 @@ for (mailbox, _, _) in client.list(reference, pattern)? {
 }
 ```
 
-### As a full std client (TCP + TLS)
+### Full client
 
 Enable one of the TLS feature flags: `rustls-ring` (default), `rustls-aws`, or `native-tls`. `ImapClientStd::connect(url, tls, starttls, sasl)` opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream), drives the optional STARTTLS upgrade, reads the greeting + capability list, and runs the chosen SASL mechanism, returning a ready-to-use authenticated client.
 
 ```toml,ignore
 [dependencies]
-io-imap = "0.0.1" # rustls-ring is enabled by default
+io-imap = { version = "0.0.1", default-features = false, features = ["rustls-ring"] }
 ```
 
 ```rust,ignore
@@ -184,7 +193,7 @@ let sasl = SaslLogin {
     password: SecretString::from("hunter2".to_owned()),
 };
 
-let mut client = ImapClientStd::connect(&url, &tls, false, Some(sasl))?;
+let (mut client, _capability) = ImapClientStd::connect(&url, &tls, false, Some(sasl))?;
 
 // session is already authenticated; issue further commands directly
 for (mailbox, _, _) in client.list("".try_into()?, "*".try_into()?)? {
@@ -194,13 +203,17 @@ for (mailbox, _, _) in client.list("".try_into()?, "*".try_into()?)? {
 
 The `sasl` argument is `Option<impl Into<Sasl>>`, so any of the per-mechanism structs (`SaslLogin`, `SaslPlain`, `SaslAnonymous`, `SaslOauthbearer`, `SaslXoauth2`, `SaslScramSha256` behind the `scram` feature) can be passed in `Some(...)` directly without wrapping in a `Sasl` variant.
 
-*See complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).*
+## Examples
 
-## More examples
+See complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).
 
-Have a look at projects built on top of this library:
+Have a look at real-world projects built on top of this library:
 
-- [himalaya](https://github.com/pimalaya/himalaya): CLI to manage emails
+- [Himalaya CLI](https://github.com/pimalaya/himalaya): CLI to manage emails
+- [Himalaya TUI](https://github.com/pimalaya/himalaya-tui): TUI to manage emails
+- [Neverest](https://github.com/pimalaya/neverest): CLI to synchronize emails
+- [Mirador](https://github.com/pimalaya/mirador): CLI to watch mailbox changes and fire hooks on every event
+- [Sirup](https://github.com/pimalaya/sirup): CLI to spawn pre-authenticated IMAP/SMTP sessions and expose them via Unix sockets
 
 ## License
 

@@ -1,6 +1,6 @@
 use std::{env, io::Read};
 
-use io_imap::{context::ImapContext, rfc3501::greeting::*};
+use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::greeting::*};
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
 
 fn main() {
@@ -12,26 +12,26 @@ fn main() {
         .parse()
         .expect("PORT u16");
 
-    let context = ImapContext::new();
+    let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 
     let tls = Tls::default();
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
 
-    let mut coroutine = ImapGreetingGet::new(context, false);
+    let mut coroutine = ImapGreetingGet::new(false);
     let mut arg: Option<&[u8]> = None;
     let mut buf = [0u8; 16 * 1024];
 
-    let context = loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::Ok { context } => break context,
-            ImapGreetingGetResult::WantsRead => {
+    let capability = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => break capability,
+            ImapCoroutineState::WantsRead => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapGreetingGetResult::WantsWrite(_) => unreachable!(),
-            ImapGreetingGetResult::Err { err, .. } => panic!("{err}"),
+            ImapCoroutineState::WantsWrite(_) => unreachable!(),
+            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     };
 
-    println!("context: {context:#?}");
+    println!("capability: {capability:#?}");
 }

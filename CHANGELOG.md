@@ -21,4 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Flattened `ImapIdleDone` into a plain `Arc<AtomicBool>`: `ImapIdle::new` now takes `done: Arc<AtomicBool>` directly. Callers use `done.store(true, Ordering::SeqCst)` / `done.load(Ordering::SeqCst)` instead of the wrapper's `done()` / `is_done()` methods.
 
+- Unified all standard-shape coroutines under a single `ImapCoroutine` trait (in `crate::coroutine`) with associated `Output` and `Error`. `resume` now returns `ImapCoroutineState<Output, Error>` directly; the per-coroutine `Imap*Result` enums are gone. `ImapClientStd::run<C: ImapCoroutine>` drives any coroutine to completion. Exempt (kept as-is with their own result enum): `ImapStartTls`, `ImapIdle`, `ImapMailboxWatch`.
+
+- Added `ImapGreetingOk { capability, pre_authenticated }` as the `ImapGreetingGet` output struct (replaces the multi-field `Ok` variant of the dropped `ImapGreetingGetResult`).
+
 [unreleased]: https://github.com/pimalaya/io-imap/compare/root..HEAD

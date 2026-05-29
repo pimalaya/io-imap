@@ -1,18 +1,21 @@
 //! I/O-free coroutine to send an IMAP UNSUBSCRIBE command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         mailbox::Mailbox,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -31,19 +34,6 @@ pub enum ImapMailboxUnsubscribeError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxUnsubscribeResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxUnsubscribeError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP UNSUBSCRIBE command.
 pub struct ImapMailboxUnsubscribe {
     send: SendImapCommand<CommandCodec>,
@@ -51,57 +41,54 @@ pub struct ImapMailboxUnsubscribe {
 
 impl ImapMailboxUnsubscribe {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
+    pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
         let body = CommandBody::Unsubscribe { mailbox };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxUnsubscribeResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxUnsubscribeResult::WantsRead,
+impl ImapCoroutine for ImapMailboxUnsubscribe {
+    type Output = ();
+    type Error = ImapMailboxUnsubscribeError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxUnsubscribeResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxUnsubscribeResult::Err {
-                    context,
-                    err: err.into(),
-                };
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Err(err.into());
             }
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxUnsubscribeError::Bye(bye.text.to_string());
-            return ImapMailboxUnsubscribeResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxUnsubscribeError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxUnsubscribeError::MissingTagged;
-            return ImapMailboxUnsubscribeResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxUnsubscribeError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapMailboxUnsubscribeResult::Ok { context },
-            StatusKind::No => ImapMailboxUnsubscribeResult::Err {
-                context,
-                err: ImapMailboxUnsubscribeError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxUnsubscribeResult::Err {
-                context,
-                err: ImapMailboxUnsubscribeError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxUnsubscribeError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxUnsubscribeError::Bad(body.text.to_string()))
+            }
         }
     }
 }

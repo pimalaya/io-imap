@@ -1,17 +1,20 @@
 //! I/O-free coroutine to send an IMAP NOOP command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -30,19 +33,6 @@ pub enum ImapNoopError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapNoopResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapNoopError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP NOOP command.
 pub struct ImapNoop {
     send: SendImapCommand<CommandCodec>,
@@ -50,53 +40,52 @@ pub struct ImapNoop {
 
 impl ImapNoop {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext) -> Self {
+    pub fn new() -> Self {
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), CommandBody::Noop).unwrap();
+        let command = Command::new(tag.generate(), CommandBody::Noop).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapNoopResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapNoopResult::WantsRead,
-            SendImapCommandResult::WantsWrite(bytes) => return ImapNoopResult::WantsWrite(bytes),
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapNoopResult::Err {
-                    context,
-                    err: err.into(),
-                };
+impl ImapCoroutine for ImapNoop {
+    type Output = ();
+    type Error = ImapNoopError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsWrite(bytes) => {
+                return ImapCoroutineState::WantsWrite(bytes);
             }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapNoopError::Bye(bye.text.to_string());
-            return ImapNoopResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapNoopError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapNoopError::MissingTagged;
-            return ImapNoopResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapNoopError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapNoopResult::Ok { context },
-            StatusKind::No => ImapNoopResult::Err {
-                context,
-                err: ImapNoopError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapNoopResult::Err {
-                context,
-                err: ImapNoopError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => ImapCoroutineState::Err(ImapNoopError::No(body.text.to_string())),
+            StatusKind::Bad => ImapCoroutineState::Err(ImapNoopError::Bad(body.text.to_string())),
         }
+    }
+}
+
+impl Default for ImapNoop {
+    fn default() -> Self {
+        Self::new()
     }
 }

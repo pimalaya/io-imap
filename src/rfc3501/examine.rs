@@ -1,10 +1,4 @@
-//! I/O-free coroutine to send an IMAP SELECT or EXAMINE command.
-//!
-//! Accepts an optional `parameters` list (RFC 4466) so the same
-//! coroutine drives the base SELECT, SELECT (CONDSTORE), and SELECT
-//! (QRESYNC ...) variants. The response loop always collects
-//! `HIGHESTMODSEQ`, `VANISHED (EARLIER)`, and implicit `* FETCH`
-//! payloads; they stay `None` / empty for the parameter-less call.
+//! I/O-free coroutine to send an IMAP EXAMINE command.
 
 use core::num::NonZeroU32;
 
@@ -12,8 +6,10 @@ use alloc::{string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         mailbox::Mailbox,
         response::{Code, Data, StatusBody, StatusKind, Tagged},
         sequence::SequenceSet,
@@ -21,31 +17,26 @@ use imap_codec::{
 };
 
 use crate::{
-    context::{ImapContext, ImapCurrentMailboxState},
+    coroutine::{ImapCoroutine, ImapCoroutineState},
     rfc3501::{
         mailbox::encode_inplace,
-        select::{ImapMailboxSelectError, ImapMailboxSelectResult, SelectData, SelectFetch},
+        select::{ImapMailboxSelectError, SelectData, SelectFetch},
     },
     send::*,
 };
 
 pub type ImapMailboxExamineError = ImapMailboxSelectError;
-pub type ImapMailboxExamineResult = ImapMailboxSelectResult;
 pub type ExamineData = SelectData;
 pub type ExamineFetch = SelectFetch;
 
-/// I/O-free coroutine to send an IMAP EXAMINE or EXAMINE command.
+/// I/O-free coroutine to send an IMAP EXAMINE command.
 pub struct ImapMailboxExamine {
-    pub(crate) examine_state: ImapCurrentMailboxState,
     pub(crate) send: SendImapCommand<CommandCodec>,
 }
 
 impl ImapMailboxExamine {
     /// Creates a new coroutine for EXAMINE with no parameters.
-    pub fn new(mut context: ImapContext, mut mailbox: Mailbox<'static>) -> Self {
-        // Stash the decoded form for the context, then encode the
-        // copy that goes on the wire.
-        let examine_state = ImapCurrentMailboxState::Selected(mailbox.clone());
+    pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
 
         let body = CommandBody::Examine {
@@ -53,46 +44,46 @@ impl ImapMailboxExamine {
             parameters: vec![],
         };
 
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
 
         Self {
-            examine_state,
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxExamineResult {
-        let (mut context, data, untagged, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxExamineResult::WantsRead,
+impl ImapCoroutine for ImapMailboxExamine {
+    type Output = SelectData;
+    type Error = ImapMailboxExamineError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (data, untagged, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxExamineResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
                 data,
                 untagged,
                 tagged,
                 bye,
                 ..
-            } => (context, data, untagged, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxExamineResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            } => (data, untagged, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxExamineError::Bye(bye.text.to_string());
-            return ImapMailboxExamineResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxExamineError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxExamineError::MissingTagged;
-            return ImapMailboxExamineResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxExamineError::MissingTagged);
         };
 
         let mut output = ExamineData::default();
@@ -131,33 +122,13 @@ impl ImapMailboxExamine {
         }
 
         match body.kind {
-            StatusKind::Ok => {
-                context.mailbox = self.examine_state.clone();
-                context.flags = output
-                    .flags
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                context.permanent_flags = output
-                    .permanent_flags
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                ImapMailboxExamineResult::Ok {
-                    context,
-                    data: output,
-                }
+            StatusKind::Ok => ImapCoroutineState::Done(output),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxExamineError::No(body.text.to_string()))
             }
-            StatusKind::No => ImapMailboxExamineResult::Err {
-                context,
-                err: ImapMailboxExamineError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxExamineResult::Err {
-                context,
-                err: ImapMailboxExamineError::Bad(body.text.to_string()),
-            },
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxExamineError::Bad(body.text.to_string()))
+            }
         }
     }
 }

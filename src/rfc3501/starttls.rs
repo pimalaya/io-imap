@@ -2,8 +2,8 @@
 //!
 //! The coroutine discards the server greeting, sends a STARTTLS
 //! command, and discards the tagged response; at which point it
-//! yields [`ImapStartTlsResult::WantsStartTls`] for the caller to
-//! perform the TLS handshake on the underlying socket. Any bytes
+//! yields [`ImapStartTlsResult::Ok`] for the caller to perform the
+//! TLS handshake on the underlying socket. Any bytes
 //! received after the tagged response (which RFC 3501 §6.2.1
 //! forbids) are returned in `remaining` so the caller can decide
 //! how to handle them.
@@ -16,14 +16,12 @@ use imap_codec::{
     encode::{Encoder, Fragment},
     imap_types::{
         command::{Command, CommandBody},
-        core::Tag,
+        core::{Tag, TagGenerator},
         utils::escape_byte_string,
     },
 };
 use log::trace;
 use thiserror::Error;
-
-use crate::context::ImapContext;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -36,18 +34,14 @@ pub enum ImapStartTlsError {
 pub enum ImapStartTlsResult {
     /// The STARTTLS handshake on the IMAP layer is complete and the
     /// caller should now perform the TLS handshake on the socket.
-    WantsStartTls {
-        context: ImapContext,
+    Ok {
         /// Bytes received after the tagged response (should be empty
         /// per RFC 3501 §6.2.1).
         remaining: Vec<u8>,
     },
     WantsRead,
     WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapStartTlsError,
-    },
+    Err(ImapStartTlsError),
 }
 
 enum State {
@@ -61,7 +55,6 @@ enum State {
 
 /// I/O-free coroutine to perform STARTTLS negotiation.
 pub struct ImapStartTls {
-    context: Option<ImapContext>,
     tag_bytes: Vec<u8>,
     state: State,
     wants_read: bool,
@@ -71,12 +64,11 @@ pub struct ImapStartTls {
 
 impl ImapStartTls {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext) -> Self {
-        let tag = context.generate_tag();
-        let tag_bytes = tag.as_ref().as_bytes().to_vec();
+    pub fn new() -> Self {
+        let mut tag = TagGenerator::new();
+        let tag_bytes = tag.generate().as_ref().as_bytes().to_vec();
 
         Self {
-            context: Some(context),
             tag_bytes,
             state: State::DiscardGreeting,
             wants_read: false,
@@ -98,13 +90,7 @@ impl ImapStartTls {
 
             match self.state {
                 State::DiscardGreeting => match arg.take() {
-                    Some(&[]) => {
-                        let context = self.context.take().unwrap();
-                        return ImapStartTlsResult::Err {
-                            context,
-                            err: ImapStartTlsError::Eof,
-                        };
-                    }
+                    Some(&[]) => return ImapStartTlsResult::Err(ImapStartTlsError::Eof),
                     Some(data) => {
                         self.buf.extend_from_slice(data);
 
@@ -138,13 +124,7 @@ impl ImapStartTls {
                     self.state = State::DiscardStartTls;
                 }
                 State::DiscardStartTls => match arg.take() {
-                    Some(&[]) => {
-                        let context = self.context.take().unwrap();
-                        return ImapStartTlsResult::Err {
-                            context,
-                            err: ImapStartTlsError::Eof,
-                        };
-                    }
+                    Some(&[]) => return ImapStartTlsResult::Err(ImapStartTlsError::Eof),
                     Some(data) => {
                         self.buf.extend_from_slice(data);
 
@@ -174,9 +154,8 @@ impl ImapStartTls {
                         );
 
                         let remaining = self.buf.split_off(end);
-                        let context = self.context.take().unwrap();
 
-                        return ImapStartTlsResult::WantsStartTls { context, remaining };
+                        return ImapStartTlsResult::Ok { remaining };
                     }
                     None => {
                         self.wants_read = true;
@@ -184,5 +163,11 @@ impl ImapStartTls {
                 },
             }
         }
+    }
+}
+
+impl Default for ImapStartTls {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -4,8 +4,10 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         datetime::DateTime,
         extensions::binary::LiteralOrLiteral8,
         flag::Flag,
@@ -15,7 +17,8 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `APPEND` command: `EXISTS` count and
 /// `[APPENDUID uidvalidity uid]` response code (RFC 4315) if the server
@@ -39,24 +42,6 @@ pub enum ImapMessageAppendError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMessageAppendResult {
-    Ok {
-        context: ImapContext,
-        exists: Option<u32>,
-        /// UIDVALIDITY and UID of the appended message, if the server
-        /// returned an `[APPENDUID uidvalidity uid]` response code
-        /// (RFC 4315).
-        appenduid: Option<(u32, u32)>,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMessageAppendError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP APPEND command.
 pub struct ImapMessageAppend {
     send: SendImapCommand<CommandCodec>,
@@ -65,7 +50,6 @@ pub struct ImapMessageAppend {
 impl ImapMessageAppend {
     /// Creates a new coroutine.
     pub fn new(
-        mut context: ImapContext,
         mut mailbox: Mailbox<'static>,
         flags: Vec<Flag<'static>>,
         date: Option<DateTime>,
@@ -78,47 +62,44 @@ impl ImapMessageAppend {
             date,
             message,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMessageAppendResult {
-        let (context, data, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMessageAppendResult::WantsRead,
+impl ImapCoroutine for ImapMessageAppend {
+    type Output = ImapAppendOutput;
+    type Error = ImapMessageAppendError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMessageAppendResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
-                data,
-                tagged,
-                bye,
-                ..
-            } => (context, data, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMessageAppendResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+                data, tagged, bye, ..
+            } => (data, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMessageAppendError::Bye(bye.text.to_string());
-            return ImapMessageAppendResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageAppendError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMessageAppendError::MissingTagged;
-            return ImapMessageAppendResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageAppendError::MissingTagged);
         };
 
         let mut exists = None;
-
         for data in data {
             if let Data::Exists(seq) = data {
                 exists = Some(seq);
@@ -132,20 +113,14 @@ impl ImapMessageAppend {
                 } else {
                     None
                 };
-                ImapMessageAppendResult::Ok {
-                    context,
-                    exists,
-                    appenduid,
-                }
+                ImapCoroutineState::Done((exists, appenduid))
             }
-            StatusKind::No => ImapMessageAppendResult::Err {
-                context,
-                err: ImapMessageAppendError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMessageAppendResult::Err {
-                context,
-                err: ImapMessageAppendError::Bad(body.text.to_string()),
-            },
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMessageAppendError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMessageAppendError::Bad(body.text.to_string()))
+            }
         }
     }
 }

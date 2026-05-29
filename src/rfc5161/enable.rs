@@ -4,16 +4,18 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::Vec1,
+        core::{TagGenerator, Vec1},
         extensions::enable::CapabilityEnable,
         response::{Data, StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -32,20 +34,6 @@ pub enum ImapExtensionEnableError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapExtensionEnableResult {
-    Ok {
-        context: ImapContext,
-        enabled: Option<Vec<CapabilityEnable<'static>>>,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapExtensionEnableError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP ENABLE command.
 pub struct ImapExtensionEnable {
     send: SendImapCommand<CommandCodec>,
@@ -53,49 +41,46 @@ pub struct ImapExtensionEnable {
 
 impl ImapExtensionEnable {
     /// Creates a new coroutine.
-    pub fn new(mut context: ImapContext, capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
+    pub fn new(capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
         let body = CommandBody::Enable { capabilities };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapExtensionEnableResult {
-        let (context, data, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapExtensionEnableResult::WantsRead,
+impl ImapCoroutine for ImapExtensionEnable {
+    type Output = Option<Vec<CapabilityEnable<'static>>>;
+    type Error = ImapExtensionEnableError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapExtensionEnableResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
-                data,
-                tagged,
-                bye,
-                ..
-            } => (context, data, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapExtensionEnableResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+                data, tagged, bye, ..
+            } => (data, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapExtensionEnableError::Bye(bye.text.to_string());
-            return ImapExtensionEnableResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapExtensionEnableError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapExtensionEnableError::MissingTagged;
-            return ImapExtensionEnableResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapExtensionEnableError::MissingTagged);
         };
 
         let mut enabled = None;
-
         for data in data {
             if let Data::Enabled { capabilities } = data {
                 enabled = Some(capabilities);
@@ -103,15 +88,13 @@ impl ImapExtensionEnable {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapExtensionEnableResult::Ok { context, enabled },
-            StatusKind::No => ImapExtensionEnableResult::Err {
-                context,
-                err: ImapExtensionEnableError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapExtensionEnableResult::Err {
-                context,
-                err: ImapExtensionEnableError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(enabled),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapExtensionEnableError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapExtensionEnableError::Bad(body.text.to_string()))
+            }
         }
     }
 }

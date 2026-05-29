@@ -6,9 +6,10 @@ use alloc::{collections::BTreeMap, string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::Vec1,
+        core::{TagGenerator, Vec1},
         fetch::MessageDataItem,
         flag::{Flag, StoreResponse, StoreType},
         response::{Data, StatusKind, Tagged},
@@ -17,7 +18,8 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -36,20 +38,6 @@ pub enum ImapMessageStoreError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMessageStoreResult {
-    Ok {
-        context: ImapContext,
-        data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMessageStoreError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP STORE command.
 pub struct ImapMessageStore {
     send: SendImapCommand<CommandCodec>,
@@ -58,7 +46,6 @@ pub struct ImapMessageStore {
 impl ImapMessageStore {
     /// Creates a new coroutine.
     pub fn new(
-        mut context: ImapContext,
         sequence_set: SequenceSet,
         kind: StoreType,
         flags: Vec<Flag<'static>>,
@@ -72,47 +59,44 @@ impl ImapMessageStore {
             flags,
             uid,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMessageStoreResult {
-        let (context, resp_data, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMessageStoreResult::WantsRead,
+impl ImapCoroutine for ImapMessageStore {
+    type Output = BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>;
+    type Error = ImapMessageStoreError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (resp_data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMessageStoreResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
             SendImapCommandResult::Ok {
-                context,
-                data,
-                tagged,
-                bye,
-                ..
-            } => (context, data, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMessageStoreResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+                data, tagged, bye, ..
+            } => (data, tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMessageStoreError::Bye(bye.text.to_string());
-            return ImapMessageStoreResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageStoreError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMessageStoreError::MissingTagged;
-            return ImapMessageStoreResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageStoreError::MissingTagged);
         };
 
         let mut data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> = BTreeMap::new();
-
         for res_data in resp_data {
             if let Data::Fetch { seq, items } = res_data {
                 data.insert(seq, items);
@@ -120,30 +104,15 @@ impl ImapMessageStore {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapMessageStoreResult::Ok { context, data },
-            StatusKind::No => ImapMessageStoreResult::Err {
-                context,
-                err: ImapMessageStoreError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMessageStoreResult::Err {
-                context,
-                err: ImapMessageStoreError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(data),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMessageStoreError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMessageStoreError::Bad(body.text.to_string()))
+            }
         }
     }
-}
-
-/// Output emitted when the silent store coroutine terminates.
-pub enum ImapMessageStoreSilentResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMessageStoreError,
-    },
 }
 
 /// I/O-free coroutine to send a silent IMAP STORE command.
@@ -157,7 +126,6 @@ pub struct ImapMessageStoreSilent {
 impl ImapMessageStoreSilent {
     /// Creates a new coroutine.
     pub fn new(
-        mut context: ImapContext,
         sequence_set: SequenceSet,
         kind: StoreType,
         flags: Vec<Flag<'static>>,
@@ -171,54 +139,51 @@ impl ImapMessageStoreSilent {
             flags,
             uid,
         };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMessageStoreSilentResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMessageStoreSilentResult::WantsRead,
+impl ImapCoroutine for ImapMessageStoreSilent {
+    type Output = ();
+    type Error = ImapMessageStoreError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMessageStoreSilentResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMessageStoreSilentResult::Err {
-                    context,
-                    err: err.into(),
-                };
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Err(err.into());
             }
         };
 
         if let Some(bye) = bye {
-            let err = ImapMessageStoreError::Bye(bye.text.to_string());
-            return ImapMessageStoreSilentResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageStoreError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMessageStoreError::MissingTagged;
-            return ImapMessageStoreSilentResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMessageStoreError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapMessageStoreSilentResult::Ok { context },
-            StatusKind::No => ImapMessageStoreSilentResult::Err {
-                context,
-                err: ImapMessageStoreError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMessageStoreSilentResult::Err {
-                context,
-                err: ImapMessageStoreError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMessageStoreError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMessageStoreError::Bad(body.text.to_string()))
+            }
         }
     }
 }

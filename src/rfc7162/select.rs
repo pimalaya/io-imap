@@ -16,26 +16,22 @@ use imap_codec::{
     CommandCodec,
     imap_types::{
         command::{Command, CommandBody, SelectParameter},
+        core::TagGenerator,
         mailbox::Mailbox,
     },
 };
 
 use crate::{
-    context::{ImapContext, ImapCurrentMailboxState},
     rfc3501::{mailbox::encode_inplace, select::ImapMailboxSelect},
     send::SendImapCommand,
 };
 
 impl ImapMailboxSelect {
-    /// Creates a new coroutine for SELECT with no parameters.
+    /// Creates a new coroutine for SELECT with the given parameters.
     pub fn with_parameters(
-        mut context: ImapContext,
         mut mailbox: Mailbox<'static>,
         params: impl IntoIterator<Item = SelectParameter>,
     ) -> Self {
-        // Stash the decoded form for the context, then encode the
-        // copy that goes on the wire.
-        let select_state = ImapCurrentMailboxState::Selected(mailbox.clone());
         encode_inplace(&mut mailbox);
 
         let body = CommandBody::Select {
@@ -43,12 +39,12 @@ impl ImapMailboxSelect {
             parameters: params.into_iter().collect(),
         };
 
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
 
         Self {
-            select_state,
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
 }

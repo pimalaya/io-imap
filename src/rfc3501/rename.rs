@@ -1,18 +1,21 @@
 //! I/O-free coroutine to send an IMAP RENAME command.
 
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::string::{String, ToString};
 
 use imap_codec::{
     CommandCodec,
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
+        core::TagGenerator,
         mailbox::Mailbox,
         response::{StatusKind, Tagged},
     },
 };
 use thiserror::Error;
 
-use crate::{context::ImapContext, rfc3501::mailbox::encode_inplace, send::*};
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -31,19 +34,6 @@ pub enum ImapMailboxRenameError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapMailboxRenameResult {
-    Ok {
-        context: ImapContext,
-    },
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err {
-        context: ImapContext,
-        err: ImapMailboxRenameError,
-    },
-}
-
 /// I/O-free coroutine to send an IMAP RENAME command.
 pub struct ImapMailboxRename {
     send: SendImapCommand<CommandCodec>,
@@ -51,62 +41,53 @@ pub struct ImapMailboxRename {
 
 impl ImapMailboxRename {
     /// Creates a new coroutine.
-    pub fn new(
-        mut context: ImapContext,
-        mut from: Mailbox<'static>,
-        mut to: Mailbox<'static>,
-    ) -> Self {
+    pub fn new(mut from: Mailbox<'static>, mut to: Mailbox<'static>) -> Self {
         encode_inplace(&mut from);
         encode_inplace(&mut to);
         let body = CommandBody::Rename { from, to };
+        let mut tag = TagGenerator::new();
         // SAFETY: tag is always valid
-        let command = Command::new(context.generate_tag(), body).unwrap();
+        let command = Command::new(tag.generate(), body).unwrap();
         Self {
-            send: SendImapCommand::new(context, CommandCodec::new(), command),
+            send: SendImapCommand::new(CommandCodec::new(), command),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxRenameResult {
-        let (context, tagged, bye) = match self.send.resume(arg) {
-            SendImapCommandResult::WantsRead => return ImapMailboxRenameResult::WantsRead,
+impl ImapCoroutine for ImapMailboxRename {
+    type Output = ();
+    type Error = ImapMailboxRenameError;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapMailboxRenameResult::WantsWrite(bytes);
+                return ImapCoroutineState::WantsWrite(bytes);
             }
-            SendImapCommandResult::Ok {
-                context,
-                tagged,
-                bye,
-                ..
-            } => (context, tagged, bye),
-            SendImapCommandResult::Err { context, err } => {
-                return ImapMailboxRenameResult::Err {
-                    context,
-                    err: err.into(),
-                };
-            }
+            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
+            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
         };
 
         if let Some(bye) = bye {
-            let err = ImapMailboxRenameError::Bye(bye.text.to_string());
-            return ImapMailboxRenameResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxRenameError::Bye(bye.text.to_string()));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            let err = ImapMailboxRenameError::MissingTagged;
-            return ImapMailboxRenameResult::Err { context, err };
+            return ImapCoroutineState::Err(ImapMailboxRenameError::MissingTagged);
         };
 
         match body.kind {
-            StatusKind::Ok => ImapMailboxRenameResult::Ok { context },
-            StatusKind::No => ImapMailboxRenameResult::Err {
-                context,
-                err: ImapMailboxRenameError::No(body.text.to_string()),
-            },
-            StatusKind::Bad => ImapMailboxRenameResult::Err {
-                context,
-                err: ImapMailboxRenameError::Bad(body.text.to_string()),
-            },
+            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::No => {
+                ImapCoroutineState::Err(ImapMailboxRenameError::No(body.text.to_string()))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Err(ImapMailboxRenameError::Bad(body.text.to_string()))
+            }
         }
     }
 }

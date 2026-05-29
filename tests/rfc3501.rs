@@ -5,20 +5,29 @@
 //! made.
 
 use io_imap::{
-    context::ImapContext,
+    codec::fragmentizer::Fragmentizer,
+    coroutine::*,
     rfc3501::{capability::*, create::*, greeting::*, list::*, noop::*},
     types::mailbox::Mailbox,
 };
 
-fn run_greeting(response: &'static [u8]) -> ImapGreetingGetResult {
-    let context = ImapContext::new();
-    let mut coroutine = ImapGreetingGet::new(context, false);
+const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
+
+fn new_fragmentizer() -> Fragmentizer {
+    Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE)
+}
+
+fn run_greeting(
+    response: &'static [u8],
+) -> ImapCoroutineState<ImapGreetingOk, ImapGreetingGetError> {
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapGreetingGet::new(false);
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
     loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -31,16 +40,19 @@ fn run_greeting(response: &'static [u8]) -> ImapGreetingGetResult {
     }
 }
 
-fn run_capability(response: &'static [u8]) -> ImapCapabilityGetResult {
-    let context = ImapContext::new();
-    let mut coroutine = ImapCapabilityGet::new(context);
+fn run_capability(
+    response: &'static [u8],
+) -> ImapCoroutineState<Vec<io_imap::types::response::Capability<'static>>, ImapCapabilityGetError>
+{
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapCapabilityGet::new();
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
     loop {
-        match coroutine.resume(arg.take()) {
-            ImapCapabilityGetResult::WantsWrite(_) => arg = None,
-            ImapCapabilityGetResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsWrite(_) => arg = None,
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -53,16 +65,18 @@ fn run_capability(response: &'static [u8]) -> ImapCapabilityGetResult {
     }
 }
 
-fn run_greeting_with_capability(response: &'static [u8]) -> ImapGreetingGetResult {
-    let context = ImapContext::new();
-    let mut coroutine = ImapGreetingGet::new(context, true);
+fn run_greeting_with_capability(
+    response: &'static [u8],
+) -> ImapCoroutineState<ImapGreetingOk, ImapGreetingGetError> {
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapGreetingGet::new(true);
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
     loop {
-        match coroutine.resume(arg.take()) {
-            ImapGreetingGetResult::WantsWrite(_) => arg = None,
-            ImapGreetingGetResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsWrite(_) => arg = None,
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -80,7 +94,7 @@ fn greeting_ok() {
     let response = b"* OK [CAPABILITY IMAP4rev1] Dovecot ready.\r\n";
 
     match run_greeting(response) {
-        ImapGreetingGetResult::Ok { .. } => {}
+        ImapCoroutineState::Done(_) => {}
         _ => panic!("unexpected result"),
     }
 }
@@ -92,7 +106,7 @@ fn greeting_incomplete_rejected() {
     let response = b"* OK Dovecot ready.";
 
     match run_greeting(response) {
-        ImapGreetingGetResult::Err { .. } => {}
+        ImapCoroutineState::Err(_) => {}
         _ => panic!("expected error for incomplete greeting"),
     }
 }
@@ -104,8 +118,8 @@ fn capability_ok() {
                      A001 OK Capability completed.\r\n";
 
     match run_capability(response) {
-        ImapCapabilityGetResult::Ok { context } => {
-            assert!(!context.capability.is_empty());
+        ImapCoroutineState::Done(capability) => {
+            assert!(!capability.is_empty());
         }
         _ => panic!("unexpected result"),
     }
@@ -116,8 +130,8 @@ fn greeting_with_capability_ok() {
     let response = b"* OK [CAPABILITY IMAP4rev1 LITERAL+ SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN] Dovecot ready.\r\n";
 
     match run_greeting_with_capability(response) {
-        ImapGreetingGetResult::Ok { context } => {
-            assert!(!context.capability.is_empty());
+        ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => {
+            assert!(!capability.is_empty());
         }
         _ => panic!("unexpected result"),
     }
@@ -126,15 +140,15 @@ fn greeting_with_capability_ok() {
 #[test]
 fn noop_ok() {
     let response: &[u8] = b"A001 OK NOOP completed.\r\n";
-    let context = ImapContext::new();
-    let mut coroutine = ImapNoop::new(context);
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapNoop::new();
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
     let result = loop {
-        match coroutine.resume(arg.take()) {
-            ImapNoopResult::WantsWrite(_) => arg = None,
-            ImapNoopResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsWrite(_) => arg = None,
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -146,7 +160,7 @@ fn noop_ok() {
         }
     };
 
-    assert!(matches!(result, ImapNoopResult::Ok { .. }));
+    assert!(matches!(result, ImapCoroutineState::Done(())));
 }
 
 #[test]
@@ -155,8 +169,8 @@ fn create_encodes_mailbox_to_modified_utf7() {
     // that hit the wire carry the RFC 3501 §5.1.3 modified UTF-7
     // form, not the raw unicode.
     let mailbox: Mailbox<'static> = "Notes/Брошены".to_string().try_into().unwrap();
-    let context = ImapContext::new();
-    let mut coroutine = ImapMailboxCreate::new(context, mailbox);
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapMailboxCreate::new(mailbox);
 
     let mut written = Vec::new();
     let mut arg: Option<&[u8]> = None;
@@ -164,12 +178,12 @@ fn create_encodes_mailbox_to_modified_utf7() {
     let response: &[u8] = b"A001 OK CREATE completed.\r\n";
 
     let result = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMailboxCreateResult::WantsWrite(bytes) => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsWrite(bytes) => {
                 written.extend_from_slice(&bytes);
                 arg = None;
             }
-            ImapMailboxCreateResult::WantsRead => {
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -190,7 +204,7 @@ fn create_encodes_mailbox_to_modified_utf7() {
         !wire.contains("Брошены"),
         "raw unicode leaked onto the wire: {wire:?}"
     );
-    assert!(matches!(result, ImapMailboxCreateResult::Ok { .. }));
+    assert!(matches!(result, ImapCoroutineState::Done(())));
 }
 
 #[test]
@@ -200,8 +214,8 @@ fn list_decodes_mailbox_from_modified_utf7() {
     // unicode form.
     let reference: Mailbox<'static> = "".to_string().try_into().unwrap();
     let pattern = "*".try_into().unwrap();
-    let context = ImapContext::new();
-    let mut coroutine = ImapMailboxList::new(context, reference, pattern);
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapMailboxList::new(reference, pattern);
 
     let response: &[u8] = b"* LIST () \"/\" \"Notes/&BBEEQAQ+BEgENQQ9BEs-\"\r\n\
                             A001 OK LIST completed.\r\n";
@@ -209,9 +223,9 @@ fn list_decodes_mailbox_from_modified_utf7() {
     let mut fed = false;
 
     let result = loop {
-        match coroutine.resume(arg.take()) {
-            ImapMailboxListResult::WantsWrite(_) => arg = None,
-            ImapMailboxListResult::WantsRead => {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::WantsWrite(_) => arg = None,
+            ImapCoroutineState::WantsRead => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -224,7 +238,7 @@ fn list_decodes_mailbox_from_modified_utf7() {
     };
 
     let mailboxes = match result {
-        ImapMailboxListResult::Ok { mailboxes, .. } => mailboxes,
+        ImapCoroutineState::Done(mailboxes) => mailboxes,
         other => panic!(
             "expected Ok, got {other:?}",
             other = std::any::type_name_of_val(&other)
