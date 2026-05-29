@@ -19,7 +19,7 @@ fn new_fragmentizer() -> Fragmentizer {
 
 fn run_greeting(
     response: &'static [u8],
-) -> ImapCoroutineState<ImapGreetingOk, ImapGreetingGetError> {
+) -> ImapCoroutineState<ImapYield, Result<ImapGreetingOk, ImapGreetingGetError>> {
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapGreetingGet::new(false);
     let mut arg: Option<&[u8]> = None;
@@ -27,7 +27,7 @@ fn run_greeting(
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -42,8 +42,10 @@ fn run_greeting(
 
 fn run_capability(
     response: &'static [u8],
-) -> ImapCoroutineState<Vec<io_imap::types::response::Capability<'static>>, ImapCapabilityGetError>
-{
+) -> ImapCoroutineState<
+    ImapYield,
+    Result<Vec<io_imap::types::response::Capability<'static>>, ImapCapabilityGetError>,
+> {
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapCapabilityGet::new();
     let mut arg: Option<&[u8]> = None;
@@ -51,8 +53,8 @@ fn run_capability(
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsWrite(_) => arg = None,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -67,7 +69,7 @@ fn run_capability(
 
 fn run_greeting_with_capability(
     response: &'static [u8],
-) -> ImapCoroutineState<ImapGreetingOk, ImapGreetingGetError> {
+) -> ImapCoroutineState<ImapYield, Result<ImapGreetingOk, ImapGreetingGetError>> {
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapGreetingGet::new(true);
     let mut arg: Option<&[u8]> = None;
@@ -75,8 +77,8 @@ fn run_greeting_with_capability(
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsWrite(_) => arg = None,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -94,7 +96,7 @@ fn greeting_ok() {
     let response = b"* OK [CAPABILITY IMAP4rev1] Dovecot ready.\r\n";
 
     match run_greeting(response) {
-        ImapCoroutineState::Done(_) => {}
+        ImapCoroutineState::Complete(Ok(_)) => {}
         _ => panic!("unexpected result"),
     }
 }
@@ -106,7 +108,7 @@ fn greeting_incomplete_rejected() {
     let response = b"* OK Dovecot ready.";
 
     match run_greeting(response) {
-        ImapCoroutineState::Err(_) => {}
+        ImapCoroutineState::Complete(Err(_)) => {}
         _ => panic!("expected error for incomplete greeting"),
     }
 }
@@ -118,7 +120,7 @@ fn capability_ok() {
                      A001 OK Capability completed.\r\n";
 
     match run_capability(response) {
-        ImapCoroutineState::Done(capability) => {
+        ImapCoroutineState::Complete(Ok(capability)) => {
             assert!(!capability.is_empty());
         }
         _ => panic!("unexpected result"),
@@ -130,7 +132,7 @@ fn greeting_with_capability_ok() {
     let response = b"* OK [CAPABILITY IMAP4rev1 LITERAL+ SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN] Dovecot ready.\r\n";
 
     match run_greeting_with_capability(response) {
-        ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => {
+        ImapCoroutineState::Complete(Ok(ImapGreetingOk { capability, .. })) => {
             assert!(!capability.is_empty());
         }
         _ => panic!("unexpected result"),
@@ -147,8 +149,8 @@ fn noop_ok() {
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsWrite(_) => arg = None,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -160,7 +162,7 @@ fn noop_ok() {
         }
     };
 
-    assert!(matches!(result, ImapCoroutineState::Done(())));
+    assert!(matches!(result, ImapCoroutineState::Complete(Ok(()))));
 }
 
 #[test]
@@ -179,11 +181,11 @@ fn create_encodes_mailbox_to_modified_utf7() {
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 written.extend_from_slice(&bytes);
                 arg = None;
             }
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -204,7 +206,7 @@ fn create_encodes_mailbox_to_modified_utf7() {
         !wire.contains("Брошены"),
         "raw unicode leaked onto the wire: {wire:?}"
     );
-    assert!(matches!(result, ImapCoroutineState::Done(())));
+    assert!(matches!(result, ImapCoroutineState::Complete(Ok(()))));
 }
 
 #[test]
@@ -224,8 +226,8 @@ fn list_decodes_mailbox_from_modified_utf7() {
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::WantsWrite(_) => arg = None,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
                 } else {
@@ -238,7 +240,7 @@ fn list_decodes_mailbox_from_modified_utf7() {
     };
 
     let mailboxes = match result {
-        ImapCoroutineState::Done(mailboxes) => mailboxes,
+        ImapCoroutineState::Complete(Ok(mailboxes)) => mailboxes,
         other => panic!(
             "expected Ok, got {other:?}",
             other = std::any::type_name_of_val(&other)

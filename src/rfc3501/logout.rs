@@ -13,7 +13,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -51,35 +51,43 @@ impl ImapLogout {
 }
 
 impl ImapCoroutine for ImapLogout {
-    type Output = ();
-    type Error = ImapLogoutError;
+    type Yield = ImapYield;
+    type Return = Result<(), ImapLogoutError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if bye.is_none() {
-            return ImapCoroutineState::Err(ImapLogoutError::MissingBye);
+            return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingBye));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapLogoutError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingTagged));
         };
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(()),
-            StatusKind::No => ImapCoroutineState::Err(ImapLogoutError::No(body.text.to_string())),
-            StatusKind::Bad => ImapCoroutineState::Err(ImapLogoutError::Bad(body.text.to_string())),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+            StatusKind::No => {
+                ImapCoroutineState::Complete(Err(ImapLogoutError::No(body.text.to_string())))
+            }
+            StatusKind::Bad => {
+                ImapCoroutineState::Complete(Err(ImapLogoutError::Bad(body.text.to_string())))
+            }
         }
     }
 }

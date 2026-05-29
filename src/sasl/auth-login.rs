@@ -18,7 +18,7 @@ use imap_codec::{
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
@@ -101,44 +101,45 @@ impl ImapAuthLogin {
 }
 
 impl ImapCoroutine for ImapAuthLogin {
-    type Output = Vec<Capability<'static>>;
-    type Error = ImapAuthLoginError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<Capability<'static>>, ImapAuthLoginError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
                 State::Send(coroutine) => {
-                    let (bye, continuation_request) = match coroutine
-                        .resume(fragmentizer, arg.take())
-                    {
-                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::WantsWrite(bytes);
-                        }
-                        SendImapCommandResult::Ok {
-                            bye,
-                            continuation_request,
-                            ..
-                        } => (bye, continuation_request),
-                        SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Err(err.into());
-                        }
-                    };
+                    let (bye, continuation_request) =
+                        match coroutine.resume(fragmentizer, arg.take()) {
+                            SendImapCommandResult::WantsRead => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+                            }
+                            SendImapCommandResult::WantsWrite(bytes) => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
+                            }
+                            SendImapCommandResult::Ok {
+                                bye,
+                                continuation_request,
+                                ..
+                            } => (bye, continuation_request),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Complete(Err(err.into()));
+                            }
+                        };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                        return ImapCoroutineState::Complete(Err(ImapAuthLoginError::Bye(
                             bye.text.to_string(),
-                        ));
+                        )));
                     }
 
                     if continuation_request.is_none() {
-                        return ImapCoroutineState::Err(
+                        return ImapCoroutineState::Complete(Err(
                             ImapAuthLoginError::MissingContinuationRequest,
-                        );
+                        ));
                     }
 
                     let username = mem::take(&mut self.username).into_bytes();
@@ -147,33 +148,34 @@ impl ImapCoroutine for ImapAuthLogin {
                     self.state = State::ContinueUsername(SendImapCommand::new(codec, auth));
                 }
                 State::ContinueUsername(coroutine) => {
-                    let (bye, continuation_request) = match coroutine
-                        .resume(fragmentizer, arg.take())
-                    {
-                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::WantsWrite(bytes);
-                        }
-                        SendImapCommandResult::Ok {
-                            bye,
-                            continuation_request,
-                            ..
-                        } => (bye, continuation_request),
-                        SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Err(err.into());
-                        }
-                    };
+                    let (bye, continuation_request) =
+                        match coroutine.resume(fragmentizer, arg.take()) {
+                            SendImapCommandResult::WantsRead => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+                            }
+                            SendImapCommandResult::WantsWrite(bytes) => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
+                            }
+                            SendImapCommandResult::Ok {
+                                bye,
+                                continuation_request,
+                                ..
+                            } => (bye, continuation_request),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Complete(Err(err.into()));
+                            }
+                        };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                        return ImapCoroutineState::Complete(Err(ImapAuthLoginError::Bye(
                             bye.text.to_string(),
-                        ));
+                        )));
                     }
 
                     if continuation_request.is_none() {
-                        return ImapCoroutineState::Err(
+                        return ImapCoroutineState::Complete(Err(
                             ImapAuthLoginError::MissingContinuationRequest,
-                        );
+                        ));
                     }
 
                     let password = mem::take(&mut self.password).into_bytes();
@@ -182,36 +184,37 @@ impl ImapCoroutine for ImapAuthLogin {
                     self.state = State::ContinuePassword(SendImapCommand::new(codec, auth));
                 }
                 State::ContinuePassword(coroutine) => {
-                    let (bye, continuation_request, tagged, data, untagged) = match coroutine
-                        .resume(fragmentizer, arg.take())
-                    {
-                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::WantsWrite(bytes);
-                        }
-                        SendImapCommandResult::Ok {
-                            bye,
-                            continuation_request,
-                            tagged,
-                            data,
-                            untagged,
-                            ..
-                        } => (bye, continuation_request, tagged, data, untagged),
-                        SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Err(err.into());
-                        }
-                    };
+                    let (bye, continuation_request, tagged, data, untagged) =
+                        match coroutine.resume(fragmentizer, arg.take()) {
+                            SendImapCommandResult::WantsRead => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+                            }
+                            SendImapCommandResult::WantsWrite(bytes) => {
+                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
+                            }
+                            SendImapCommandResult::Ok {
+                                bye,
+                                continuation_request,
+                                tagged,
+                                data,
+                                untagged,
+                                ..
+                            } => (bye, continuation_request, tagged, data, untagged),
+                            SendImapCommandResult::Err(err) => {
+                                return ImapCoroutineState::Complete(Err(err.into()));
+                            }
+                        };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapAuthLoginError::Bye(
+                        return ImapCoroutineState::Complete(Err(ImapAuthLoginError::Bye(
                             bye.text.to_string(),
-                        ));
+                        )));
                     }
 
                     if continuation_request.is_some() {
-                        return ImapCoroutineState::Err(
+                        return ImapCoroutineState::Complete(Err(
                             ImapAuthLoginError::UnexpectedContinuationRequest,
-                        );
+                        ));
                     }
 
                     match finish(tagged, data, untagged) {
@@ -221,21 +224,18 @@ impl ImapCoroutine for ImapAuthLogin {
                                 self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapCoroutineState::Done(mem::take(&mut self.observed));
+                            return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                         }
-                        Err(err) => return ImapCoroutineState::Err(err),
+                        Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
                 }
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::WantsRead => return ImapCoroutineState::WantsRead,
-                    ImapCoroutineState::WantsWrite(bytes) => {
-                        return ImapCoroutineState::WantsWrite(bytes);
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(capability)) => {
+                        return ImapCoroutineState::Complete(Ok(capability));
                     }
-                    ImapCoroutineState::Done(capability) => {
-                        return ImapCoroutineState::Done(capability);
-                    }
-                    ImapCoroutineState::Err(err) => {
-                        return ImapCoroutineState::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
             }

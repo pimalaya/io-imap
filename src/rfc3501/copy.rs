@@ -16,7 +16,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `COPY` (and `MOVE`) command: the
@@ -90,29 +90,35 @@ impl ImapMessageCopy {
 }
 
 impl ImapCoroutine for ImapMessageCopy {
-    type Output = ImapCopyUid;
-    type Error = ImapMessageCopyError;
+    type Yield = ImapYield;
+    type Return = Result<ImapCopyUid, ImapMessageCopyError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageCopyError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageCopyError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageCopyError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageCopyError::MissingTagged));
         };
 
         match body.kind {
@@ -131,13 +137,13 @@ impl ImapCoroutine for ImapMessageCopy {
                 } else {
                     None
                 };
-                ImapCoroutineState::Done(copyuid)
+                ImapCoroutineState::Complete(Ok(copyuid))
             }
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageCopyError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageCopyError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageCopyError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageCopyError::Bad(body.text.to_string())))
             }
         }
     }

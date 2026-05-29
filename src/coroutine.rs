@@ -1,65 +1,86 @@
-//! # Generic coroutine driver
+//! # Generator-shape coroutine driver
 //!
-//! Every standard-shape coroutine in this crate exposes the same loop
-//! contract: produce some bytes to write, ask for some bytes to read,
-//! or terminate with success or failure. The [`ImapCoroutine`] trait
-//! unifies that contract behind a single method so a generic driver
-//! ([`ImapClientStd::run`]) can advance any coroutine without macros.
+//! Mirrors the shape of core::ops::Coroutine: a `Yield` associated
+//! type for intermediate progress, a `Return` associated type for
+//! terminal output, and a two-variant [`ImapCoroutineState`]
+//! (`Yielded` / `Complete`).
 //!
-//! Coroutines whose progression yields extra intermediate events
-//! ([`ImapMailboxWatch`](crate::watch::ImapMailboxWatch),
-//! [`ImapIdle`](crate::rfc2177::idle::ImapIdle)) or a different resume
-//! signature ([`ImapStartTls`](crate::rfc3501::starttls::ImapStartTls))
-//! stay outside this trait and keep their own per-coroutine `Result`
-//! enums.
+//! Each coroutine declares its own `Yield` enum mixing socket I/O step
+//! requests with any extra intermediate variants (e.g.
+//! [`ImapStartTlsYield::WantsStartTls`], [`ImapIdleYield::Event`],
+//! [`ImapMailboxWatchYield::Event`]). Most request/response coroutines
+//! pick the standard [`ImapYield`] directly; only coroutines that need
+//! extra variants declare their own.
+//!
+//! [`ImapClientStd::run`] drives any standard-Yield coroutine to
+//! completion against a blocking stream; coroutines that need extra
+//! Yield variants get their own per-method client loops.
 //!
 //! [`ImapClientStd::run`]: crate::client::ImapClientStd::run
+//! [`ImapStartTlsYield::WantsStartTls`]: crate::rfc3501::starttls::ImapStartTlsYield::WantsStartTls
+//! [`ImapIdleYield::Event`]: crate::rfc2177::idle::ImapIdleYield::Event
+//! [`ImapMailboxWatchYield::Event`]: crate::watch::ImapMailboxWatchYield::Event
 
 use alloc::vec::Vec;
 
 use imap_codec::fragmentizer::Fragmentizer;
 
-/// State yielded by an [`ImapCoroutine`] resume.
+/// State yielded by an [`ImapCoroutine::resume`] step.
 ///
-/// Single generic enum so a generic driver can pattern match on
-/// progression without naming a per-coroutine `Result` type.
+/// Two-variant by design (matches std's `core::ops::CoroutineState`):
+/// any further variation lives inside the per-coroutine `Yield` type.
 #[derive(Debug)]
-pub enum ImapCoroutineState<T, E> {
-    /// Coroutine terminated successfully with this payload.
-    Done(T),
-    /// Caller should read more bytes from the socket and feed them
-    /// back on the next resume.
-    WantsRead,
-    /// Caller should write these bytes to the socket; the next resume
-    /// typically takes `None`.
-    WantsWrite(Vec<u8>),
-    /// Coroutine terminated with this error.
-    Err(E),
+pub enum ImapCoroutineState<Y, R> {
+    /// Intermediate yield. The driver reacts to `Y` (do I/O, deliver
+    /// an event...) and resumes the coroutine again.
+    Yielded(Y),
+    /// Terminal yield. By convention `R = Result<Output, Error>`.
+    Complete(R),
 }
 
-/// Standard-shape IMAP coroutine: anything whose progression maps onto
-/// [`ImapCoroutineState`].
+/// Standard-shape IMAP coroutine.
 ///
-/// `resume` is the single source of truth: each implementor's body
-/// returns [`ImapCoroutineState::Done`] / [`WantsRead`] /
-/// [`WantsWrite`] / [`Err`] directly. [`ImapClientStd::run`] drives
-/// any [`ImapCoroutine`] to completion against a blocking stream;
-/// downstream code can write its own driver against the same trait.
-///
-/// [`ImapClientStd::run`]: crate::client::ImapClientStd::run
-/// [`WantsRead`]: ImapCoroutineState::WantsRead
-/// [`WantsWrite`]: ImapCoroutineState::WantsWrite
-/// [`Err`]: ImapCoroutineState::Err
+/// Implementors own their internal state machine and declare their
+/// per-step `Yield` plus a terminal `Return`. The driver pumps I/O
+/// based on the `Yield` variant and resumes until `Complete`.
 pub trait ImapCoroutine {
-    /// Payload yielded on terminal success.
-    type Output;
-    /// Error yielded on terminal failure.
-    type Error;
+    /// Intermediate value handed back on every step. Per-coroutine:
+    /// each implementor picks exactly the variants it needs (socket
+    /// I/O, domain events, TLS upgrade requests...).
+    type Yield;
+    /// Terminal value. By convention `Result<Output, Error>`; the
+    /// "ok" arm carries the operation's final output, the "error" arm
+    /// carries the cause.
+    type Return;
 
     /// Advances the coroutine one step.
+    ///
+    /// Pass [`None`] when there is no data to provide (initial call
+    /// or after the previous yield was [`ImapYield::WantsWrite`]).
+    /// Pass `Some(data)` with bytes read from the socket after a
+    /// [`ImapYield::WantsRead`]. Pass `Some(&[])` to signal EOF.
+    ///
+    /// `fragmentizer` is borrowed from the caller (typically the
+    /// per-connection one owned by [`ImapClientStd`]) so its
+    /// in-flight server-response buffer survives across resume calls
+    /// and coroutine boundaries.
+    ///
+    /// [`ImapClientStd`]: crate::client::ImapClientStd
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error>;
+    ) -> ImapCoroutineState<Self::Yield, Self::Return>;
+}
+
+/// Standard I/O-only Yield. Pick `type Yield = ImapYield` for any
+/// coroutine that only needs to read or write socket bytes.
+#[derive(Debug)]
+pub enum ImapYield {
+    /// Driver should read more bytes from the socket and feed them
+    /// back on the next resume.
+    WantsRead,
+    /// Driver should write these bytes to the socket; the next resume
+    /// typically takes `None`.
+    WantsWrite(Vec<u8>),
 }

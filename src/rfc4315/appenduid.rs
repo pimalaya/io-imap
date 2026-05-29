@@ -19,11 +19,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::{
-    coroutine::{ImapCoroutine, ImapCoroutineState},
-    rfc3501::mailbox::encode_inplace,
-    send::*,
-};
+use crate::{coroutine::*, rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -72,29 +68,35 @@ impl ImapAppendUid {
 }
 
 impl ImapCoroutine for ImapAppendUid {
-    type Output = Option<(NonZeroU32, NonZeroU32)>;
-    type Error = ImapAppendUidError;
+    type Yield = ImapYield;
+    type Return = Result<Option<(NonZeroU32, NonZeroU32)>, ImapAppendUidError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapAppendUidError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapAppendUidError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapAppendUidError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapAppendUidError::MissingTagged));
         };
 
         match body.kind {
@@ -104,13 +106,13 @@ impl ImapCoroutine for ImapAppendUid {
                 } else {
                     None
                 };
-                ImapCoroutineState::Done(uid_pair)
+                ImapCoroutineState::Complete(Ok(uid_pair))
             }
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapAppendUidError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapAppendUidError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapAppendUidError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapAppendUidError::Bad(body.text.to_string())))
             }
         }
     }

@@ -15,7 +15,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -65,31 +65,37 @@ impl ImapMessageThread {
 }
 
 impl ImapCoroutine for ImapMessageThread {
-    type Output = Vec<Thread>;
-    type Error = ImapMessageThreadError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<Thread>, ImapMessageThreadError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageThreadError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageThreadError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageThreadError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageThreadError::MissingTagged));
         };
 
         let mut threads = None;
@@ -101,15 +107,15 @@ impl ImapCoroutine for ImapMessageThread {
 
         match body.kind {
             StatusKind::Ok => match threads {
-                Some(threads) => ImapCoroutineState::Done(threads),
-                None => ImapCoroutineState::Err(ImapMessageThreadError::MissingData),
+                Some(threads) => ImapCoroutineState::Complete(Ok(threads)),
+                None => ImapCoroutineState::Complete(Err(ImapMessageThreadError::MissingData)),
             },
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageThreadError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageThreadError::No(body.text.to_string())))
             }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageThreadError::Bad(body.text.to_string()))
-            }
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMessageThreadError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

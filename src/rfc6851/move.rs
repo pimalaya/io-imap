@@ -15,7 +15,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{
     rfc3501::{
         copy::{ImapCopyUid, uid_set_to_vec},
@@ -65,29 +65,35 @@ impl ImapMessageMove {
 }
 
 impl ImapCoroutine for ImapMessageMove {
-    type Output = ImapCopyUid;
-    type Error = ImapMessageMoveError;
+    type Yield = ImapYield;
+    type Return = Result<ImapCopyUid, ImapMessageMoveError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageMoveError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageMoveError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageMoveError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageMoveError::MissingTagged));
         };
 
         match body.kind {
@@ -106,13 +112,13 @@ impl ImapCoroutine for ImapMessageMove {
                 } else {
                     None
                 };
-                ImapCoroutineState::Done(copyuid)
+                ImapCoroutineState::Complete(Ok(copyuid))
             }
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageMoveError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageMoveError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageMoveError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageMoveError::Bad(body.text.to_string())))
             }
         }
     }

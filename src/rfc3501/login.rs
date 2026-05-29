@@ -16,7 +16,7 @@ use imap_codec::{
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
@@ -90,36 +90,40 @@ impl ImapLogin {
 }
 
 impl ImapCoroutine for ImapLogin {
-    type Output = Vec<Capability<'static>>;
-    type Error = ImapLoginError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<Capability<'static>>, ImapLoginError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
                 State::Send(send) => {
                     let (bye, tagged, data) = match send.resume(fragmentizer, arg.take()) {
-                        SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+                        SendImapCommandResult::WantsRead => {
+                            return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+                        }
                         SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::WantsWrite(bytes);
+                            return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
                         }
                         SendImapCommandResult::Ok {
                             data, tagged, bye, ..
                         } => (bye, tagged, data),
                         SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Err(err.into());
+                            return ImapCoroutineState::Complete(Err(err.into()));
                         }
                     };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapLoginError::Bye(bye.text.to_string()));
+                        return ImapCoroutineState::Complete(Err(ImapLoginError::Bye(
+                            bye.text.to_string(),
+                        )));
                     }
 
                     let Some(Tagged { body, .. }) = tagged else {
-                        return ImapCoroutineState::Err(ImapLoginError::MissingTagged);
+                        return ImapCoroutineState::Complete(Err(ImapLoginError::MissingTagged));
                     };
 
                     let mut new_capability = None;
@@ -132,14 +136,14 @@ impl ImapCoroutine for ImapLogin {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            return ImapCoroutineState::Err(ImapLoginError::No(
+                            return ImapCoroutineState::Complete(Err(ImapLoginError::No(
                                 body.text.to_string(),
-                            ));
+                            )));
                         }
                         StatusKind::Bad => {
-                            return ImapCoroutineState::Err(ImapLoginError::Bad(
+                            return ImapCoroutineState::Complete(Err(ImapLoginError::Bad(
                                 body.text.to_string(),
-                            ));
+                            )));
                         }
                     };
 
@@ -156,18 +160,15 @@ impl ImapCoroutine for ImapLogin {
                         continue;
                     }
 
-                    return ImapCoroutineState::Done(core::mem::take(&mut self.observed));
+                    return ImapCoroutineState::Complete(Ok(core::mem::take(&mut self.observed)));
                 }
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::WantsRead => return ImapCoroutineState::WantsRead,
-                    ImapCoroutineState::WantsWrite(bytes) => {
-                        return ImapCoroutineState::WantsWrite(bytes);
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(capability)) => {
+                        return ImapCoroutineState::Complete(Ok(capability));
                     }
-                    ImapCoroutineState::Done(capability) => {
-                        return ImapCoroutineState::Done(capability);
-                    }
-                    ImapCoroutineState::Err(err) => {
-                        return ImapCoroutineState::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
             }

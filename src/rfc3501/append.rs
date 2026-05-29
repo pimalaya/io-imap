@@ -17,7 +17,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Output of the IMAP `APPEND` command: `EXISTS` count and
@@ -72,31 +72,37 @@ impl ImapMessageAppend {
 }
 
 impl ImapCoroutine for ImapMessageAppend {
-    type Output = ImapAppendOutput;
-    type Error = ImapMessageAppendError;
+    type Yield = ImapYield;
+    type Return = Result<ImapAppendOutput, ImapMessageAppendError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageAppendError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageAppendError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageAppendError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageAppendError::MissingTagged));
         };
 
         let mut exists = None;
@@ -113,14 +119,14 @@ impl ImapCoroutine for ImapMessageAppend {
                 } else {
                     None
                 };
-                ImapCoroutineState::Done((exists, appenduid))
+                ImapCoroutineState::Complete(Ok((exists, appenduid)))
             }
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageAppendError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageAppendError::No(body.text.to_string())))
             }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageAppendError::Bad(body.text.to_string()))
-            }
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMessageAppendError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

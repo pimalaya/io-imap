@@ -17,7 +17,7 @@ use imap_codec::{
 };
 
 use crate::{
-    coroutine::{ImapCoroutine, ImapCoroutineState},
+    coroutine::*,
     rfc3501::{
         mailbox::encode_inplace,
         select::{ImapMailboxSelectError, SelectData, SelectFetch},
@@ -55,18 +55,20 @@ impl ImapMailboxExamine {
 }
 
 impl ImapCoroutine for ImapMailboxExamine {
-    type Output = SelectData;
-    type Error = ImapMailboxExamineError;
+    type Yield = ImapYield;
+    type Return = Result<SelectData, ImapMailboxExamineError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, untagged, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data,
@@ -75,15 +77,19 @@ impl ImapCoroutine for ImapMailboxExamine {
                 bye,
                 ..
             } => (data, untagged, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMailboxExamineError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMailboxExamineError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMailboxExamineError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMailboxExamineError::MissingTagged));
         };
 
         let mut output = ExamineData::default();
@@ -122,13 +128,13 @@ impl ImapCoroutine for ImapMailboxExamine {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(output),
-            StatusKind::No => {
-                ImapCoroutineState::Err(ImapMailboxExamineError::No(body.text.to_string()))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMailboxExamineError::Bad(body.text.to_string()))
-            }
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
+            StatusKind::No => ImapCoroutineState::Complete(Err(ImapMailboxExamineError::No(
+                body.text.to_string(),
+            ))),
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMailboxExamineError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

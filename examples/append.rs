@@ -36,16 +36,16 @@ fn main() {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(_) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     }
 
@@ -55,16 +55,16 @@ fn main() {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(_) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     }
 
@@ -73,16 +73,16 @@ fn main() {
 
     let data = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(data) => break data,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(data)) => break data,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err:?}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("{err:?}"),
         }
     };
 
@@ -98,16 +98,16 @@ fn main() {
 
     let exists = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done((exists, _appenduid)) => break exists,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok((exists, _appenduid))) => break exists,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err:?}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("{err:?}"),
         }
     };
 

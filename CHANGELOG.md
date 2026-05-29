@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Unified all standard-shape coroutines under a single `ImapCoroutine` trait (in `crate::coroutine`) with associated `Output` and `Error`. `resume` now returns `ImapCoroutineState<Output, Error>` directly; the per-coroutine `Imap*Result` enums are gone. `ImapClientStd::run<C: ImapCoroutine>` drives any coroutine to completion. Exempt (kept as-is with their own result enum): `ImapStartTls`, `ImapIdle`, `ImapMailboxWatch`.
 
+- Migrated `ImapCoroutine` to the generator-shape pattern: `type Yield` + `type Return` + two-variant `ImapCoroutineState<Y, R>` (`Yielded(Y)` / `Complete(R)`), mirroring `core::ops::Coroutine`. Standard coroutines pick `type Yield = ImapYield { WantsRead, WantsWrite(Vec<u8>) }` and `type Return = Result<Output, Error>`. The previously-exempt streaming coroutines now also implement the trait with per-coroutine `Yield` enums: `ImapStartTls` declares `ImapStartTlsYield { WantsRead, WantsWrite, WantsStartTls(Vec<u8>) }`, `ImapIdle` declares `ImapIdleYield { WantsRead, WantsWrite, Event(ImapIdleEvent) }`, `ImapMailboxWatch` declares `ImapMailboxWatchYield { WantsRead, WantsWrite, Event(ImapMailboxWatchEvent) }`. `ImapClientStd::run<C, T, E>` is now generic over `C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>`; streaming coroutines and `starttls` keep dedicated per-method loops.
+
 - Added `ImapGreetingOk { capability, pre_authenticated }` as the `ImapGreetingGet` output struct (replaces the multi-field `Ok` variant of the dropped `ImapGreetingGetResult`).
 
 [unreleased]: https://github.com/pimalaya/io-imap/compare/root..HEAD

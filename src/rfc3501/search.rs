@@ -16,7 +16,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -59,31 +59,37 @@ impl ImapMessageSearch {
 }
 
 impl ImapCoroutine for ImapMessageSearch {
-    type Output = Vec<NonZeroU32>;
-    type Error = ImapMessageSearchError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<NonZeroU32>, ImapMessageSearchError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageSearchError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageSearchError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageSearchError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageSearchError::MissingTagged));
         };
 
         let mut ids = Vec::new();
@@ -94,13 +100,13 @@ impl ImapCoroutine for ImapMessageSearch {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(ids),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(ids)),
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageSearchError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageSearchError::No(body.text.to_string())))
             }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageSearchError::Bad(body.text.to_string()))
-            }
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMessageSearchError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

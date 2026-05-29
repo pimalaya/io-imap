@@ -18,7 +18,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -69,31 +69,38 @@ impl ImapMessageStore {
 }
 
 impl ImapCoroutine for ImapMessageStore {
-    type Output = BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>;
-    type Error = ImapMessageStoreError;
+    type Yield = ImapYield;
+    type Return =
+        Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapMessageStoreError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (resp_data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageStoreError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageStoreError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageStoreError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageStoreError::MissingTagged));
         };
 
         let mut data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> = BTreeMap::new();
@@ -104,12 +111,12 @@ impl ImapCoroutine for ImapMessageStore {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(data),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(data)),
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageStoreError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageStoreError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageStoreError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageStoreError::Bad(body.text.to_string())))
             }
         }
     }
@@ -149,40 +156,44 @@ impl ImapMessageStoreSilent {
 }
 
 impl ImapCoroutine for ImapMessageStoreSilent {
-    type Output = ();
-    type Error = ImapMessageStoreError;
+    type Yield = ImapYield;
+    type Return = Result<(), ImapMessageStoreError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
             SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Err(err.into());
+                return ImapCoroutineState::Complete(Err(err.into()));
             }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageStoreError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageStoreError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageStoreError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageStoreError::MissingTagged));
         };
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageStoreError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageStoreError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageStoreError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageStoreError::Bad(body.text.to_string())))
             }
         }
     }

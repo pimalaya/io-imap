@@ -277,30 +277,49 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
         self.stream
     }
 
-    /// Drives any [`ImapCoroutine`] against this client's stream +
-    /// fragmentizer until it terminates. Each command method on
-    /// [`ImapClientStd`] is a one-liner around `run`; downstream
-    /// callers can also use it to drive custom coroutines.
-    pub fn run<C>(&mut self, mut coroutine: C) -> Result<C::Output, ImapClientStdError>
+    /// Consumes the client and returns both the stream and the
+    /// fragmentizer. Useful for handing the connection state off to
+    /// a downstream consumer (e.g. io-email's `ImapContext`) without
+    /// dropping the fragmentizer's in-flight server-response buffer.
+    pub fn into_parts(self) -> (S, Fragmentizer) {
+        (self.stream, self.fragmentizer)
+    }
+
+    /// Drives any standard-shape coroutine (`Yield = ImapYield`,
+    /// `Return = Result<Output, Error>`) against this client's stream
+    /// and fragmentizer until it terminates.
+    ///
+    /// Coroutines that need richer Yield variants
+    /// ([`ImapStartTls`] with [`ImapStartTlsYield::WantsStartTls`],
+    /// [`ImapIdle`](crate::rfc2177::idle::ImapIdle) with
+    /// [`ImapIdleYield::Event`],
+    /// [`ImapMailboxWatch`] with [`ImapMailboxWatchYield::Event`])
+    /// are driven by their own per-method loops on this client; see
+    /// [`Self::starttls`] and [`Self::watch_mailbox`].
+    ///
+    /// [`ImapStartTlsYield::WantsStartTls`]: crate::rfc3501::starttls::ImapStartTlsYield::WantsStartTls
+    /// [`ImapIdleYield::Event`]: crate::rfc2177::idle::ImapIdleYield::Event
+    /// [`ImapMailboxWatchYield::Event`]: crate::watch::ImapMailboxWatchYield::Event
+    pub fn run<C, T, E>(&mut self, mut coroutine: C) -> Result<T, ImapClientStdError>
     where
-        C: ImapCoroutine,
-        ImapClientStdError: From<C::Error>,
+        C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
+        ImapClientStdError: From<E>,
     {
         let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut arg = None;
+        let mut arg: Option<&[u8]> = None;
 
         loop {
-            match coroutine.resume(&mut self.fragmentizer, arg) {
-                ImapCoroutineState::Done(out) => return Ok(out),
-                ImapCoroutineState::WantsRead => {
+            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
+                ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = self.stream.read(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
-                ImapCoroutineState::WantsWrite(bytes) => {
+                ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
                     arg = None;
                 }
-                ImapCoroutineState::Err(err) => return Err(err.into()),
             }
         }
     }
@@ -341,19 +360,26 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
         let mut coroutine = ImapStartTls::new();
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut remaining: Option<Vec<u8>> = None;
 
         loop {
-            match coroutine.resume(arg) {
-                ImapStartTlsResult::Ok { remaining } => return Ok(remaining),
-                ImapStartTlsResult::WantsRead => {
+            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
+                ImapCoroutineState::Complete(Ok(())) => {
+                    return Ok(remaining.unwrap_or_default());
+                }
+                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
                     let n = self.stream.read(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
-                ImapStartTlsResult::WantsWrite(bytes) => {
+                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
                     arg = None;
                 }
-                ImapStartTlsResult::Err(err) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(bytes)) => {
+                    remaining = Some(bytes);
+                    arg = None;
+                }
             }
         }
     }
@@ -614,34 +640,36 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
 
             loop {
                 match watcher.resume(&mut fragmentizer, arg.as_deref()) {
-                    ImapMailboxWatchResult::Event(e) => {
+                    ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(e)) => {
                         arg = None;
                         if tx.send(Ok(e)).is_err() {
                             return;
                         }
                     }
-                    ImapMailboxWatchResult::Ok => return,
-                    ImapMailboxWatchResult::WantsRead => match stream.read(&mut buf) {
-                        Ok(0) => {
-                            let eof = io::ErrorKind::UnexpectedEof;
-                            let err = "IMAP server closed the connection during watch";
-                            tx.send(Err(io::Error::new(eof, err).into())).ok();
-                            return;
+                    ImapCoroutineState::Complete(Ok(())) => return,
+                    ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
+                        match stream.read(&mut buf) {
+                            Ok(0) => {
+                                let eof = io::ErrorKind::UnexpectedEof;
+                                let err = "IMAP server closed the connection during watch";
+                                tx.send(Err(io::Error::new(eof, err).into())).ok();
+                                return;
+                            }
+                            Ok(n) => arg = Some(buf[..n].to_vec()),
+                            Err(err) => {
+                                tx.send(Err(err.into())).ok();
+                                return;
+                            }
                         }
-                        Ok(n) => arg = Some(buf[..n].to_vec()),
-                        Err(err) => {
-                            tx.send(Err(err.into())).ok();
-                            return;
-                        }
-                    },
-                    ImapMailboxWatchResult::WantsWrite(bytes) => {
+                    }
+                    ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
                         if let Err(err) = stream.write_all(&bytes) {
                             tx.send(Err(err.into())).ok();
                             return;
                         }
                         arg = None;
                     }
-                    ImapMailboxWatchResult::Err(err) => {
+                    ImapCoroutineState::Complete(Err(err)) => {
                         tx.send(Err(err.into())).ok();
                         return;
                     }

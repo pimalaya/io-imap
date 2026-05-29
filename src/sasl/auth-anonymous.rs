@@ -16,7 +16,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
@@ -107,24 +107,24 @@ impl ImapAuthAnonymous {
 }
 
 impl ImapCoroutine for ImapAuthAnonymous {
-    type Output = Vec<Capability<'static>>;
-    type Error = ImapAuthAnonymousError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<Capability<'static>>, ImapAuthAnonymousError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
                 State::Send(coroutine) => {
                     let (bye, continuation_request, tagged, data, untagged) =
                         match coroutine.resume(fragmentizer, arg.take()) {
                             SendImapCommandResult::WantsRead => {
-                                return ImapCoroutineState::WantsRead;
+                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
                             }
                             SendImapCommandResult::WantsWrite(bytes) => {
-                                return ImapCoroutineState::WantsWrite(bytes);
+                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
                             }
                             SendImapCommandResult::Ok {
                                 bye,
@@ -135,21 +135,21 @@ impl ImapCoroutine for ImapAuthAnonymous {
                                 ..
                             } => (bye, continuation_request, tagged, data, untagged),
                             SendImapCommandResult::Err(err) => {
-                                return ImapCoroutineState::Err(err.into());
+                                return ImapCoroutineState::Complete(Err(err.into()));
                             }
                         };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapAuthAnonymousError::Bye(
+                        return ImapCoroutineState::Complete(Err(ImapAuthAnonymousError::Bye(
                             bye.text.to_string(),
-                        ));
+                        )));
                     }
 
                     if continuation_request.is_some() {
                         if self.ir {
-                            return ImapCoroutineState::Err(
+                            return ImapCoroutineState::Complete(Err(
                                 ImapAuthAnonymousError::UnexpectedContinuationRequest,
-                            );
+                            ));
                         }
 
                         let message = self.message.take().unwrap().into_bytes();
@@ -160,9 +160,9 @@ impl ImapCoroutine for ImapAuthAnonymous {
                     }
 
                     if !self.ir {
-                        return ImapCoroutineState::Err(
+                        return ImapCoroutineState::Complete(Err(
                             ImapAuthAnonymousError::MissingContinuationRequest,
-                        );
+                        ));
                     }
 
                     match finish(tagged, data, untagged) {
@@ -172,19 +172,21 @@ impl ImapCoroutine for ImapAuthAnonymous {
                                 self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapCoroutineState::Done(core::mem::take(&mut self.observed));
+                            return ImapCoroutineState::Complete(Ok(core::mem::take(
+                                &mut self.observed,
+                            )));
                         }
-                        Err(err) => return ImapCoroutineState::Err(err),
+                        Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
                 }
                 State::Continue(coroutine) => {
                     let (bye, continuation_request, tagged, data, untagged) =
                         match coroutine.resume(fragmentizer, arg.take()) {
                             SendImapCommandResult::WantsRead => {
-                                return ImapCoroutineState::WantsRead;
+                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
                             }
                             SendImapCommandResult::WantsWrite(bytes) => {
-                                return ImapCoroutineState::WantsWrite(bytes);
+                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
                             }
                             SendImapCommandResult::Ok {
                                 bye,
@@ -195,20 +197,20 @@ impl ImapCoroutine for ImapAuthAnonymous {
                                 ..
                             } => (bye, continuation_request, tagged, data, untagged),
                             SendImapCommandResult::Err(err) => {
-                                return ImapCoroutineState::Err(err.into());
+                                return ImapCoroutineState::Complete(Err(err.into()));
                             }
                         };
 
                     if let Some(bye) = bye {
-                        return ImapCoroutineState::Err(ImapAuthAnonymousError::Bye(
+                        return ImapCoroutineState::Complete(Err(ImapAuthAnonymousError::Bye(
                             bye.text.to_string(),
-                        ));
+                        )));
                     }
 
                     if continuation_request.is_some() {
-                        return ImapCoroutineState::Err(
+                        return ImapCoroutineState::Complete(Err(
                             ImapAuthAnonymousError::UnexpectedContinuationRequest,
-                        );
+                        ));
                     }
 
                     match finish(tagged, data, untagged) {
@@ -218,23 +220,20 @@ impl ImapCoroutine for ImapAuthAnonymous {
                                 self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
-                            return ImapCoroutineState::Done(core::mem::take(&mut self.observed));
+                            return ImapCoroutineState::Complete(Ok(core::mem::take(
+                                &mut self.observed,
+                            )));
                         }
-                        Err(err) => return ImapCoroutineState::Err(err),
+                        Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
                 }
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::WantsRead => {
-                        return ImapCoroutineState::WantsRead;
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(capability)) => {
+                        return ImapCoroutineState::Complete(Ok(capability));
                     }
-                    ImapCoroutineState::WantsWrite(bytes) => {
-                        return ImapCoroutineState::WantsWrite(bytes);
-                    }
-                    ImapCoroutineState::Done(capability) => {
-                        return ImapCoroutineState::Done(capability);
-                    }
-                    ImapCoroutineState::Err(err) => {
-                        return ImapCoroutineState::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
             }

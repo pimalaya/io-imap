@@ -23,13 +23,15 @@ fn main() {
 
     let capability = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => break capability,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(ImapGreetingOk { capability, .. })) => {
+                break capability;
+            }
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(_) => unreachable!(),
-            ImapCoroutineState::Err(err) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => unreachable!(),
         }
     };
 

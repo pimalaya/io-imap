@@ -17,7 +17,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
+default = ["client"]
 scram = ["dep:hmac", "dep:pbkdf2", "dep:rand", "dep:sha2"]
 client = []
 rustls-ring = ["client", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:url"]
@@ -44,7 +44,9 @@ thiserror = { version = "2", default-features = false }
 url = { version = "2.2", default-features = false, optional = true }
 
 # [patch.crates-io]
+# imap-codec.git = "https://github.com/soywod/imap-codec"
 # pimalaya-stream.path = "../stream"
 
 [patch.crates-io]
+imap-codec.git = "https://github.com/soywod/imap-codec"
 pimalaya-stream.git = "https://github.com/pimalaya/stream"

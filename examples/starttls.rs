@@ -26,21 +26,26 @@ fn main() {
 
     let mut coroutine = ImapStartTls::new();
     let mut arg: Option<&[u8]> = None;
+    let mut _remaining: Vec<u8> = Vec::new();
 
-    let _remaining = loop {
-        match coroutine.resume(arg.take()) {
-            ImapStartTlsResult::Ok { remaining } => break remaining,
-            ImapStartTlsResult::WantsRead => {
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Complete(Ok(())) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapStartTlsResult::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapStartTlsResult::Err(err) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(bytes)) => {
+                _remaining = bytes;
+                arg = None;
+            }
         }
-    };
+    }
 
     let tls = Tls::default();
     let mut stream = stream.upgrade_tls(&tls).unwrap();
@@ -50,16 +55,16 @@ fn main() {
 
     let capability = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(capability) => break capability,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(capability)) => break capability,
+            ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("{err}"),
         }
     };
 

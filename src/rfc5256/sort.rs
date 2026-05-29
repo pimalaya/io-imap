@@ -17,7 +17,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -67,31 +67,37 @@ impl ImapMailboxSort {
 }
 
 impl ImapCoroutine for ImapMailboxSort {
-    type Output = Vec<NonZeroU32>;
-    type Error = ImapMailboxSortError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<NonZeroU32>, ImapMailboxSortError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMailboxSortError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMailboxSortError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMailboxSortError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMailboxSortError::MissingTagged));
         };
 
         let mut ids = None;
@@ -103,14 +109,14 @@ impl ImapCoroutine for ImapMailboxSort {
 
         match body.kind {
             StatusKind::Ok => match ids {
-                Some(ids) => ImapCoroutineState::Done(ids),
-                None => ImapCoroutineState::Err(ImapMailboxSortError::MissingData),
+                Some(ids) => ImapCoroutineState::Complete(Ok(ids)),
+                None => ImapCoroutineState::Complete(Err(ImapMailboxSortError::MissingData)),
             },
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMailboxSortError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMailboxSortError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMailboxSortError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMailboxSortError::Bad(body.text.to_string())))
             }
         }
     }

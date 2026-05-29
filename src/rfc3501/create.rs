@@ -14,7 +14,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::{rfc3501::mailbox::encode_inplace, send::*};
 
 /// Errors that can occur during the coroutine progression.
@@ -54,39 +54,45 @@ impl ImapMailboxCreate {
 }
 
 impl ImapCoroutine for ImapMailboxCreate {
-    type Output = ();
-    type Error = ImapMailboxCreateError;
+    type Yield = ImapYield;
+    type Return = Result<(), ImapMailboxCreateError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMailboxCreateError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMailboxCreateError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMailboxCreateError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMailboxCreateError::MissingTagged));
         };
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(()),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMailboxCreateError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMailboxCreateError::No(body.text.to_string())))
             }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMailboxCreateError::Bad(body.text.to_string()))
-            }
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMailboxCreateError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

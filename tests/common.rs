@@ -52,16 +52,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(_) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("GREETING: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("greeting read");
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).expect("greeting write");
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("GREETING: {err}"),
         }
     }
 
@@ -73,16 +73,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(_) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("LOGIN: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("login read");
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).expect("login write");
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("LOGIN: {err}"),
         }
     }
 
@@ -93,16 +93,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(_) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("SELECT: {err:?}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("select read");
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).expect("select write");
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("SELECT: {err:?}"),
         }
     }
 
@@ -113,16 +113,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Done(()) => break,
-            ImapCoroutineState::WantsRead => {
+            ImapCoroutineState::Complete(Ok(())) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("LOGOUT: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("logout read");
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::WantsWrite(bytes) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).expect("logout write");
                 arg = None;
             }
-            ImapCoroutineState::Err(err) => panic!("LOGOUT: {err}"),
         }
     }
 }

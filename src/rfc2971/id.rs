@@ -13,7 +13,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -52,31 +52,35 @@ impl ImapServerId {
 }
 
 impl ImapCoroutine for ImapServerId {
-    type Output = Option<Vec<(IString<'static>, NString<'static>)>>;
-    type Error = ImapServerIdError;
+    type Yield = ImapYield;
+    type Return = Result<Option<Vec<(IString<'static>, NString<'static>)>>, ImapServerIdError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapServerIdError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapServerIdError::Bye(bye.text.to_string())));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapServerIdError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapServerIdError::MissingTagged));
         };
 
         let mut server_id = None;
@@ -87,10 +91,12 @@ impl ImapCoroutine for ImapServerId {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(server_id),
-            StatusKind::No => ImapCoroutineState::Err(ImapServerIdError::No(body.text.to_string())),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(server_id)),
+            StatusKind::No => {
+                ImapCoroutineState::Complete(Err(ImapServerIdError::No(body.text.to_string())))
+            }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapServerIdError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapServerIdError::Bad(body.text.to_string())))
             }
         }
     }

@@ -79,28 +79,24 @@ impl ImapGreetingGet {
 }
 
 impl ImapCoroutine for ImapGreetingGet {
-    type Output = ImapGreetingOk;
-    type Error = ImapGreetingGetError;
+    type Yield = ImapYield;
+    type Return = Result<ImapGreetingOk, ImapGreetingGetError>;
 
-    /// Advances the coroutine.
-    ///
-    /// Pass [`None`] when there is no data to provide (initial call).
-    /// Pass `Some(data)` with bytes read from the stream after a
-    /// [`ImapCoroutineState::WantsRead`]. Pass `Some(&[])` to signal
-    /// EOF.
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             if mem::take(&mut self.wants_read) {
-                return ImapCoroutineState::WantsRead;
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
             }
 
             match &mut self.state {
                 State::Read => match arg.take() {
-                    Some(&[]) => return ImapCoroutineState::Err(ImapGreetingGetError::Eof),
+                    Some(&[]) => {
+                        return ImapCoroutineState::Complete(Err(ImapGreetingGetError::Eof));
+                    }
                     Some(data) => {
                         trace!("read bytes: {}", escape_byte_string(data));
                         fragmentizer.enqueue_bytes(data);
@@ -121,8 +117,8 @@ impl ImapCoroutine for ImapGreetingGet {
 
                         match fragmentizer.decode_message(&self.codec) {
                             Ok(greeting) if greeting.kind == GreetingKind::Bye => {
-                                return ImapCoroutineState::Err(ImapGreetingGetError::Bye(
-                                    greeting.text.to_string(),
+                                return ImapCoroutineState::Complete(Err(
+                                    ImapGreetingGetError::Bye(greeting.text.to_string()),
                                 ));
                             }
                             Ok(greeting) => {
@@ -137,15 +133,15 @@ impl ImapCoroutine for ImapGreetingGet {
                                     continue;
                                 }
 
-                                return ImapCoroutineState::Done(ImapGreetingOk {
+                                return ImapCoroutineState::Complete(Ok(ImapGreetingOk {
                                     capability: mem::take(&mut self.observed),
                                     pre_authenticated: self.pre_authenticated,
-                                });
+                                }));
                             }
                             Err(err) => {
                                 let bytes = fragmentizer.message_bytes();
                                 let bytes = Secret::new(bytes.into());
-                                return ImapCoroutineState::Err(match err {
+                                let err = match err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
                                         ImapGreetingGetError::DecodingFailure(bytes)
@@ -156,7 +152,8 @@ impl ImapCoroutine for ImapGreetingGet {
                                     DecodeMessageError::MessagePoisoned { .. } => {
                                         ImapGreetingGetError::MessageIsPoisoned(bytes)
                                     }
-                                });
+                                };
+                                return ImapCoroutineState::Complete(Err(err));
                             }
                         }
                     }
@@ -169,18 +166,15 @@ impl ImapCoroutine for ImapGreetingGet {
                     }
                 },
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::WantsRead => return ImapCoroutineState::WantsRead,
-                    ImapCoroutineState::WantsWrite(bytes) => {
-                        return ImapCoroutineState::WantsWrite(bytes);
-                    }
-                    ImapCoroutineState::Done(capability) => {
-                        return ImapCoroutineState::Done(ImapGreetingOk {
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(capability)) => {
+                        return ImapCoroutineState::Complete(Ok(ImapGreetingOk {
                             capability,
                             pre_authenticated: self.pre_authenticated,
-                        });
+                        }));
                     }
-                    ImapCoroutineState::Err(err) => {
-                        return ImapCoroutineState::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
             }

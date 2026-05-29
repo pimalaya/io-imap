@@ -17,7 +17,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -67,31 +67,38 @@ impl ImapMessageFetch {
 }
 
 impl ImapCoroutine for ImapMessageFetch {
-    type Output = BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>;
-    type Error = ImapMessageFetchError;
+    type Yield = ImapYield;
+    type Return =
+        Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapMessageFetchError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageFetchError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageFetchError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageFetchError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageFetchError::MissingTagged));
         };
 
         let mut output: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>> = BTreeMap::new();
@@ -102,17 +109,15 @@ impl ImapCoroutine for ImapMessageFetch {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(
-                output
-                    .into_iter()
-                    .map(|(key, val)| (key, Vec1::unvalidated(val)))
-                    .collect(),
-            ),
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(output
+                .into_iter()
+                .map(|(key, val)| (key, Vec1::unvalidated(val)))
+                .collect())),
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageFetchError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageFetchError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageFetchError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageFetchError::Bad(body.text.to_string())))
             }
         }
     }
@@ -146,31 +151,37 @@ impl ImapMessageFetchFirst {
 }
 
 impl ImapCoroutine for ImapMessageFetchFirst {
-    type Output = Vec1<MessageDataItem<'static>>;
-    type Error = ImapMessageFetchError;
+    type Yield = ImapYield;
+    type Return = Result<Vec1<MessageDataItem<'static>>, ImapMessageFetchError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMessageFetchError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMessageFetchError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMessageFetchError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMessageFetchError::MissingTagged));
         };
 
         let mut output = None;
@@ -182,14 +193,14 @@ impl ImapCoroutine for ImapMessageFetchFirst {
 
         match body.kind {
             StatusKind::Ok => match output {
-                Some(items) => ImapCoroutineState::Done(items),
-                None => ImapCoroutineState::Err(ImapMessageFetchError::MissingData),
+                Some(items) => ImapCoroutineState::Complete(Ok(items)),
+                None => ImapCoroutineState::Complete(Err(ImapMessageFetchError::MissingData)),
             },
             StatusKind::No => {
-                ImapCoroutineState::Err(ImapMessageFetchError::No(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageFetchError::No(body.text.to_string())))
             }
             StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMessageFetchError::Bad(body.text.to_string()))
+                ImapCoroutineState::Complete(Err(ImapMessageFetchError::Bad(body.text.to_string())))
             }
         }
     }

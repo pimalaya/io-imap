@@ -13,7 +13,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -54,18 +54,20 @@ impl ImapCapabilityGet {
 }
 
 impl ImapCoroutine for ImapCapabilityGet {
-    type Output = Vec<Capability<'static>>;
-    type Error = ImapCapabilityGetError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<Capability<'static>>, ImapCapabilityGetError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (bye, tagged, data, untagged) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 bye,
@@ -74,24 +76,32 @@ impl ImapCoroutine for ImapCapabilityGet {
                 untagged,
                 ..
             } => (bye, tagged, data, untagged),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapCapabilityGetError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapCapabilityGetError::ExpectedTagged);
+            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::ExpectedTagged));
         };
 
         let code = match body.kind {
             StatusKind::Ok => body.code,
             StatusKind::No => {
-                return ImapCoroutineState::Err(ImapCapabilityGetError::No(body.text.to_string()));
+                return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::No(
+                    body.text.to_string(),
+                )));
             }
             StatusKind::Bad => {
-                return ImapCoroutineState::Err(ImapCapabilityGetError::Bad(body.text.to_string()));
+                return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::Bad(
+                    body.text.to_string(),
+                )));
             }
         };
 
@@ -114,10 +124,10 @@ impl ImapCoroutine for ImapCapabilityGet {
         }
 
         let Some(capability) = new_capability else {
-            return ImapCoroutineState::Err(ImapCapabilityGetError::ExpectedCapability);
+            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::ExpectedCapability));
         };
 
-        ImapCoroutineState::Done(capability.into_iter().collect())
+        ImapCoroutineState::Complete(Ok(capability.into_iter().collect()))
     }
 }
 

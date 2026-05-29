@@ -70,12 +70,10 @@ This library is composed of 3 feature-gated layers:
 
 I/O-IMAP can be consumed three ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
 
-Whichever mode you pick, every standard-shape coroutine implements the `ImapCoroutine` trait. Its `resume(&mut Fragmentizer, Option<&[u8]>)` method returns an `ImapCoroutineState<Output, Error>` with four shapes:
+Whichever mode you pick, every coroutine implements the `ImapCoroutine` trait (in `crate::coroutine`). Its `resume(&mut Fragmentizer, Option<&[u8]>)` method returns an `ImapCoroutineState<Yield, Return>` with two shapes:
 
-- `WantsRead`: caller reads more bytes from the socket and feeds them back on the next call. Pass `Some(&[])` to signal EOF.
-- `WantsWrite(Vec<u8>)`: caller writes these bytes to the socket. The next call typically passes `None`.
-- `Done(Output)`: terminal success carrying the coroutine's `Output` associated type.
-- `Err(Error)`: terminal failure carrying the coroutine's `Error` associated type.
+- `Yielded(yield)`: intermediate progression carrying the coroutine's `Yield` associated type. For the standard `ImapYield`, that is `WantsRead` (caller reads more bytes and feeds them back; pass `Some(&[])` to signal EOF) or `WantsWrite(Vec<u8>)` (caller writes these bytes; the next call typically passes `None`). Streaming coroutines (`ImapIdle`, `ImapMailboxWatch`) and `ImapStartTls` declare their own `Yield` enums mixing the standard I/O variants with extra variants (`Event(...)`, `WantsStartTls(...)`).
+- `Complete(result)`: terminal payload, by convention `Result<Output, Error>`. The "ok" arm carries the coroutine's final output; the "error" arm carries the cause.
 
 ### I/O-free coroutines
 
@@ -97,13 +95,13 @@ let mut arg: Option<&[u8]> = None;
 
 let capability = loop {
     match coroutine.resume(&mut fragmentizer, arg.take()) {
-        ImapCoroutineState::Done(ImapGreetingOk { capability, .. }) => break capability,
-        ImapCoroutineState::WantsRead => {
+        ImapCoroutineState::Complete(Ok(ImapGreetingOk { capability, .. })) => break capability,
+        ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
             let n = stream.read(&mut buf).unwrap();
             arg = Some(&buf[..n]);
         }
-        ImapCoroutineState::WantsWrite(_) => unreachable!(),
-        ImapCoroutineState::Err(err) => panic!("{err}"),
+        ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => unreachable!(),
     }
 };
 ```
@@ -126,16 +124,16 @@ let mut arg: Option<&[u8]> = None;
 
 let mailboxes = loop {
     match coroutine.resume(&mut fragmentizer, arg.take()) {
-        ImapCoroutineState::Done(mailboxes) => break mailboxes,
-        ImapCoroutineState::WantsRead => {
+        ImapCoroutineState::Complete(Ok(mailboxes)) => break mailboxes,
+        ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
             let n = stream.read(&mut buf).unwrap();
             arg = Some(&buf[..n]);
         }
-        ImapCoroutineState::WantsWrite(bytes) => {
+        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
             stream.write_all(&bytes).unwrap();
             arg = None;
         }
-        ImapCoroutineState::Err(err) => panic!("{err}"),
     }
 };
 

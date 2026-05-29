@@ -2,11 +2,11 @@
 //!
 //! The coroutine discards the server greeting, sends a STARTTLS
 //! command, and discards the tagged response; at which point it
-//! yields [`ImapStartTlsResult::Ok`] for the caller to perform the
-//! TLS handshake on the underlying socket. Any bytes
-//! received after the tagged response (which RFC 3501 §6.2.1
-//! forbids) are returned in `remaining` so the caller can decide
-//! how to handle them.
+//! yields [`ImapStartTlsYield::WantsStartTls`] carrying any bytes
+//! received past the tagged response so the caller can perform the
+//! TLS handshake on the underlying socket. Any bytes received after
+//! the tagged response (which RFC 3501 §6.2.1 forbids) ride along on
+//! the yield so the caller can decide how to handle them.
 
 use alloc::vec::Vec;
 use core::mem;
@@ -14,6 +14,7 @@ use core::mem;
 use imap_codec::{
     CommandCodec,
     encode::{Encoder, Fragment},
+    fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
         core::{Tag, TagGenerator},
@@ -23,6 +24,8 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
+use crate::coroutine::*;
+
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapStartTlsError {
@@ -30,18 +33,27 @@ pub enum ImapStartTlsError {
     Eof,
 }
 
-/// Output emitted when the coroutine terminates its progression.
-pub enum ImapStartTlsResult {
-    /// The STARTTLS handshake on the IMAP layer is complete and the
-    /// caller should now perform the TLS handshake on the socket.
-    Ok {
-        /// Bytes received after the tagged response (should be empty
-        /// per RFC 3501 §6.2.1).
-        remaining: Vec<u8>,
-    },
+/// Per-coroutine Yield: socket I/O step requests on one axis,
+/// TLS-upgrade hand-off on the other. The driver dispatches on the
+/// variant: I/O variants pump the IMAP socket;
+/// [`Self::WantsStartTls`] hands the remaining pre-read bytes back to
+/// the caller so it can perform the TLS handshake on the underlying
+/// socket.
+#[derive(Debug)]
+pub enum ImapStartTlsYield {
+    /// Socket: read more bytes and feed them back on the next
+    /// resume.
     WantsRead,
+    /// Socket: write these bytes; the next resume typically takes
+    /// `None`.
     WantsWrite(Vec<u8>),
-    Err(ImapStartTlsError),
+    /// IMAP-layer STARTTLS dance is complete; the driver should now
+    /// perform the TLS handshake on the underlying socket. The vec
+    /// carries any bytes received past the tagged STARTTLS response
+    /// (RFC 3501 §6.2.1 forbids any; non-empty here is a classic
+    /// STARTTLS-injection signal). After the upgrade the coroutine
+    /// has no more work; one extra resume completes with `Ok(())`.
+    WantsStartTls(Vec<u8>),
 }
 
 enum State {
@@ -51,6 +63,9 @@ enum State {
     WriteStartTls,
     /// The STARTTLS response needs to be discarded.
     DiscardStartTls,
+    /// Terminal state reached after [`ImapStartTlsYield::WantsStartTls`]
+    /// was emitted; the next resume completes with `Ok(())`.
+    Done,
 }
 
 /// I/O-free coroutine to perform STARTTLS negotiation.
@@ -59,6 +74,7 @@ pub struct ImapStartTls {
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
+    wants_start_tls: Option<Vec<u8>>,
     buf: Vec<u8>,
 }
 
@@ -73,24 +89,40 @@ impl ImapStartTls {
             state: State::DiscardGreeting,
             wants_read: false,
             wants_write: None,
+            wants_start_tls: None,
             buf: Vec::new(),
         }
     }
+}
 
-    /// Advances the coroutine.
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapStartTlsResult {
+impl ImapCoroutine for ImapStartTls {
+    type Yield = ImapStartTlsYield;
+    type Return = Result<(), ImapStartTlsError>;
+
+    fn resume(
+        &mut self,
+        _fragmentizer: &mut Fragmentizer,
+        mut arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             if let Some(bytes) = self.wants_write.take() {
-                return ImapStartTlsResult::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes));
+            }
+
+            if let Some(remaining) = self.wants_start_tls.take() {
+                self.state = State::Done;
+                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(remaining));
             }
 
             if mem::take(&mut self.wants_read) {
-                return ImapStartTlsResult::WantsRead;
+                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead);
             }
 
             match self.state {
                 State::DiscardGreeting => match arg.take() {
-                    Some(&[]) => return ImapStartTlsResult::Err(ImapStartTlsError::Eof),
+                    Some(&[]) => {
+                        return ImapCoroutineState::Complete(Err(ImapStartTlsError::Eof));
+                    }
                     Some(data) => {
                         self.buf.extend_from_slice(data);
 
@@ -124,7 +156,9 @@ impl ImapStartTls {
                     self.state = State::DiscardStartTls;
                 }
                 State::DiscardStartTls => match arg.take() {
-                    Some(&[]) => return ImapStartTlsResult::Err(ImapStartTlsError::Eof),
+                    Some(&[]) => {
+                        return ImapCoroutineState::Complete(Err(ImapStartTlsError::Eof));
+                    }
                     Some(data) => {
                         self.buf.extend_from_slice(data);
 
@@ -154,13 +188,15 @@ impl ImapStartTls {
                         );
 
                         let remaining = self.buf.split_off(end);
-
-                        return ImapStartTlsResult::Ok { remaining };
+                        self.wants_start_tls = Some(remaining);
                     }
                     None => {
                         self.wants_read = true;
                     }
                 },
+                State::Done => {
+                    return ImapCoroutineState::Complete(Ok(()));
+                }
             }
         }
     }

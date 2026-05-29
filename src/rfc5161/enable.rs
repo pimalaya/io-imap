@@ -14,7 +14,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -53,31 +53,37 @@ impl ImapExtensionEnable {
 }
 
 impl ImapCoroutine for ImapExtensionEnable {
-    type Output = Option<Vec<CapabilityEnable<'static>>>;
-    type Error = ImapExtensionEnableError;
+    type Yield = ImapYield;
+    type Return = Result<Option<Vec<CapabilityEnable<'static>>>, ImapExtensionEnableError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapExtensionEnableError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapExtensionEnableError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapExtensionEnableError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapExtensionEnableError::MissingTagged));
         };
 
         let mut enabled = None;
@@ -88,13 +94,13 @@ impl ImapCoroutine for ImapExtensionEnable {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(enabled),
-            StatusKind::No => {
-                ImapCoroutineState::Err(ImapExtensionEnableError::No(body.text.to_string()))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapExtensionEnableError::Bad(body.text.to_string()))
-            }
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
+            StatusKind::No => ImapCoroutineState::Complete(Err(ImapExtensionEnableError::No(
+                body.text.to_string(),
+            ))),
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapExtensionEnableError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }

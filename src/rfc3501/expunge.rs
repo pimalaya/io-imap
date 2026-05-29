@@ -15,7 +15,7 @@ use imap_codec::{
 };
 use thiserror::Error;
 
-use crate::coroutine::{ImapCoroutine, ImapCoroutineState};
+use crate::coroutine::*;
 use crate::send::*;
 
 /// Errors that can occur during the coroutine progression.
@@ -53,31 +53,37 @@ impl ImapMailboxExpunge {
 }
 
 impl ImapCoroutine for ImapMailboxExpunge {
-    type Output = Vec<NonZeroU32>;
-    type Error = ImapMailboxExpungeError;
+    type Yield = ImapYield;
+    type Return = Result<Vec<NonZeroU32>, ImapMailboxExpungeError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Output, Self::Error> {
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => return ImapCoroutineState::WantsRead,
+            SendImapCommandResult::WantsRead => {
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+            }
             SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::WantsWrite(bytes);
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
             SendImapCommandResult::Ok {
                 data, tagged, bye, ..
             } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => return ImapCoroutineState::Err(err.into()),
+            SendImapCommandResult::Err(err) => {
+                return ImapCoroutineState::Complete(Err(err.into()));
+            }
         };
 
         if let Some(bye) = bye {
-            return ImapCoroutineState::Err(ImapMailboxExpungeError::Bye(bye.text.to_string()));
+            return ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::Bye(
+                bye.text.to_string(),
+            )));
         }
 
         let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Err(ImapMailboxExpungeError::MissingTagged);
+            return ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::MissingTagged));
         };
 
         let mut expunged = Vec::new();
@@ -88,13 +94,13 @@ impl ImapCoroutine for ImapMailboxExpunge {
         }
 
         match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Done(expunged),
-            StatusKind::No => {
-                ImapCoroutineState::Err(ImapMailboxExpungeError::No(body.text.to_string()))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Err(ImapMailboxExpungeError::Bad(body.text.to_string()))
-            }
+            StatusKind::Ok => ImapCoroutineState::Complete(Ok(expunged)),
+            StatusKind::No => ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::No(
+                body.text.to_string(),
+            ))),
+            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::Bad(
+                body.text.to_string(),
+            ))),
         }
     }
 }
