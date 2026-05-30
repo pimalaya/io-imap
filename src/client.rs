@@ -21,6 +21,7 @@
 //! [`connect`]: ImapClientStd::connect
 
 use core::{
+    any::Any,
     fmt,
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::{AtomicBool, Ordering},
@@ -109,9 +110,6 @@ use crate::{
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*},
     watch::*,
 };
-
-const READ_BUFFER_SIZE: usize = 16 * 1024;
-const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Errors returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
@@ -240,26 +238,14 @@ pub enum ImapClientStdError {
     InvalidModSeq,
 }
 
-/// Marker for everything the client can run against; auto-implemented
-/// for any blocking `Read + Write + Send` impl. The `Send` supertrait
-/// flows the auto-trait through the `Box<dyn Stream>` type erasure so
-/// `ImapClientStd` can travel between threads in worker pools.
-pub trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send + ?Sized> Stream for T {}
+const READ_BUFFER_SIZE: usize = 16 * 1024;
+const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Std-blocking IMAP client wrapping a single boxed stream plus a
 /// per-connection [`Fragmentizer`].
 pub struct ImapClientStd {
-    pub stream: Box<dyn Stream>,
+    pub stream: Box<dyn ImapStream>,
     pub fragmentizer: Fragmentizer,
-}
-
-impl fmt::Debug for ImapClientStd {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ImapClientStd")
-            .field("fragmentizer", &self.fragmentizer)
-            .finish_non_exhaustive()
-    }
 }
 
 impl ImapClientStd {
@@ -767,6 +753,14 @@ impl ImapClientStd {
     }
 }
 
+impl fmt::Debug for ImapClientStd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImapClientStd")
+            .field("fragmentizer", &self.fragmentizer)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Long-lived [`ImapMailboxWatchEvent`] stream backed by a background
 /// worker thread that owns the IMAP connection. Drop or
 /// [`Self::close`] to wind it down; the worker observes the shutdown
@@ -991,5 +985,25 @@ fn run_starttls(
             }
             ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(_)) => {}
         }
+    }
+}
+
+/// Marker for everything the client can run against; auto-implemented
+/// for any blocking `Read + Write + Send + 'static` impl. The `Send`
+/// supertrait flows the auto-trait through the `Box<dyn ImapStream>`
+/// type erasure so `ImapClientStd` can travel between threads in
+/// worker pools. [`as_any_mut`] lets specialized callers (e.g.
+/// byte-level proxies that need [`StreamStd::set_read_timeout`])
+/// downcast the boxed stream back to its concrete type.
+///
+/// [`as_any_mut`]: ImapStream::as_any_mut
+/// [`StreamStd::set_read_timeout`]: pimalaya_stream::std::stream::StreamStd::set_read_timeout
+pub trait ImapStream: Read + Write + Send + Any {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Read + Write + Send + Any> ImapStream for T {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
