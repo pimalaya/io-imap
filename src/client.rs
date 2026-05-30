@@ -21,6 +21,7 @@
 //! [`connect`]: ImapClientStd::connect
 
 use core::{
+    fmt,
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -239,50 +240,43 @@ pub enum ImapClientStdError {
     InvalidModSeq,
 }
 
-/// Std-blocking IMAP client wrapping a single `Read + Write` stream plus a
+/// Marker for everything the client can run against; auto-implemented
+/// for any blocking `Read + Write + Send` impl. The `Send` supertrait
+/// flows the auto-trait through the `Box<dyn Stream>` type erasure so
+/// `ImapClientStd` can travel between threads in worker pools.
+pub trait Stream: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> Stream for T {}
+
+/// Std-blocking IMAP client wrapping a single boxed stream plus a
 /// per-connection [`Fragmentizer`].
-#[derive(Debug)]
-pub struct ImapClientStd<S: Read + Write> {
-    stream: S,
-    fragmentizer: Fragmentizer,
+pub struct ImapClientStd {
+    pub stream: Box<dyn Stream>,
+    pub fragmentizer: Fragmentizer,
 }
 
-impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
-    /// Builds a client around `stream`. The caller is responsible for opening
-    /// the connection (TCP, TLS handshake if needed, STARTTLS upgrade if
-    /// needed).
-    pub fn new(stream: S) -> Self {
+impl fmt::Debug for ImapClientStd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImapClientStd")
+            .field("fragmentizer", &self.fragmentizer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImapClientStd {
+    /// Builds a client around `stream`. The caller is responsible for
+    /// opening the connection (TCP, TLS handshake if needed, STARTTLS
+    /// upgrade if needed).
+    pub fn new<S: Read + Write + Send + 'static>(stream: S) -> Self {
         Self {
-            stream,
+            stream: Box::new(stream),
             fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
         }
     }
 
-    /// Returns a shared reference to the underlying stream.
-    pub fn stream(&self) -> &S {
-        &self.stream
-    }
-
-    /// Returns an exclusive reference to the underlying stream.
-    pub fn stream_mut(&mut self) -> &mut S {
-        &mut self.stream
-    }
-
-    /// Consumes the client and returns its underlying stream. Useful
-    /// after [`starttls`] to perform a TLS upgrade on the raw stream
-    /// before rebuilding a fresh client around the upgraded stream.
-    ///
-    /// [`starttls`]: ImapClientStd::starttls
-    pub fn into_stream(self) -> S {
-        self.stream
-    }
-
-    /// Consumes the client and returns both the stream and the
-    /// fragmentizer. Useful for handing the connection state off to
-    /// a downstream consumer (e.g. io-email's `ImapContext`) without
-    /// dropping the fragmentizer's in-flight server-response buffer.
-    pub fn into_parts(self) -> (S, Fragmentizer) {
-        (self.stream, self.fragmentizer)
+    /// Replaces the underlying stream; useful after a STARTTLS upgrade
+    /// or when the caller manages reconnection across hosts.
+    pub fn set_stream<S: Read + Write + Send + 'static>(&mut self, stream: S) {
+        self.stream = Box::new(stream);
     }
 
     /// Drives any standard-shape coroutine (`Yield = ImapYield`,
@@ -630,7 +624,7 @@ impl<S: Read + Write + Send + 'static> ImapClientStd<S> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone())?;
         let mut fragmentizer = self.fragmentizer;
-        let mut stream: Box<dyn ImapStream> = Box::new(self.stream);
+        let mut stream = self.stream;
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientStdError>>(256);
         let shutdown_handle = shutdown.clone();
@@ -835,7 +829,7 @@ impl Drop for ImapMailboxWatchStream {
     feature = "rustls-ring",
     feature = "native-tls"
 ))]
-impl ImapClientStd<StreamStd> {
+impl ImapClientStd {
     /// Connects to `url`, optionally performs the STARTTLS upgrade, reads
     /// the greeting + capability list, then runs the chosen SASL
     /// mechanism.
@@ -887,13 +881,30 @@ impl ImapClientStd<StreamStd> {
             return Err(ImapClientStdError::StartTlsOverTls);
         }
 
+        // STARTTLS needs the concrete StreamStd to call upgrade_tls
+        // after the IMAP-layer handshake; once boxed there is no way
+        // back to the concrete type. Run the STARTTLS coroutine inline
+        // against the raw stream + a temporary fragmentizer, swap in
+        // the upgraded stream, then build the boxed client.
+        let stream = if starttls {
+            let mut stream = stream;
+            let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+            run_starttls(&mut stream, &mut fragmentizer)?;
+            stream.upgrade_tls(tls)?
+        } else {
+            stream
+        };
+
+        // Sensible default read timeout: makes [`watch_mailbox`] poll
+        // its shutdown flag every 5 s instead of blocking forever on
+        // the silent IDLE socket. Per-read (not per-operation) so big
+        // FETCH responses are unaffected as long as TCP packets keep
+        // arriving.
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
         let mut client = Self::new(stream);
 
         let mut capability = if starttls {
-            client.starttls()?;
-            let raw = client.into_stream();
-            let upgraded = raw.upgrade_tls(tls)?;
-            client = Self::new(upgraded);
             client.capability()?
         } else {
             client.greeting()?
@@ -948,9 +959,37 @@ impl ImapClientStd<StreamStd> {
     }
 }
 
-/// Marker for every blocking, `Send` stream the watcher can run
-/// against; auto-implemented for any concrete `Read + Write + Send`
-/// type. Mirrors the same pattern as
-/// [`io_http::client::HttpClientStd`].
-trait ImapStream: Read + Write + Send {}
-impl<T: Read + Write + Send + ?Sized> ImapStream for T {}
+/// Drives [`ImapStartTls`] inline against a concrete `StreamStd` +
+/// `Fragmentizer`. Used by [`ImapClientStd::connect`] when the caller
+/// asks for STARTTLS: the IMAP-layer handshake has to complete on the
+/// plain socket before [`StreamStd::upgrade_tls`] can swap the stream,
+/// and the boxed [`ImapClientStd::stream`] hides the concrete type
+/// that `upgrade_tls` needs.
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+fn run_starttls(
+    stream: &mut StreamStd,
+    fragmentizer: &mut Fragmentizer,
+) -> Result<(), ImapClientStdError> {
+    let mut coroutine = ImapStartTls::new();
+    let mut buf = [0u8; READ_BUFFER_SIZE];
+    let mut arg: Option<&[u8]> = None;
+
+    loop {
+        match coroutine.resume(fragmentizer, arg.take()) {
+            ImapCoroutineState::Complete(Ok(())) => return Ok(()),
+            ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
+                let n = stream.read(&mut buf)?;
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
+                stream.write_all(&bytes)?;
+            }
+            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(_)) => {}
+        }
+    }
+}
