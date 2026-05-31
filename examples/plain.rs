@@ -50,7 +50,7 @@ fn main() {
     println!("capability pre plain: {capability:#?}");
 
     let params = ImapAuthPlainParams::new(None::<&str>, user, SecretString::from(pass), false);
-    let mut coroutine = ImapAuthPlain::new(params, true);
+    let mut coroutine = ImapAuthPlain::new(params, true, None);
     let mut arg: Option<&[u8]> = None;
 
     let capability = loop {

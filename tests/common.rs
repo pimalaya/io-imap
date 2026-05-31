@@ -68,7 +68,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     // ── LOGIN ─────────────────────────────────────────────────────────────────
 
     let params = ImapLoginParams::new(username, SecretString::from(password.to_owned())).unwrap();
-    let mut coroutine = ImapLogin::new(params, true);
+    let mut coroutine = ImapLogin::new(params, true, None);
     let mut arg: Option<&[u8]> = None;
 
     loop {

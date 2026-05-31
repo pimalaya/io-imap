@@ -52,7 +52,7 @@ fn main() {
     println!("capability pre login: {capability:#?}");
 
     let params = ImapLoginParams::new(user, SecretString::from(pass)).unwrap();
-    let mut coroutine = ImapLogin::new(params, true);
+    let mut coroutine = ImapLogin::new(params, true, None);
     let mut arg: Option<&[u8]> = None;
 
     let capability = loop {

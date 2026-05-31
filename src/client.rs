@@ -243,19 +243,30 @@ const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Std-blocking IMAP client wrapping a single boxed stream plus a
 /// per-connection [`Fragmentizer`].
+///
+/// `auto_id` is the optional RFC 2971 payload sent by every auth_*/
+/// login method straight after authentication: [`None`] skips the
+/// extra round-trip (default); [`Some`] with an empty vec sends
+/// `ID NIL`; [`Some`] with parameters sends `ID (key val …)`. Some
+/// providers (notably mail.qq.com, fastmail) require an ID exchange
+/// before they will accept further commands.
 pub struct ImapClientStd {
     pub stream: Box<dyn ImapStream>,
     pub fragmentizer: Fragmentizer,
+    pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
 impl ImapClientStd {
     /// Builds a client around `stream`. The caller is responsible for
     /// opening the connection (TCP, TLS handshake if needed, STARTTLS
-    /// upgrade if needed).
+    /// upgrade if needed). `auto_id` defaults to [`None`]; set it on
+    /// the returned client before invoking an auth_*/login method to
+    /// chain an `ID` round-trip after the SASL handshake.
     pub fn new<S: Read + Write + Send + 'static>(stream: S) -> Self {
         Self {
             stream: Box::new(stream),
             fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
+            auto_id: None,
         }
     }
 
@@ -318,11 +329,15 @@ impl ImapClientStd {
 
     /// Runs [`ImapLogin`] (`LOGIN`) with the `ensure_capabilities` flag
     /// set so the capability list is always refreshed before returning.
+    /// Honours [`Self::auto_id`]: when set, chains an RFC 2971 `ID`
+    /// round-trip after the tagged `OK`; the field is consumed and
+    /// reset to [`None`].
     pub fn login(
         &mut self,
         params: ImapLoginParams,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapLogin::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapLogin::new(params, true, auto_id))
     }
 
     /// Runs [`ImapStartTls`] (`STARTTLS`, RFC 3501 §6.2.1). The IMAP-layer
@@ -366,17 +381,22 @@ impl ImapClientStd {
 
     /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC 4505)
     /// with `ensure_capabilities=true` so the capability list is refreshed
-    /// before returning.
+    /// before returning. Honours [`Self::auto_id`] (see [`login`] for
+    /// details).
+    ///
+    /// [`login`]: ImapClientStd::login
     pub fn auth_anonymous(
         &mut self,
         params: ImapAuthAnonymousParams,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthAnonymous::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthAnonymous::new(params, true, auto_id))
     }
 
     /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy two-prompt
     /// mechanism) with `ensure_capabilities=true`. Prefer [`auth_plain`] or
-    /// [`auth_scram_sha256`] when the server supports them.
+    /// [`auth_scram_sha256`] when the server supports them. Honours
+    /// [`Self::auto_id`].
     ///
     /// [`auth_plain`]: ImapClientStd::auth_plain
     /// [`auth_scram_sha256`]: ImapClientStd::auth_scram_sha256
@@ -384,51 +404,58 @@ impl ImapClientStd {
         &mut self,
         params: ImapAuthLoginParams,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthLogin::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthLogin::new(params, true, auto_id))
     }
 
     /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616) with
-    /// `ensure_capabilities=true`.
+    /// `ensure_capabilities=true`. Honours [`Self::auto_id`].
     pub fn auth_plain(
         &mut self,
         params: ImapAuthPlainParams,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthPlain::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthPlain::new(params, true, auto_id))
     }
 
     /// Runs [`ImapAuthOAuthBearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
     /// RFC 7628) with `ensure_capabilities=true`. The `token` is an
     /// OAuth 2.0 bearer access token: the connection must be
-    /// TLS-protected before calling this method.
+    /// TLS-protected before calling this method. Honours
+    /// [`Self::auto_id`].
     pub fn auth_oauthbearer(
         &mut self,
         params: ImapAuthOAuthBearerParams,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthOAuthBearer::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthOAuthBearer::new(params, true, auto_id))
     }
 
     /// Runs [`ImapAuthXOAuth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
     /// pre-standard OAuth 2.0 mechanism) with `ensure_capabilities=true`.
     /// The `token` is an OAuth 2.0 bearer access token: the connection
     /// must be TLS-protected. Prefer [`auth_oauthbearer`] on servers that
-    /// support both.
+    /// support both. Honours [`Self::auto_id`].
     ///
     /// [`auth_oauthbearer`]: ImapClientStd::auth_oauthbearer
     pub fn auth_xoauth2(
         &mut self,
         params: ImapAuthXOAuth2Params,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthXOAuth2::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthXOAuth2::new(params, true, auto_id))
     }
 
     /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
-    /// RFC 7677) with `ensure_capabilities=true`.
+    /// RFC 7677) with `ensure_capabilities=true`. Honours
+    /// [`Self::auto_id`].
     #[cfg(feature = "scram")]
     pub fn auth_scram_sha256(
         &mut self,
         params: ImapAuthScramSha256Params,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        self.run(ImapAuthScramSha256::new(params, true))
+        let auto_id = self.auto_id.take();
+        self.run(ImapAuthScramSha256::new(params, true, auto_id))
     }
 
     /// Runs [`ImapLogout`] (`LOGOUT`).
@@ -842,6 +869,9 @@ impl ImapClientStd {
     ///   [`SaslOauthbearer`] (RFC 7628), [`SaslXoauth2`] (Google), and
     ///   [`SaslScramSha256`] (RFC 7677, behind the `scram` cargo
     ///   feature). Pass [`None`] to skip authentication.
+    /// - `auto_id` is forwarded to the auth coroutine and triggers an
+    ///   RFC 2971 `ID` exchange after authentication (see
+    ///   [`Self::auto_id`]).
     ///
     /// Returns a fully authenticated client paired with the latest
     /// observed capability list, ready to issue further commands.
@@ -850,6 +880,7 @@ impl ImapClientStd {
         tls: &Tls,
         starttls: bool,
         sasl: Option<impl Into<Sasl>>,
+        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<(Self, Vec<Capability<'static>>), ImapClientStdError> {
         let Some(host) = url.host_str() else {
             return Err(ImapClientStdError::UrlMissingHost(url.to_string()));
@@ -897,6 +928,7 @@ impl ImapClientStd {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
         let mut client = Self::new(stream);
+        client.auto_id = auto_id;
 
         let mut capability = if starttls {
             client.capability()?

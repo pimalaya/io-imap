@@ -12,7 +12,7 @@ use imap_codec::{
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
-        core::TagGenerator,
+        core::{IString, NString, TagGenerator},
         response::{
             Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
         },
@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::coroutine::*;
-use crate::{rfc3501::capability::*, send::*};
+use crate::{rfc2971::id::*, rfc3501::capability::*, send::*};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -73,6 +73,9 @@ pub enum ImapAuthScramSha256Error {
 
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+
+    #[error(transparent)]
+    ServerId(#[from] ImapServerIdError),
 }
 
 pub struct ImapAuthScramSha256Params {
@@ -97,6 +100,7 @@ enum State {
     SendClientFinal(SendImapCommand<AuthenticateDataCodec>),
     Acknowledge(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
+    Id(ImapServerId),
 }
 
 /// I/O-free coroutine to authenticate via SCRAM-SHA-256 (RFC 7677).
@@ -109,6 +113,7 @@ pub struct ImapAuthScramSha256 {
     client_nonce: String,
     observed: Vec<Capability<'static>>,
     expected_server_signature: Option<Vec<u8>>,
+    auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
 fn escape_username(username: &str) -> String {
@@ -253,8 +258,14 @@ impl ImapAuthScramSha256 {
     /// Creates a new coroutine. When `ensure_capabilities` is true and the
     /// server did not piggyback a capability list on the AUTHENTICATE tagged
     /// response, the coroutine drives an extra `CAPABILITY` round-trip
-    /// before completing.
-    pub fn new(params: ImapAuthScramSha256Params, ensure_capabilities: bool) -> Self {
+    /// before completing. When `auto_id` is [`Some`], runs an extra `ID`
+    /// round-trip (RFC 2971) after authentication; an empty vec maps to
+    /// `ID NIL`.
+    pub fn new(
+        params: ImapAuthScramSha256Params,
+        ensure_capabilities: bool,
+        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+    ) -> Self {
         let client_nonce = generate_nonce();
         let escaped = escape_username(&params.username);
         let client_first_bare = format!("n={escaped},r={client_nonce}");
@@ -287,7 +298,14 @@ impl ImapAuthScramSha256 {
             client_nonce,
             observed: Vec::new(),
             expected_server_signature: None,
+            auto_id,
         }
+    }
+
+    fn start_auto_id(&mut self) -> Option<State> {
+        let params = self.auto_id.take()?;
+        let wire = (!params.is_empty()).then_some(params);
+        Some(State::Id(ImapServerId::new(wire)))
     }
 
     /// Processes the server-first-message and builds the
@@ -527,6 +545,10 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                                 self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
+                            if let Some(next) = self.start_auto_id() {
+                                self.state = next;
+                                continue;
+                            }
                             return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                         }
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
@@ -572,6 +594,10 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                                 self.state = State::Capability(ImapCapabilityGet::new());
                                 continue;
                             }
+                            if let Some(next) = self.start_auto_id() {
+                                self.state = next;
+                                continue;
+                            }
                             return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                         }
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
@@ -580,7 +606,21 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
                     ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
                     ImapCoroutineState::Complete(Ok(capability)) => {
-                        return ImapCoroutineState::Complete(Ok(capability));
+                        self.observed = capability;
+                        if let Some(next) = self.start_auto_id() {
+                            self.state = next;
+                            continue;
+                        }
+                        return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Id(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(_)) => {
+                        return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
                         return ImapCoroutineState::Complete(Err(err.into()));

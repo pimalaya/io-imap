@@ -10,7 +10,7 @@ use imap_codec::{
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
-        core::TagGenerator,
+        core::{IString, NString, TagGenerator},
         response::{
             Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
         },
@@ -21,7 +21,7 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 use crate::coroutine::*;
-use crate::{rfc3501::capability::*, send::*};
+use crate::{rfc2971::id::*, rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -53,6 +53,9 @@ pub enum ImapAuthXOAuth2Error {
 
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+
+    #[error(transparent)]
+    ServerId(#[from] ImapServerIdError),
 }
 
 pub struct ImapAuthXOAuth2Params {
@@ -76,6 +79,7 @@ enum State {
     Continue(SendImapCommand<AuthenticateDataCodec>),
     AcknowledgeError(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
+    Id(ImapServerId),
 }
 
 /// I/O-free coroutine to authenticate an IMAP mailbox via XOAUTH2.
@@ -86,11 +90,18 @@ pub struct ImapAuthXOAuth2 {
     observed: Vec<Capability<'static>>,
     ensure_capabilities: bool,
     error: Option<String>,
+    auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
 impl ImapAuthXOAuth2 {
-    /// Creates a new coroutine.
-    pub fn new(params: ImapAuthXOAuth2Params, ensure_capabilities: bool) -> Self {
+    /// Creates a new coroutine. When `auto_id` is [`Some`], runs an
+    /// extra `ID` round-trip (RFC 2971) after authentication; an
+    /// empty vec maps to `ID NIL`.
+    pub fn new(
+        params: ImapAuthXOAuth2Params,
+        ensure_capabilities: bool,
+        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+    ) -> Self {
         let username = &params.username;
         let token = params.token.declassify();
         let payload = format!("user={username}\x01auth=Bearer {token}\x01\x01");
@@ -118,7 +129,14 @@ impl ImapAuthXOAuth2 {
             observed: Vec::new(),
             ensure_capabilities,
             error: None,
+            auto_id,
         }
+    }
+
+    fn start_auto_id(&mut self) -> Option<State> {
+        let params = self.auto_id.take()?;
+        let wire = (!params.is_empty()).then_some(params);
+        Some(State::Id(ImapServerId::new(wire)))
     }
 }
 
@@ -288,6 +306,11 @@ impl ImapCoroutine for ImapAuthXOAuth2 {
                         continue;
                     }
 
+                    if let Some(next) = self.start_auto_id() {
+                        self.state = next;
+                        continue;
+                    }
+
                     return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                 }
                 State::AcknowledgeError(send) => {
@@ -336,7 +359,21 @@ impl ImapCoroutine for ImapAuthXOAuth2 {
                 State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
                     ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
                     ImapCoroutineState::Complete(Ok(capability)) => {
-                        return ImapCoroutineState::Complete(Ok(capability));
+                        self.observed = capability;
+                        if let Some(next) = self.start_auto_id() {
+                            self.state = next;
+                            continue;
+                        }
+                        return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Id(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
+                    ImapCoroutineState::Complete(Ok(_)) => {
+                        return ImapCoroutineState::Complete(Ok(mem::take(&mut self.observed)));
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
                         return ImapCoroutineState::Complete(Err(err.into()));

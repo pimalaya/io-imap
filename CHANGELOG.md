@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added an `auto_id: Option<Vec<(IString<'static>, NString<'static>)>>` constructor argument to every auth coroutine (`ImapLogin`, `ImapAuthAnonymous`, `ImapAuthLogin`, `ImapAuthPlain`, `ImapAuthOAuthBearer`, `ImapAuthXOAuth2`, `ImapAuthScramSha256`). When `Some`, the coroutine chains an RFC 2971 `ID` round-trip after the tagged auth response (empty vec → `ID NIL`, non-empty → `ID (key val …)`); each error enum gained a `ServerId(#[from] ImapServerIdError)` variant. `ImapClientStd` gained a matching `pub auto_id` field consumed by every `auth_*`/`login` method (moved into the coroutine then reset to `None`). `ImapClientStd::connect` takes the same `auto_id` argument and threads it through the SASL dispatch so providers that require `ID` after auth (mail.qq.com, fastmail) are reachable end-to-end.
+
 - Flattened `ImapIdleDone` into a plain `Arc<AtomicBool>`: `ImapIdle::new` now takes `done: Arc<AtomicBool>` directly. Callers use `done.store(true, Ordering::SeqCst)` / `done.load(Ordering::SeqCst)` instead of the wrapper's `done()` / `is_done()` methods.
 
 - Unified all standard-shape coroutines under a single `ImapCoroutine` trait (in `crate::coroutine`) with associated `Output` and `Error`. `resume` now returns `ImapCoroutineState<Output, Error>` directly; the per-coroutine `Imap*Result` enums are gone. `ImapClientStd::run<C: ImapCoroutine>` drives any coroutine to completion. Exempt (kept as-is with their own result enum): `ImapStartTls`, `ImapIdle`, `ImapMailboxWatch`.
