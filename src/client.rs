@@ -241,6 +241,14 @@ pub enum ImapClientStdError {
 const READ_BUFFER_SIZE: usize = 16 * 1024;
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
+/// Default ALPN protocol identifier offered during the TLS handshake
+/// for IMAP connections (RFC 7595 registers the `imap` token).
+/// Re-exported so config-driven callers can use it as a serde default
+/// and so wizard/discovery code shares a single source of truth.
+pub fn default_alpn() -> Vec<String> {
+    vec![String::from("imap")]
+}
+
 /// Std-blocking IMAP client wrapping a single boxed stream plus a
 /// per-connection [`Fragmentizer`].
 ///
@@ -857,6 +865,9 @@ impl ImapClientStd {
     ///
     /// - `imap://`  goes through plain TCP (port defaults to 143).
     /// - `imaps://` goes through implicit TLS (port defaults to 993).
+    /// - `tls` carries the rustls/native-tls knobs *and* the ALPN list
+    ///   (see [`default_alpn`] for the IMAP-conformant `["imap"]`).
+    ///   Set `tls.rustls.alpn` to an empty vec to skip ALPN.
     /// - `starttls = true` (only valid on `imap://`) performs the IMAP
     ///   `STARTTLS` upgrade and refreshes capabilities over TLS before
     ///   authenticating.
