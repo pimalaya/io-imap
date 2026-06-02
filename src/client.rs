@@ -757,7 +757,11 @@ impl ImapClientStd {
         mailbox: Mailbox<'static>,
         uid: bool,
     ) -> Result<ImapCopyUid, ImapClientStdError> {
-        self.run(ImapMessageCopy::new(sequence_set, mailbox, uid))
+        self.run(ImapMessageCopy::new(
+            sequence_set,
+            mailbox,
+            ImapMessageCopyOptions { uid },
+        ))
     }
 
     /// Runs [`ImapMessageMove`] (`MOVE` or `UID MOVE`, RFC 6851).
