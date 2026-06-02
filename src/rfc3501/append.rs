@@ -117,6 +117,7 @@ impl ImapCoroutine for ImapMessageAppend {
                     };
 
                     let mut exists = None;
+
                     for data in out.data {
                         if let Data::Exists(seq) = data {
                             exists = Some(seq);

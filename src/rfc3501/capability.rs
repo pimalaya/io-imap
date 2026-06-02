@@ -1,4 +1,13 @@
-//! I/O-free coroutine to get capabilities of an IMAP server.
+//! I/O-free coroutine to fetch the IMAP server capability list (RFC 3501
+//! §6.1.1).
+//!
+//! Resolves the advertised capability from any of: the tagged OK response code,
+//! an untagged `CAPABILITY` data response, or an untagged status response
+//! carrying a `CAPABILITY` code. The first match wins; later matches overwrite
+//! earlier ones, mirroring how IMAP itself treats the most recent advertisement
+//! as authoritative.
+
+use core::fmt;
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -11,45 +20,54 @@ use imap_codec::{
         response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::send::*;
+use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during CAPABILITY progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapCapabilityGetError {
-    #[error("IMAP CAPABILITY NO error: {0}")]
+    #[error("IMAP CAPABILITY failed: NO {0}")]
     No(String),
-    #[error("IMAP CAPABILITY BAD error: {0}")]
+    #[error("IMAP CAPABILITY failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP CAPABILITY BYE error: {0}")]
+    #[error("IMAP CAPABILITY failed: BYE {0}")]
     Bye(String),
 
-    #[error("No CAPABILITY tagged response returned by the IMAP server")]
-    ExpectedTagged,
-    #[error("No CAPABILITY returned by the IMAP server")]
-    ExpectedCapability,
+    #[error("IMAP CAPABILITY failed: server did not return a tagged response")]
+    MissingTagged,
+    #[error("IMAP CAPABILITY failed: server did not advertise any capability")]
+    MissingCapability,
 
-    #[error("Send IMAP CAPABILITY command error")]
+    #[error("IMAP CAPABILITY failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to get capabilities of an IMAP server.
+/// I/O-free IMAP CAPABILITY coroutine.
 pub struct ImapCapabilityGet {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapCapabilityGet {
-    /// Creates a new coroutine.
+    /// Creates a new CAPABILITY coroutine.
     pub fn new() -> Self {
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), CommandBody::Capability).unwrap();
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Capability,
+        };
 
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
+    }
+}
+
+impl Default for ImapCapabilityGet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -62,77 +80,223 @@ impl ImapCoroutine for ImapCapabilityGet {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (bye, tagged, data, untagged) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-            }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok {
-                bye,
-                tagged,
-                data,
-                untagged,
-                ..
-            } => (bye, tagged, data, untagged),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
-        };
+        loop {
+            trace!("capability: {}", self.state);
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::Bye(
-                bye.text.to_string(),
-            )));
-        }
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::ExpectedTagged));
-        };
+                    if let Some(bye) = out.bye {
+                        let err = ImapCapabilityGetError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
-        let code = match body.kind {
-            StatusKind::Ok => body.code,
-            StatusKind::No => {
-                return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::No(
-                    body.text.to_string(),
-                )));
-            }
-            StatusKind::Bad => {
-                return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::Bad(
-                    body.text.to_string(),
-                )));
-            }
-        };
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapCapabilityGetError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
 
-        let mut new_capability = None;
+                    let code = match body.kind {
+                        StatusKind::Ok => body.code,
+                        StatusKind::No => {
+                            let err = ImapCapabilityGetError::No(body.text.to_string());
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapCapabilityGetError::Bad(body.text.to_string());
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+                    };
 
-        if let Some(Code::Capability(capability)) = code {
-            new_capability.replace(capability);
-        }
+                    let mut new_capability = None;
 
-        for data in data {
-            if let Data::Capability(capability) = data {
-                new_capability.replace(capability);
-            }
-        }
+                    if let Some(Code::Capability(capability)) = code {
+                        new_capability.replace(capability);
+                    }
 
-        for StatusBody { code, .. } in untagged {
-            if let Some(Code::Capability(capability)) = code {
-                new_capability.replace(capability);
+                    for data in out.data {
+                        if let Data::Capability(capability) = data {
+                            new_capability.replace(capability);
+                        }
+                    }
+
+                    for StatusBody { code, .. } in out.untagged {
+                        if let Some(Code::Capability(capability)) = code {
+                            new_capability.replace(capability);
+                        }
+                    }
+
+                    let Some(capability) = new_capability else {
+                        let err = ImapCapabilityGetError::MissingCapability;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    return ImapCoroutineState::Complete(Ok(capability.into_iter().collect()));
+                }
             }
         }
-
-        let Some(capability) = new_capability else {
-            return ImapCoroutineState::Complete(Err(ImapCapabilityGetError::ExpectedCapability));
-        };
-
-        ImapCoroutineState::Complete(Ok(capability.into_iter().collect()))
     }
 }
 
-impl Default for ImapCapabilityGet {
-    fn default() -> Self {
-        Self::new()
+enum State {
+    /// Send CAPABILITY and await the tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send capability"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::borrow::ToOwned;
+
+    use super::*;
+
+    /// Happy path: server returns an untagged CAPABILITY data
+    /// response followed by tagged OK.
+    #[test]
+    fn data_capability_returns_capabilities() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.trim_end().ends_with("CAPABILITY"));
+
+        expect_wants_read(&mut cap, &mut frag);
+
+        let reply =
+            format!("* CAPABILITY IMAP4REV1 STARTTLS IDLE\r\n{tag} OK CAPABILITY completed\r\n");
+        let caps = expect_complete_ok(&mut cap, &mut frag, reply.as_bytes());
+        assert_eq!(3, caps.len());
+        assert!(caps.contains(&Capability::Imap4Rev1));
+        assert!(caps.contains(&Capability::StartTls));
+        assert!(caps.contains(&Capability::Idle));
+    }
+
+    /// Capability advertised inside the tagged OK response code:
+    /// surface it just as if it had come on the untagged line.
+    #[test]
+    fn tagged_code_capability_returns_capabilities() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut cap, &mut frag);
+
+        let reply = format!("{tag} OK [CAPABILITY IMAP4REV1 IDLE] done\r\n");
+        let caps = expect_complete_ok(&mut cap, &mut frag, reply.as_bytes());
+        assert_eq!(2, caps.len());
+    }
+
+    /// Tagged OK without any CAPABILITY advertisement: surface
+    /// MissingCapability.
+    #[test]
+    fn no_capability_returns_missing_error() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut cap, &mut frag);
+
+        let reply = format!("{tag} OK CAPABILITY completed\r\n");
+        let err = expect_complete_err(&mut cap, &mut frag, reply.as_bytes());
+        assert!(matches!(err, ImapCapabilityGetError::MissingCapability));
+    }
+
+    /// Tagged NO: surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut cap, &mut frag);
+
+        let reply = format!("{tag} NO server is sulking\r\n");
+        let err = expect_complete_err(&mut cap, &mut frag, reply.as_bytes());
+        let ImapCapabilityGetError::No(text) = err else {
+            panic!("expected ImapCapabilityGetError::No, got {err:?}");
+        };
+        assert_eq!(text, "server is sulking");
+    }
+
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_read(&mut cap, &mut frag);
+
+        let err = expect_complete_err(&mut cap, &mut frag, b"* BYE going down\r\n");
+        let ImapCapabilityGetError::Bye(text) = err else {
+            panic!("expected ImapCapabilityGetError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "going down");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapCapabilityGet,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapCapabilityGet, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapCapabilityGet,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> Vec<Capability<'static>> {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapCapabilityGet,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapCapabilityGetError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
