@@ -47,6 +47,8 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
+use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
+
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
 pub enum SendImapCommandError {
@@ -269,6 +271,55 @@ impl<T: Encoder> SendImapCommand<T> {
                     }
                 },
             }
+        }
+    }
+}
+
+/// Successful payload returned by [`SendImapCommand`] through the
+/// [`ImapCoroutine`] trait surface; mirrors the fields of
+/// [`SendImapCommandResult::Ok`].
+#[derive(Debug)]
+pub struct SendImapCommandOk<T: Encoder> {
+    pub message: T::Message<'static>,
+    pub data: Vec<Data<'static>>,
+    pub untagged: Vec<StatusBody<'static>>,
+    pub tagged: Option<Tagged<'static>>,
+    pub bye: Option<Bye<'static>>,
+    pub continuation_request: Option<CommandContinuationRequest<'static>>,
+}
+
+impl<T: Encoder> ImapCoroutine for SendImapCommand<T> {
+    type Yield = ImapYield;
+    type Return = Result<SendImapCommandOk<T>, SendImapCommandError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        // NOTE: fully qualified path keeps method resolution on the
+        // inherent `resume`, avoiding recursion into this trait impl.
+        match SendImapCommand::<T>::resume(self, fragmentizer, arg) {
+            SendImapCommandResult::WantsRead => ImapCoroutineState::Yielded(ImapYield::WantsRead),
+            SendImapCommandResult::WantsWrite(bytes) => {
+                ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes))
+            }
+            SendImapCommandResult::Ok {
+                message,
+                data,
+                untagged,
+                tagged,
+                bye,
+                continuation_request,
+            } => ImapCoroutineState::Complete(Ok(SendImapCommandOk {
+                message,
+                data,
+                untagged,
+                tagged,
+                bye,
+                continuation_request,
+            })),
+            SendImapCommandResult::Err(err) => ImapCoroutineState::Complete(Err(err)),
         }
     }
 }

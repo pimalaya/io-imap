@@ -20,8 +20,7 @@ use imap_codec::{
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::{rfc2971::id::*, rfc3501::capability::*, send::*};
+use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
 /// Errors that can occur during the coroutine progression.
 #[derive(Clone, Debug, Error)]
@@ -112,14 +111,14 @@ impl ImapAuthXOAuth2 {
             None
         };
 
-        let xoauth = CommandBody::Authenticate {
-            mechanism: AuthMechanism::XOAuth2,
-            initial_response,
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Authenticate {
+                mechanism: AuthMechanism::XOAuth2,
+                initial_response,
+            },
         };
 
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), xoauth).unwrap();
         let send = SendImapCommand::new(CommandCodec::new(), command);
 
         Self {
@@ -152,32 +151,14 @@ impl ImapCoroutine for ImapAuthXOAuth2 {
         loop {
             match &mut self.state {
                 State::Send(send) => {
-                    let (bye, continuation_request, tagged) =
-                        match send.resume(fragmentizer, arg.take()) {
-                            SendImapCommandResult::WantsRead => {
-                                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-                            }
-                            SendImapCommandResult::WantsWrite(bytes) => {
-                                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-                            }
-                            SendImapCommandResult::Ok {
-                                bye,
-                                continuation_request,
-                                tagged,
-                                ..
-                            } => (bye, continuation_request, tagged),
-                            SendImapCommandResult::Err(err) => {
-                                return ImapCoroutineState::Complete(Err(err.into()));
-                            }
-                        };
+                    let out = imap_try!(send, fragmentizer, arg);
 
-                    if let Some(bye) = bye {
-                        return ImapCoroutineState::Complete(Err(ImapAuthXOAuth2Error::Bye(
-                            bye.text.to_string(),
-                        )));
+                    if let Some(bye) = out.bye {
+                        let err = ImapAuthXOAuth2Error::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    if let Some(cr) = continuation_request {
+                    if let Some(cr) = out.continuation_request {
                         if self.ir {
                             self.error.replace(match cr {
                                 CommandContinuationRequest::Basic(err) => err.text().to_string(),
@@ -199,7 +180,7 @@ impl ImapCoroutine for ImapAuthXOAuth2 {
                         continue;
                     }
 
-                    if let Some(Tagged { body, .. }) = tagged {
+                    if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
                             StatusKind::Ok => ImapAuthXOAuth2Error::UnexpectedOk,
                             StatusKind::No => ImapAuthXOAuth2Error::No(body.text.to_string()),
@@ -210,9 +191,8 @@ impl ImapCoroutine for ImapAuthXOAuth2 {
                     }
 
                     if !self.ir {
-                        return ImapCoroutineState::Complete(Err(
-                            ImapAuthXOAuth2Error::ExpectedContinuationRequest,
-                        ));
+                        let err = ImapAuthXOAuth2Error::ExpectedContinuationRequest;
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
                     unreachable!();

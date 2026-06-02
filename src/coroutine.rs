@@ -84,3 +84,60 @@ pub enum ImapYield {
     /// typically takes `None`.
     WantsWrite(Vec<u8>),
 }
+
+/// Coroutine equivalent of the `?` operator: advances one
+/// [`ImapCoroutine::resume`] step and propagates non-success states
+/// to the enclosing coroutine.
+///
+/// Takes the same arguments as [`ImapCoroutine::resume`]: the inner
+/// coroutine (as a place expression, since the macro takes `&mut` of
+/// it), the borrowed fragmentizer, and the optional `arg` slice.
+///
+/// Behaviour per inner state:
+/// * [`ImapCoroutineState::Yielded`]\(y\): re-yields `y.into()`, so
+///   the driver performs the requested I/O and the outer coroutine is
+///   resumed again with the routed `arg`.
+/// * [`ImapCoroutineState::Complete`]\(Err(e)\): short-circuits with
+///   `Complete(Err(e.into()))`.
+/// * [`ImapCoroutineState::Complete`]\(Ok(v)\): evaluates to `v`.
+///
+/// Must be invoked inside a function returning
+/// `ImapCoroutineState<OuterYield, Result<_, OuterError>>`, with
+/// `From<InnerYield> for OuterYield` and `From<InnerError> for
+/// OuterError` available (the reflexive `From<T> for T` covers the
+/// common case where both sides use [`ImapYield`]).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use io_imap::{
+///     coroutine::*,
+///     imap_try,
+///     send::{SendImapCommand, SendImapCommandOk},
+/// };
+///
+/// fn resume(
+///     &mut self,
+///     fragmentizer: &mut Fragmentizer,
+///     arg: Option<&[u8]>,
+/// ) -> ImapCoroutineState<ImapYield, Result<(), MyError>> {
+///     let SendImapCommandOk { tagged, bye, .. } =
+///         imap_try!(self.send, fragmentizer, arg);
+///     // ...continue with tagged/bye
+///     ImapCoroutineState::Complete(Ok(()))
+/// }
+/// ```
+#[macro_export]
+macro_rules! imap_try {
+    ($coroutine:expr, $frag:expr, $arg:expr $(,)?) => {
+        match $crate::coroutine::ImapCoroutine::resume($coroutine, $frag, $arg) {
+            $crate::coroutine::ImapCoroutineState::Yielded(y) => {
+                return $crate::coroutine::ImapCoroutineState::Yielded(y.into());
+            }
+            $crate::coroutine::ImapCoroutineState::Complete(Err(err)) => {
+                return $crate::coroutine::ImapCoroutineState::Complete(Err(err.into()));
+            }
+            $crate::coroutine::ImapCoroutineState::Complete(Ok(value)) => value,
+        }
+    };
+}

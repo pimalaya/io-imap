@@ -33,8 +33,8 @@ use core::{
     feature = "rustls-ring",
     feature = "native-tls"
 ))]
-use alloc::string::{String, ToString};
-use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::string::ToString;
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 
 use std::{
     io::{self, Read, Write},
