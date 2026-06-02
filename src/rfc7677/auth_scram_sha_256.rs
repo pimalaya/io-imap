@@ -11,7 +11,7 @@
 //!
 //! Both flows converge on the client-final/server-final exchange.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     string::{String, ToString},
@@ -45,42 +45,48 @@ type HmacSha256 = Hmac<Sha256>;
 /// Errors that can occur during SCRAM-SHA-256 progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthScramSha256Error {
-    #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP AUTHENTICATE tagged response returned by the server")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
+    #[error(
+        "IMAP AUTHENTICATE SCRAM-SHA-256 failed: server did not send the expected continuation request"
+    )]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256 error: expected continuation request got OK")]
+    #[error(
+        "IMAP AUTHENTICATE SCRAM-SHA-256 failed: server returned OK before the mechanism could complete"
+    )]
     UnexpectedOk,
 
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: invalid server message encoding")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid server message encoding")]
     InvalidEncoding,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server-first-message missing nonce")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing nonce")]
     MissingNonce,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server-first-message missing salt")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing salt")]
     MissingSalt,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server-first-message missing iteration count")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing iteration count")]
     MissingIterations,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: invalid base64 in server message")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid base64 in server message")]
     InvalidBase64,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: invalid iteration count")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid iteration count")]
     InvalidIterationCount,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server nonce does not start with client nonce")]
+    #[error(
+        "IMAP AUTHENTICATE SCRAM-SHA-256 failed: server nonce does not start with client nonce"
+    )]
     NonceMismatch,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server signature verification failed")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server signature verification failed")]
     ServerSignatureMismatch,
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: server error: {0}")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server error: {0}")]
     ServerError(String),
-    #[error("Parse IMAP AUTHENTICATE SCRAM-SHA-256: invalid server-final-message")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid server-final-message")]
     InvalidServerFinal,
 
-    #[error("Send IMAP AUTHENTICATE command error")]
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -280,6 +286,7 @@ impl ImapCoroutine for ImapAuthScramSha256 {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("auth SCRAM-SHA-256: {}", self.state);
             match &mut self.state {
                 State::Send {
                     send,
@@ -497,6 +504,20 @@ enum State {
     Acknowledge(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { .. } => f.write_str("send auth"),
+            Self::SendIr(_) => f.write_str("send auth with ir"),
+            Self::SendClientFirst(_) => f.write_str("send client-first"),
+            Self::SendClientFinal(_) => f.write_str("send client-final"),
+            Self::Acknowledge(_) => f.write_str("acknowledge server-final"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 fn escape_username(username: &str) -> String {

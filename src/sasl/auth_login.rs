@@ -9,7 +9,7 @@
 //! * SASL-IR (RFC 4959, `initial_request: true`): the username is embedded
 //!   inline as the initial response so only the password round-trip remains.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     string::{String, ToString},
@@ -35,23 +35,27 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Errors that can occur during LOGIN progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthLoginError {
-    #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP AUTHENTICATE tagged response returned by the server")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
+    #[error(
+        "IMAP AUTHENTICATE LOGIN failed: server did not send the expected continuation request"
+    )]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE LOGIN error: unexpected continuation request")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: server sent an unexpected continuation request")]
     UnexpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE LOGIN error: expected continuation request got OK")]
+    #[error(
+        "IMAP AUTHENTICATE LOGIN failed: server returned OK before the mechanism could complete"
+    )]
     UnexpectedOk,
 
-    #[error("Send IMAP AUTHENTICATE command error")]
+    #[error("IMAP AUTHENTICATE LOGIN failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -181,6 +185,7 @@ impl ImapCoroutine for ImapAuthLogin {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("auth LOGIN: {}", self.state);
             match &mut self.state {
                 State::Send { send, user } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -337,6 +342,19 @@ enum State {
     ContinuePassword(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { .. } => f.write_str("send auth"),
+            Self::SendIr(_) => f.write_str("send auth with ir"),
+            Self::ContinueUsername(_) => f.write_str("send username"),
+            Self::ContinuePassword(_) => f.write_str("send password"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 #[cfg(test)]

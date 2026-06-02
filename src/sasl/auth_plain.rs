@@ -8,7 +8,7 @@
 //!   as the initial response so the auth completes in a single round-trip on
 //!   success.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     borrow::Cow,
@@ -35,23 +35,27 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Errors that can occur during PLAIN progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthPlainError {
-    #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP AUTHENTICATE tagged response returned by the server")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
+    #[error(
+        "IMAP AUTHENTICATE PLAIN failed: server did not send the expected continuation request"
+    )]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE PLAIN error: unexpected continuation request")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: server sent an unexpected continuation request")]
     UnexpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE PLAIN error: expected continuation request got OK")]
+    #[error(
+        "IMAP AUTHENTICATE PLAIN failed: server returned OK before the mechanism could complete"
+    )]
     UnexpectedOk,
 
-    #[error("Send IMAP AUTHENTICATE command error")]
+    #[error("IMAP AUTHENTICATE PLAIN failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -182,6 +186,7 @@ impl ImapCoroutine for ImapAuthPlain {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("auth PLAIN: {}", self.state);
             match &mut self.state {
                 State::Send { send, payload } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -328,6 +333,18 @@ enum State {
     Continue(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { .. } => f.write_str("send auth"),
+            Self::SendIr(_) => f.write_str("send auth with ir"),
+            Self::Continue(_) => f.write_str("send credentials"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 #[cfg(test)]

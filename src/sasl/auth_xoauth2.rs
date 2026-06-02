@@ -14,7 +14,7 @@
 //! server then sends the final tagged NO. See
 //! <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     borrow::Cow,
@@ -43,25 +43,29 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Errors that can occur during XOAUTH2 progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthXoauth2Error {
-    #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE NO error: {info} ({err})")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: NO {info} ({err})")]
     NoWithError { info: String, err: String },
-    #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP AUTHENTICATE tagged response returned by the server")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
+    #[error(
+        "IMAP AUTHENTICATE XOAUTH2 failed: server did not send the expected continuation request"
+    )]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE XOAUTH2 error: expected NO got {kind:?}: {info}")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: expected NO got {kind:?} ({info})")]
     UnexpectedStatus { kind: StatusKind, info: String },
-    #[error("Parse IMAP AUTHENTICATE XOAUTH2 error: expected continuation request got OK")]
+    #[error(
+        "IMAP AUTHENTICATE XOAUTH2 failed: server returned OK before the mechanism could complete"
+    )]
     UnexpectedOk,
 
-    #[error("Send IMAP AUTHENTICATE command error")]
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -193,6 +197,7 @@ impl ImapCoroutine for ImapAuthXoauth2 {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("auth XOAUTH2: {}", self.state);
             match &mut self.state {
                 State::Send { send, payload } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -374,6 +379,19 @@ enum State {
     AcknowledgeError(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { .. } => f.write_str("send auth"),
+            Self::SendIr(_) => f.write_str("send auth with ir"),
+            Self::Continue(_) => f.write_str("send credentials"),
+            Self::AcknowledgeError(_) => f.write_str("acknowledge error"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 #[cfg(test)]

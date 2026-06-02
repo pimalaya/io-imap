@@ -5,7 +5,7 @@
 //! TLS-protected. There is no SASL challenge and no initial-response
 //! flow.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     string::{String, ToString},
@@ -31,17 +31,17 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Errors that can occur during LOGIN progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapLoginError {
-    #[error("Parse IMAP LOGIN NO error: {0}")]
+    #[error("IMAP LOGIN failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP LOGIN BAD error: {0}")]
+    #[error("IMAP LOGIN failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP LOGIN BYE error: {0}")]
+    #[error("IMAP LOGIN failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP LOGIN tagged response returned by the server")]
+    #[error("IMAP LOGIN failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP LOGIN command error")]
+    #[error("IMAP LOGIN failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -111,6 +111,7 @@ impl ImapCoroutine for ImapLogin {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("login: {}", self.state);
             match &mut self.state {
                 State::Send(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -191,6 +192,16 @@ enum State {
     Send(SendImapCommand<CommandCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send login"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 #[cfg(test)]

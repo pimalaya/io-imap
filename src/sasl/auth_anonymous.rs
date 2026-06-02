@@ -9,7 +9,7 @@
 //!   is embedded inline as the initial response so the auth completes
 //!   in a single round-trip on success.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{
     borrow::Cow,
@@ -36,23 +36,27 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Errors that can occur during ANONYMOUS progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthAnonymousError {
-    #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: NO {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: BAD {0}")]
     Bad(String),
-    #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP AUTHENTICATE tagged response returned by the server")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
+    #[error(
+        "IMAP AUTHENTICATE ANONYMOUS failed: server did not send the expected continuation request"
+    )]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE ANONYMOUS error: unexpected continuation request")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: server sent an unexpected continuation request")]
     UnexpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE ANONYMOUS error: expected continuation request got OK")]
+    #[error(
+        "IMAP AUTHENTICATE ANONYMOUS failed: server returned OK before the mechanism could complete"
+    )]
     UnexpectedOk,
 
-    #[error("Send IMAP AUTHENTICATE command error")]
+    #[error("IMAP AUTHENTICATE ANONYMOUS failed: {0}")]
     Send(#[from] SendImapCommandError),
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
@@ -173,6 +177,7 @@ impl ImapCoroutine for ImapAuthAnonymous {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("auth ANONYMOUS: {}", self.state);
             match &mut self.state {
                 State::Send { send, payload } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -319,6 +324,18 @@ enum State {
     Continue(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { .. } => f.write_str("send auth"),
+            Self::SendIr(_) => f.write_str("send auth with ir"),
+            Self::Continue(_) => f.write_str("send trace"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+            Self::Id(_) => f.write_str("send id"),
+        }
+    }
 }
 
 #[cfg(test)]
