@@ -35,6 +35,12 @@ use core::{
 ))]
 use alloc::string::ToString;
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+use secrecy::ExposeSecret;
 
 use std::{
     io::{self, Read, Write},
@@ -106,8 +112,8 @@ use crate::{
     rfc5161::enable::*,
     rfc5256::{sort::*, thread::*},
     rfc6851::r#move::*,
-    rfc7628::{auth_oauthbearer::*, auth_xoauth2::*},
-    sasl::{auth_anonymous::*, auth_login::*, auth_plain::*},
+    rfc7628::auth_oauthbearer::*,
+    sasl::{auth_anonymous::*, auth_login::*, auth_plain::*, auth_xoauth2::*},
     watch::*,
 };
 
@@ -127,7 +133,7 @@ pub enum ImapClientStdError {
     #[error(transparent)]
     AuthOAuthBearer(#[from] ImapAuthOAuthBearerError),
     #[error(transparent)]
-    AuthXOAuth2(#[from] ImapAuthXOAuth2Error),
+    AuthXOAuth2(#[from] ImapAuthXoauth2Error),
     #[cfg(feature = "scram")]
     #[error(transparent)]
     AuthScramSha256(#[from] ImapAuthScramSha256Error),
@@ -439,19 +445,21 @@ impl ImapClientStd {
         self.run(ImapAuthOAuthBearer::new(params, true, auto_id))
     }
 
-    /// Runs [`ImapAuthXOAuth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
-    /// pre-standard OAuth 2.0 mechanism) with `ensure_capabilities=true`.
-    /// The `token` is an OAuth 2.0 bearer access token: the connection
-    /// must be TLS-protected. Prefer [`auth_oauthbearer`] on servers that
-    /// support both. Honours [`Self::auto_id`].
+    /// Runs [`ImapAuthXoauth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
+    /// pre-standard OAuth 2.0 mechanism). `opts.initial_request`
+    /// selects between the non-IR and SASL-IR (RFC 4959) flows. The
+    /// `token` is an OAuth 2.0 bearer access token: the connection
+    /// must be TLS-protected. Prefer [`auth_oauthbearer`] on servers
+    /// that support both. Honours [`Self::auto_id`].
     ///
     /// [`auth_oauthbearer`]: ImapClientStd::auth_oauthbearer
     pub fn auth_xoauth2(
         &mut self,
-        params: ImapAuthXOAuth2Params,
+        user: impl AsRef<str>,
+        token: impl AsRef<str>,
+        opts: ImapAuthXoauth2Options,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthXOAuth2::new(params, true, auto_id))
+        self.run(ImapAuthXoauth2::new(user, token, opts))
     }
 
     /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
@@ -977,8 +985,13 @@ impl ImapClientStd {
                     client.auth_oauthbearer(params)?
                 }
                 Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
-                    let params = ImapAuthXOAuth2Params::new(username, token, ir);
-                    client.auth_xoauth2(params)?
+                    let opts = ImapAuthXoauth2Options {
+                        initial_request: ir,
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.auth_xoauth2(username, token.expose_secret(), opts)?
                 }
                 #[cfg(feature = "scram")]
                 Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
