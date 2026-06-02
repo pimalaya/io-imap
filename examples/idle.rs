@@ -12,7 +12,6 @@ use io_imap::{
     rfc3501::{greeting::*, login::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
-use secrecy::SecretString;
 
 fn main() {
     env_logger::init();
@@ -51,8 +50,11 @@ fn main() {
         }
     }
 
-    let params = ImapLoginParams::new(user, SecretString::from(pass)).unwrap();
-    let mut coroutine = ImapLogin::new(params, true, None);
+    let opts = ImapLoginOptions {
+        ensure_capabilities: true,
+        auto_id: None,
+    };
+    let mut coroutine = ImapLogin::new(user, pass, opts).unwrap();
     let mut arg: Option<&[u8]> = None;
 
     loop {

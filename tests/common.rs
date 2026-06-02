@@ -17,7 +17,6 @@ use io_imap::{
     rfc3501::{greeting::*, login::*, logout::*, select::*},
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
-use secrecy::SecretString;
 
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
@@ -67,8 +66,11 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     // ── LOGIN ─────────────────────────────────────────────────────────────────
 
-    let params = ImapLoginParams::new(username, SecretString::from(password.to_owned())).unwrap();
-    let mut coroutine = ImapLogin::new(params, true, None);
+    let opts = ImapLoginOptions {
+        ensure_capabilities: true,
+        auto_id: None,
+    };
+    let mut coroutine = ImapLogin::new(username, password, opts).expect("valid credentials");
     let mut arg: Option<&[u8]> = None;
 
     loop {

@@ -7,7 +7,6 @@ use io_imap::{
     codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::greeting::*, sasl::auth_plain::*,
 };
 use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
-use secrecy::SecretString;
 
 fn main() {
     env_logger::init();
@@ -49,8 +48,12 @@ fn main() {
 
     println!("capability pre plain: {capability:#?}");
 
-    let params = ImapAuthPlainParams::new(None::<&str>, user, SecretString::from(pass), false);
-    let mut coroutine = ImapAuthPlain::new(params, true, None);
+    let opts = ImapAuthPlainOptions {
+        initial_request: false,
+        ensure_capabilities: true,
+        auto_id: None,
+    };
+    let mut coroutine = ImapAuthPlain::new(None::<&str>, user, pass, opts);
     let mut arg: Option<&[u8]> = None;
 
     let capability = loop {

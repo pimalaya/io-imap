@@ -1,7 +1,17 @@
 [sources]
-allow-git = ["https://github.com/pimalaya/stream"]
+allow-git = [
+  "https://github.com/pimalaya/stream",
+  "https://github.com/soywod/imap-codec",
+]
 unknown-git = "deny"
 unknown-registry = "deny"
 
 [licenses]
-allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
