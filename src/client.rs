@@ -176,6 +176,8 @@ pub enum ImapClientStdError {
     #[error(transparent)]
     MailboxSelect(#[from] ImapMailboxSelectError),
     #[error(transparent)]
+    MailboxExamine(#[from] ImapMailboxExamineError),
+    #[error(transparent)]
     MailboxWatch(#[from] ImapMailboxWatchError),
     #[error(transparent)]
     MailboxClose(#[from] ImapMailboxCloseError),
@@ -585,7 +587,10 @@ impl ImapClientStd {
 
     /// Runs [`ImapMailboxExamine`] (`EXAMINE <mailbox>`).
     pub fn examine(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        self.run(ImapMailboxExamine::new(mailbox))
+        self.run(ImapMailboxExamine::new(
+            mailbox,
+            ImapMailboxExamineOptions::default(),
+        ))
     }
 
     /// Runs `SELECT <mailbox> (QRESYNC (<uidvalidity> <highestmodseq>))`
