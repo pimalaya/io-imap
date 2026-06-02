@@ -507,7 +507,7 @@ impl ImapClientStd {
         &mut self,
         parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<Option<Vec<(IString<'static>, NString<'static>)>>, ImapClientStdError> {
-        self.run(ImapServerId::new(parameters))
+        self.run(ImapServerId::new(ImapServerIdOptions { parameters }))
     }
 
     /// Runs [`ImapExtensionEnable`] (`ENABLE`, RFC 5161).

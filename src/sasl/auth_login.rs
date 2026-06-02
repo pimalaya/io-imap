@@ -164,7 +164,9 @@ impl ImapAuthLogin {
     fn wants_id(&mut self) -> Option<State> {
         let params = self.opts.auto_id.take()?;
         let wire = (!params.is_empty()).then_some(params);
-        Some(State::Id(ImapServerId::new(wire)))
+        Some(State::Id(ImapServerId::new(ImapServerIdOptions {
+            parameters: wire,
+        })))
     }
 
     fn next_continue_password(&mut self) -> State {
