@@ -103,30 +103,26 @@ impl ImapAuthXoauth2 {
     ) -> Self {
         let user = user.as_ref();
         let token = token.as_ref();
-        let payload = format!("user={user}\x01auth=Bearer {token}\x01\x01").into_bytes();
+        let payload = format!("user={user}\x01auth=Bearer {token}\x01\x01");
+        let payload = Cow::from(payload.into_bytes());
         let tag = TagGenerator::new().generate();
 
         let state = if opts.initial_request {
-            let command = Command {
-                tag,
-                body: CommandBody::Authenticate {
-                    mechanism: AuthMechanism::XOAuth2,
-                    initial_response: Some(Secret::new(payload.into())),
-                },
+            let body = CommandBody::Authenticate {
+                mechanism: AuthMechanism::XOAuth2,
+                initial_response: Some(Secret::new(payload)),
             };
-            State::SendIr(SendImapCommand::new(CommandCodec::new(), command))
+            State::SendIr(SendImapCommand::new(
+                CommandCodec::new(),
+                Command { tag, body },
+            ))
         } else {
-            let command = Command {
-                tag,
-                body: CommandBody::Authenticate {
-                    mechanism: AuthMechanism::XOAuth2,
-                    initial_response: None,
-                },
+            let body = CommandBody::Authenticate {
+                mechanism: AuthMechanism::XOAuth2,
+                initial_response: None,
             };
-            State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), command),
-                payload: payload.into(),
-            }
+            let send = SendImapCommand::new(CommandCodec::new(), Command { tag, body });
+            State::Send { send, payload }
         };
 
         Self {

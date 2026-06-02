@@ -1,18 +1,13 @@
 //! I/O-free coroutine to authenticate an IMAP account via SASL
-//! OAUTHBEARER (RFC 7628). Both flows are supported:
+//! ANONYMOUS (RFC 4505). Both flows are supported:
 //!
-//! * non-IR ([`ImapAuthOauthbearer::new`] with `initial_request:
-//!   false`): bare `AUTHENTICATE OAUTHBEARER`, then credentials
-//!   uploaded as continuation data after the server's empty SASL
-//!   challenge.
-//! * SASL-IR (RFC 4959, `initial_request: true`): credentials
-//!   embedded inline as the initial response so the auth completes in
-//!   a single round-trip on success.
-//!
-//! On authentication failure the server returns a continuation
-//! carrying a JSON error; the client acknowledges it with a single
-//! `\x01` byte (RFC 7628 §3.2.3) and the server then sends the final
-//! tagged NO.
+//! * non-IR ([`ImapAuthAnonymous::new`] with `initial_request:
+//!   false`): bare `AUTHENTICATE ANONYMOUS`, then the optional trace
+//!   message is uploaded as continuation data after the server's
+//!   empty SASL challenge.
+//! * SASL-IR (RFC 4959, `initial_request: true`): the trace message
+//!   is embedded inline as the initial response so the auth completes
+//!   in a single round-trip on success.
 
 use core::mem;
 
@@ -29,9 +24,7 @@ use imap_codec::{
         auth::{AuthMechanism, AuthenticateData},
         command::{Command, CommandBody},
         core::{IString, NString, TagGenerator},
-        response::{
-            Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
-        },
+        response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
         secret::Secret,
     },
 };
@@ -39,13 +32,11 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during OAUTHBEARER progression.
+/// Errors that can occur during ANONYMOUS progression.
 #[derive(Clone, Debug, Error)]
-pub enum ImapAuthOauthbearerError {
+pub enum ImapAuthAnonymousError {
     #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
     No(String),
-    #[error("Parse IMAP AUTHENTICATE NO error: {info} ({err})")]
-    NoWithError { info: String, err: String },
     #[error("Parse IMAP AUTHENTICATE BAD error: {0}")]
     Bad(String),
     #[error("Parse IMAP AUTHENTICATE BYE error: {0}")]
@@ -55,9 +46,9 @@ pub enum ImapAuthOauthbearerError {
     MissingTagged,
     #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE OAUTHBEARER error: expected NO got {kind:?}: {info}")]
-    UnexpectedStatus { kind: StatusKind, info: String },
-    #[error("Parse IMAP AUTHENTICATE OAUTHBEARER error: expected continuation request got OK")]
+    #[error("Parse IMAP AUTHENTICATE ANONYMOUS error: unexpected continuation request")]
+    UnexpectedContinuationRequest,
+    #[error("Parse IMAP AUTHENTICATE ANONYMOUS error: expected continuation request got OK")]
     UnexpectedOk,
 
     #[error("Send IMAP AUTHENTICATE command error")]
@@ -68,78 +59,64 @@ pub enum ImapAuthOauthbearerError {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the OAUTHBEARER sub-flow and any post-authentication
+/// Selects the ANONYMOUS sub-flow and any post-authentication
 /// round-trips.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImapAuthOauthbearerOptions {
-    /// When `true`, embed credentials inline as the SASL initial
-    /// response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the credentials are uploaded
-    /// as continuation data after the server's empty challenge; the
+pub struct ImapAuthAnonymousOptions {
+    /// When `true`, embed the trace message inline as the SASL
+    /// initial response (RFC 4959); the coroutine starts in
+    /// [`State::SendIr`]. When `false`, the message is uploaded as
+    /// continuation data after the server's empty challenge; the
     /// coroutine starts in [`State::Send`].
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL OAUTHBEARER coroutine. The initial [`State`] variant
+/// I/O-free SASL ANONYMOUS coroutine. The initial [`State`] variant
 /// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
 /// and SASL-IR flows.
-pub struct ImapAuthOauthbearer {
+pub struct ImapAuthAnonymous {
     state: State,
-    error: Option<String>,
     observed: Vec<Capability<'static>>,
-    opts: ImapAuthOauthbearerOptions,
+    opts: ImapAuthAnonymousOptions,
 }
 
-impl ImapAuthOauthbearer {
-    /// Creates a new OAUTHBEARER coroutine. `opts.initial_request` selects
-    /// between the non-IR flow ([`State::Send`]) and the SASL-IR flow
-    /// ([`State::SendIr`]).
-    pub fn new(
-        user: impl AsRef<str>,
-        host: impl AsRef<str>,
-        port: u16,
-        token: impl AsRef<str>,
-        opts: ImapAuthOauthbearerOptions,
-    ) -> Self {
-        let u = user.as_ref();
-        let h = host.as_ref();
-        let t = token.as_ref();
-
-        let payload = format!("n,a={u},\x01host={h}\x01port={port}\x01auth=Bearer {t}\x01\x01");
-        let payload = payload.into_bytes().into();
+impl ImapAuthAnonymous {
+    /// Creates a new ANONYMOUS coroutine. `opts.initial_request`
+    /// selects between the non-IR flow ([`State::Send`]) and the
+    /// SASL-IR flow ([`State::SendIr`]). `message` is the optional
+    /// trace identifier (RFC 4505 §2); pass `None` to omit it.
+    pub fn new(message: Option<impl AsRef<str>>, opts: ImapAuthAnonymousOptions) -> Self {
+        let payload = message
+            .map(|m| m.as_ref().as_bytes().to_vec())
+            .unwrap_or_default();
+        let tag = TagGenerator::new().generate();
 
         let state = if opts.initial_request {
             let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::OAuthBearer,
-                initial_response: Some(Secret::new(payload)),
+                // SAFETY: ANONYMOUS is a valid mechanism name.
+                mechanism: AuthMechanism::try_from("ANONYMOUS").unwrap(),
+                initial_response: Some(Secret::new(payload.into())),
             };
             State::SendIr(SendImapCommand::new(
                 CommandCodec::new(),
-                Command {
-                    tag: TagGenerator::new().generate(),
-                    body,
-                },
+                Command { tag, body },
             ))
         } else {
             let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::OAuthBearer,
+                // SAFETY: ANONYMOUS is a valid mechanism name.
+                mechanism: AuthMechanism::try_from("ANONYMOUS").unwrap(),
                 initial_response: None,
             };
-            let send = SendImapCommand::new(
-                CommandCodec::new(),
-                Command {
-                    tag: TagGenerator::new().generate(),
-                    body,
-                },
-            );
-            State::Send { payload, send }
+            State::Send {
+                send: SendImapCommand::new(CommandCodec::new(), Command { tag, body }),
+                payload: payload.into(),
+            }
         };
 
         Self {
             state,
-            error: None,
             observed: Vec::new(),
             opts,
         }
@@ -182,20 +159,11 @@ impl ImapAuthOauthbearer {
         let wire = (!params.is_empty()).then_some(params);
         Some(State::Id(ImapServerId::new(wire)))
     }
-
-    fn extract_json_error(cr: &CommandContinuationRequest<'_>) -> String {
-        let err = match cr {
-            CommandContinuationRequest::Basic(err) => err.text().to_string().into(),
-            CommandContinuationRequest::Base64(err) => String::from_utf8_lossy(err),
-        };
-
-        err.to_string()
-    }
 }
 
-impl ImapCoroutine for ImapAuthOauthbearer {
+impl ImapCoroutine for ImapAuthAnonymous {
     type Yield = ImapYield;
-    type Return = Result<Vec<Capability<'static>>, ImapAuthOauthbearerError>;
+    type Return = Result<Vec<Capability<'static>>, ImapAuthAnonymousError>;
 
     fn resume(
         &mut self,
@@ -208,7 +176,7 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
+                        let err = ImapAuthAnonymousError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
@@ -222,46 +190,43 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
-                            StatusKind::Ok => ImapAuthOauthbearerError::UnexpectedOk,
-                            StatusKind::No => ImapAuthOauthbearerError::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthOauthbearerError::Bad(body.text.to_string()),
+                            StatusKind::Ok => ImapAuthAnonymousError::UnexpectedOk,
+                            StatusKind::No => ImapAuthAnonymousError::No(body.text.to_string()),
+                            StatusKind::Bad => ImapAuthAnonymousError::Bad(body.text.to_string()),
                         };
 
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    let err = ImapAuthOauthbearerError::ExpectedContinuationRequest;
+                    let err = ImapAuthAnonymousError::ExpectedContinuationRequest;
                     return ImapCoroutineState::Complete(Err(err));
                 }
                 State::SendIr(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
+                        let err = ImapAuthAnonymousError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    if let Some(cr) = out.continuation_request {
-                        self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![0x01]);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
-                        continue;
+                    if out.continuation_request.is_some() {
+                        let err = ImapAuthAnonymousError::UnexpectedContinuationRequest;
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthOauthbearerError::MissingTagged;
+                        let err = ImapAuthAnonymousError::MissingTagged;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthOauthbearerError::No(body.text.to_string());
+                            let err = ImapAuthAnonymousError::No(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
+                            let err = ImapAuthAnonymousError::Bad(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -283,31 +248,28 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
+                        let err = ImapAuthAnonymousError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    if let Some(cr) = out.continuation_request {
-                        self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![0x01]);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
-                        continue;
+                    if out.continuation_request.is_some() {
+                        let err = ImapAuthAnonymousError::UnexpectedContinuationRequest;
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthOauthbearerError::MissingTagged;
+                        let err = ImapAuthAnonymousError::MissingTagged;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthOauthbearerError::No(body.text.to_string());
+                            let err = ImapAuthAnonymousError::No(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
+                            let err = ImapAuthAnonymousError::Bad(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -324,34 +286,6 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
-                }
-                State::AcknowledgeError(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthOauthbearerError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let info = body.text.to_string();
-
-                    let StatusKind::No = body.kind else {
-                        let kind = body.kind;
-                        let err = ImapAuthOauthbearerError::UnexpectedStatus { kind, info };
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let err = match self.error.take() {
-                        Some(err) => ImapAuthOauthbearerError::NoWithError { info, err },
-                        None => ImapAuthOauthbearerError::No(info),
-                    };
-
-                    return ImapCoroutineState::Complete(Err(err));
                 }
                 State::Capability(capability) => {
                     self.observed = imap_try!(capability, fragmentizer, arg);
@@ -381,7 +315,6 @@ enum State {
     },
     SendIr(SendImapCommand<CommandCodec>),
     Continue(SendImapCommand<AuthenticateDataCodec>),
-    AcknowledgeError(SendImapCommand<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -392,28 +325,22 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: credentials sent inline, server accepts on the first
-    /// round-trip with tagged OK.
+    /// SASL-IR happy path: trace message embedded inline, server accepts on the
+    /// first round-trip with tagged OK.
     #[test]
     fn ir_success_returns_ok() {
-        let opts = ImapAuthOauthbearerOptions {
+        let opts = ImapAuthAnonymousOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthOauthbearer::new(
-            "user@example.org",
-            "imap.example.org",
-            993,
-            "oauth-token",
-            opts,
-        );
+        let mut auth = ImapAuthAnonymous::new(Some("trace@example.org"), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
-        assert!(line.contains("AUTHENTICATE OAUTHBEARER "));
+        assert!(line.contains("AUTHENTICATE ANONYMOUS "));
 
         expect_wants_read(&mut auth, &mut frag);
 
@@ -421,23 +348,15 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server rejects the inline credentials in the very
-    /// first continuation. Per RFC 7628 §3.2.3 the client acknowledges with a
-    /// single `\x01` byte (base64 `AQ==`) before reading the tagged NO.
+    /// SASL-IR error path: server rejects ANONYMOUS with tagged NO.
     #[test]
-    fn ir_invalid_token_returns_no_with_error() {
-        let opts = ImapAuthOauthbearerOptions {
+    fn ir_rejected_returns_no_error() {
+        let opts = ImapAuthAnonymousOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthOauthbearer::new(
-            "user@example.org",
-            "imap.example.org",
-            993,
-            "expired-token",
-            opts,
-        );
+        let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -445,37 +364,23 @@ mod tests {
 
         expect_wants_read(&mut auth, &mut frag);
 
-        let (err_json_b64, err_json) = fake_json_error();
-        let challenge = format!("+ {err_json_b64}\r\n");
-        let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
-        assert_eq!(b"AQ==\r\n", &*ack);
-
-        expect_wants_read(&mut auth, &mut frag);
-
-        let reply = format!("{tag} NO SASL authentication failed\r\n");
+        let reply = format!("{tag} NO anonymous access disabled\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthOauthbearerError::NoWithError { info, err } = err else {
-            panic!("expected ImapAuthOauthbearerError::NoWithError, got {err:?}");
+        let ImapAuthAnonymousError::No(text) = err else {
+            panic!("expected ImapAuthAnonymousError::No, got {err:?}");
         };
-        assert_eq!(info, "SASL authentication failed");
-        assert_eq!(err, err_json);
+        assert_eq!(text, "anonymous access disabled");
     }
 
     /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
-        let opts = ImapAuthOauthbearerOptions {
+        let opts = ImapAuthAnonymousOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthOauthbearer::new(
-            "user@example.org",
-            "imap.example.org",
-            993,
-            "oauth-token",
-            opts,
-        );
+        let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -485,36 +390,30 @@ mod tests {
 
         let reply = format!("{tag} BAD AUTHENTICATE not enabled\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthOauthbearerError::Bad(text) = err else {
-            panic!("expected ImapAuthOauthbearerError::Bad, got {err:?}");
+        let ImapAuthAnonymousError::Bad(text) = err else {
+            panic!("expected ImapAuthAnonymousError::Bad, got {err:?}");
         };
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
     /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client sends the GS2-framed credentials as
-    /// continuation data, server returns tagged OK.
+    /// empty continuation challenge, client uploads the (possibly empty) trace
+    /// message as continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
-        let opts = ImapAuthOauthbearerOptions::default();
-        let mut auth = ImapAuthOauthbearer::new(
-            "user@example.org",
-            "imap.example.org",
-            993,
-            "oauth-token",
-            opts,
-        );
+        let opts = ImapAuthAnonymousOptions::default();
+        let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
-        assert!(line.trim_end().ends_with("AUTHENTICATE OAUTHBEARER"));
+        assert!(line.trim_end().ends_with("AUTHENTICATE ANONYMOUS"));
 
         expect_wants_read(&mut auth, &mut frag);
 
-        let creds = expect_wants_write(&mut auth, &mut frag, Some(b"+ \r\n"));
-        assert!(creds.ends_with(b"\r\n"));
+        let trace = expect_wants_write(&mut auth, &mut frag, Some(b"+ \r\n"));
+        assert!(trace.ends_with(b"\r\n"));
 
         expect_wants_read(&mut auth, &mut frag);
 
@@ -522,19 +421,11 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded credentials with a JSON
-    /// error in a continuation; client acknowledges with `\x01` (base64 `AQ==`),
-    /// server returns tagged NO.
+    /// Non-IR error path: server rejects the uploaded trace with tagged NO.
     #[test]
-    fn non_ir_invalid_token_returns_no_with_error() {
-        let opts = ImapAuthOauthbearerOptions::default();
-        let mut auth = ImapAuthOauthbearer::new(
-            "user@example.org",
-            "imap.example.org",
-            993,
-            "expired-token",
-            opts,
-        );
+    fn non_ir_rejected_returns_no_error() {
+        let opts = ImapAuthAnonymousOptions::default();
+        let mut auth = ImapAuthAnonymous::new(Some("trace@example.org"), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -544,26 +435,18 @@ mod tests {
         expect_wants_write(&mut auth, &mut frag, Some(b"+ \r\n"));
         expect_wants_read(&mut auth, &mut frag);
 
-        let (err_json_b64, err_json) = fake_json_error();
-        let challenge = format!("+ {err_json_b64}\r\n");
-        let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
-        assert_eq!(b"AQ==\r\n", &*ack);
-
-        expect_wants_read(&mut auth, &mut frag);
-
-        let reply = format!("{tag} NO SASL authentication failed\r\n");
+        let reply = format!("{tag} NO anonymous access disabled\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthOauthbearerError::NoWithError { info, err } = err else {
-            panic!("expected ImapAuthOauthbearerError::NoWithError, got {err:?}");
+        let ImapAuthAnonymousError::No(text) = err else {
+            panic!("expected ImapAuthAnonymousError::No, got {err:?}");
         };
-        assert_eq!(info, "SASL authentication failed");
-        assert_eq!(err, err_json);
+        assert_eq!(text, "anonymous access disabled");
     }
 
     // --- utils
 
     fn expect_wants_write(
-        cor: &mut ImapAuthOauthbearer,
+        cor: &mut ImapAuthAnonymous,
         frag: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> Vec<u8> {
@@ -573,14 +456,14 @@ mod tests {
         }
     }
 
-    fn expect_wants_read(cor: &mut ImapAuthOauthbearer, frag: &mut Fragmentizer) {
+    fn expect_wants_read(cor: &mut ImapAuthAnonymous, frag: &mut Fragmentizer) {
         match cor.resume(frag, None) {
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
             state => panic!("expected WantsRead, got {state:?}"),
         }
     }
 
-    fn expect_complete_ok(cor: &mut ImapAuthOauthbearer, frag: &mut Fragmentizer, reply: &[u8]) {
+    fn expect_complete_ok(cor: &mut ImapAuthAnonymous, frag: &mut Fragmentizer, reply: &[u8]) {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(_)) => {}
             state => panic!("expected Complete(Ok), got {state:?}"),
@@ -588,10 +471,10 @@ mod tests {
     }
 
     fn expect_complete_err(
-        cor: &mut ImapAuthOauthbearer,
+        cor: &mut ImapAuthAnonymous,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapAuthOauthbearerError {
+    ) -> ImapAuthAnonymousError {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Err(err)) => err,
             state => panic!("expected Complete(Err), got {state:?}"),
@@ -602,12 +485,5 @@ mod tests {
         line.split_whitespace()
             .next()
             .expect("first whitespace-separated token")
-    }
-
-    fn fake_json_error() -> (&'static str, &'static str) {
-        (
-            "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIiwic2NvcGUiOiJleGFtcGxlX3Njb3BlIiwib3BlbmlkLWNvbmZpZ3VyYXRpb24iOiJodHRwczovL2V4YW1wbGUuY29tLy53ZWxsLWtub3duL29wZW5pZC1jb25maWd1cmF0aW9uIn0=",
-            "{\"status\":\"invalid_token\",\"scope\":\"example_scope\",\"openid-configuration\":\"https://example.com/.well-known/openid-configuration\"}",
-        )
     }
 }

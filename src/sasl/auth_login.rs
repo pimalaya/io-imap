@@ -96,28 +96,21 @@ impl ImapAuthLogin {
         let tag = TagGenerator::new().generate();
 
         let state = if opts.initial_request {
+            let body = CommandBody::Authenticate {
+                mechanism: AuthMechanism::Login,
+                initial_response: Some(Secret::new(user.as_bytes().to_vec().into())),
+            };
             State::SendIr(SendImapCommand::new(
                 CommandCodec::new(),
-                Command {
-                    tag,
-                    body: CommandBody::Authenticate {
-                        mechanism: AuthMechanism::Login,
-                        initial_response: Some(Secret::new(user.as_bytes().to_vec().into())),
-                    },
-                },
+                Command { tag, body },
             ))
         } else {
+            let body = CommandBody::Authenticate {
+                mechanism: AuthMechanism::Login,
+                initial_response: None,
+            };
             State::Send {
-                send: SendImapCommand::new(
-                    CommandCodec::new(),
-                    Command {
-                        tag,
-                        body: CommandBody::Authenticate {
-                            mechanism: AuthMechanism::Login,
-                            initial_response: None,
-                        },
-                    },
-                ),
+                send: SendImapCommand::new(CommandCodec::new(), Command { tag, body }),
                 user: user.to_string(),
             }
         };

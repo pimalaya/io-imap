@@ -393,18 +393,19 @@ impl ImapClientStd {
         }
     }
 
-    /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC 4505)
-    /// with `ensure_capabilities=true` so the capability list is refreshed
-    /// before returning. Honours [`Self::auto_id`] (see [`login`] for
-    /// details).
+    /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC
+    /// 4505). `opts.initial_request` selects between the non-IR and
+    /// SASL-IR (RFC 4959) flows. `message` is the optional trace
+    /// identifier; pass `None` to omit it. Honours [`Self::auto_id`]
+    /// (see [`login`] for details).
     ///
     /// [`login`]: ImapClientStd::login
     pub fn auth_anonymous(
         &mut self,
-        params: ImapAuthAnonymousParams,
+        message: Option<impl AsRef<str>>,
+        opts: ImapAuthAnonymousOptions,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthAnonymous::new(params, true, auto_id))
+        self.run(ImapAuthAnonymous::new(message, opts))
     }
 
     /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy
@@ -968,8 +969,13 @@ impl ImapClientStd {
 
             capability = match sasl {
                 Sasl::Anonymous(SaslAnonymous { message }) => {
-                    let params = ImapAuthAnonymousParams::new(message.unwrap_or_default(), ir);
-                    client.auth_anonymous(params)?
+                    let opts = ImapAuthAnonymousOptions {
+                        initial_request: ir,
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.auth_anonymous(message, opts)?
                 }
                 Sasl::Login(SaslLogin { username, password }) => {
                     let params = ImapLoginParams::new(username, password)?;
