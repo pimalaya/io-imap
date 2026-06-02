@@ -1,18 +1,18 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL XOAUTH2
-//! (Google's pre-standard OAuth 2.0 mechanism, also accepted by Microsoft
-//! Exchange Online). Both flows are supported:
+//! I/O-free coroutine to authenticate an IMAP account via SASL
+//! OAUTHBEARER (RFC 7628). Both flows are supported:
 //!
-//! * non-IR ([`ImapAuthXoauth2::new`]): bare `AUTHENTICATE XOAUTH2`, then
-//!   credentials uploaded as continuation data after the server's empty SASL
+//! * non-IR ([`ImapAuthOauthbearer::new`] with `initial_request:
+//!   false`): bare `AUTHENTICATE OAUTHBEARER`, then credentials
+//!   uploaded as continuation data after the server's empty SASL
 //!   challenge.
-//! * SASL-IR (RFC 4959, [`ImapAuthXoauth2::new_ir`]): credentials embedded
-//!   inline as the initial response so the auth completes in a single
-//!   round-trip on success.
+//! * SASL-IR (RFC 4959, `initial_request: true`): credentials
+//!   embedded inline as the initial response so the auth completes in
+//!   a single round-trip on success.
 //!
-//! On authentication failure the server returns a continuation carrying a
-//! base64 JSON error; the client acknowledges it with an empty line and the
-//! server then sends the final tagged NO. See
-//! <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>.
+//! On authentication failure the server returns a continuation
+//! carrying a JSON error; the client acknowledges it with a single
+//! `\x01` byte (RFC 7628 §3.2.3) and the server then sends the final
+//! tagged NO.
 
 use core::mem;
 
@@ -39,9 +39,9 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during XOAUTH2 progression.
+/// Errors that can occur during OAUTHBEARER progression.
 #[derive(Clone, Debug, Error)]
-pub enum ImapAuthXoauth2Error {
+pub enum ImapAuthOauthbearerError {
     #[error("Parse IMAP AUTHENTICATE NO error: {0}")]
     No(String),
     #[error("Parse IMAP AUTHENTICATE NO error: {info} ({err})")]
@@ -55,9 +55,9 @@ pub enum ImapAuthXoauth2Error {
     MissingTagged,
     #[error("Parse IMAP AUTHENTICATE response: expected continuation request")]
     ExpectedContinuationRequest,
-    #[error("Parse IMAP AUTHENTICATE XOAUTH2 error: expected NO got {kind:?}: {info}")]
+    #[error("Parse IMAP AUTHENTICATE OAUTHBEARER error: expected NO got {kind:?}: {info}")]
     UnexpectedStatus { kind: StatusKind, info: String },
-    #[error("Parse IMAP AUTHENTICATE XOAUTH2 error: expected continuation request got OK")]
+    #[error("Parse IMAP AUTHENTICATE OAUTHBEARER error: expected continuation request got OK")]
     UnexpectedOk,
 
     #[error("Send IMAP AUTHENTICATE command error")]
@@ -68,10 +68,10 @@ pub enum ImapAuthXoauth2Error {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the XOAUTH2 sub-flow and any post-authentication
+/// Selects the OAUTHBEARER sub-flow and any post-authentication
 /// round-trips.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImapAuthXoauth2Options {
+pub struct ImapAuthOauthbearerOptions {
     /// When `true`, embed credentials inline as the SASL initial
     /// response (RFC 4959); the coroutine starts in
     /// [`State::SendIr`]. When `false`, the credentials are uploaded
@@ -82,50 +82,58 @@ pub struct ImapAuthXoauth2Options {
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL XOAUTH2 coroutine. The initial [`State`] variant
+/// I/O-free SASL OAUTHBEARER coroutine. The initial [`State`] variant
 /// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
 /// and SASL-IR flows.
-pub struct ImapAuthXoauth2 {
+pub struct ImapAuthOauthbearer {
     state: State,
     error: Option<String>,
     observed: Vec<Capability<'static>>,
-    opts: ImapAuthXoauth2Options,
+    opts: ImapAuthOauthbearerOptions,
 }
 
-impl ImapAuthXoauth2 {
-    /// Creates a new XOAUTH2 coroutine. `opts.initial_request`
-    /// selects between the non-IR flow ([`State::Send`]) and the
-    /// SASL-IR flow ([`State::SendIr`]).
+impl ImapAuthOauthbearer {
+    /// Creates a new OAUTHBEARER coroutine. `opts.initial_request` selects
+    /// between the non-IR flow ([`State::Send`]) and the SASL-IR flow
+    /// ([`State::SendIr`]).
     pub fn new(
         user: impl AsRef<str>,
+        host: impl AsRef<str>,
+        port: u16,
         token: impl AsRef<str>,
-        opts: ImapAuthXoauth2Options,
+        opts: ImapAuthOauthbearerOptions,
     ) -> Self {
-        let user = user.as_ref();
-        let token = token.as_ref();
-        let payload = format!("user={user}\x01auth=Bearer {token}\x01\x01").into_bytes();
-        let tag = TagGenerator::new().generate();
+        let u = user.as_ref();
+        let h = host.as_ref();
+        let t = token.as_ref();
+
+        let payload = format!("n,a={u},\x01host={h}\x01port={port}\x01auth=Bearer {t}\x01\x01");
+        let payload = payload.into_bytes().into();
 
         let state = if opts.initial_request {
-            let command = Command {
-                tag,
-                body: CommandBody::Authenticate {
-                    mechanism: AuthMechanism::XOAuth2,
-                    initial_response: Some(Secret::new(payload.into())),
+            State::SendIr(SendImapCommand::new(
+                CommandCodec::new(),
+                Command {
+                    tag: TagGenerator::new().generate(),
+                    body: CommandBody::Authenticate {
+                        mechanism: AuthMechanism::OAuthBearer,
+                        initial_response: Some(Secret::new(payload)),
+                    },
                 },
-            };
-            State::SendIr(SendImapCommand::new(CommandCodec::new(), command))
+            ))
         } else {
-            let command = Command {
-                tag,
-                body: CommandBody::Authenticate {
-                    mechanism: AuthMechanism::XOAuth2,
-                    initial_response: None,
-                },
-            };
             State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), command),
-                payload: payload.into(),
+                payload,
+                send: SendImapCommand::new(
+                    CommandCodec::new(),
+                    Command {
+                        tag: TagGenerator::new().generate(),
+                        body: CommandBody::Authenticate {
+                            mechanism: AuthMechanism::OAuthBearer,
+                            initial_response: None,
+                        },
+                    },
+                ),
             }
         };
 
@@ -185,9 +193,9 @@ impl ImapAuthXoauth2 {
     }
 }
 
-impl ImapCoroutine for ImapAuthXoauth2 {
+impl ImapCoroutine for ImapAuthOauthbearer {
     type Yield = ImapYield;
-    type Return = Result<Vec<Capability<'static>>, ImapAuthXoauth2Error>;
+    type Return = Result<Vec<Capability<'static>>, ImapAuthOauthbearerError>;
 
     fn resume(
         &mut self,
@@ -200,7 +208,7 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
+                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
@@ -214,46 +222,46 @@ impl ImapCoroutine for ImapAuthXoauth2 {
 
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
-                            StatusKind::Ok => ImapAuthXoauth2Error::UnexpectedOk,
-                            StatusKind::No => ImapAuthXoauth2Error::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthXoauth2Error::Bad(body.text.to_string()),
+                            StatusKind::Ok => ImapAuthOauthbearerError::UnexpectedOk,
+                            StatusKind::No => ImapAuthOauthbearerError::No(body.text.to_string()),
+                            StatusKind::Bad => ImapAuthOauthbearerError::Bad(body.text.to_string()),
                         };
 
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    let err = ImapAuthXoauth2Error::ExpectedContinuationRequest;
+                    let err = ImapAuthOauthbearerError::ExpectedContinuationRequest;
                     return ImapCoroutineState::Complete(Err(err));
                 }
                 State::SendIr(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
+                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
                     if let Some(cr) = out.continuation_request {
                         self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![]);
+                        let auth = AuthenticateData::r#continue(vec![0x01]);
                         let codec = AuthenticateDataCodec::new();
                         self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
                         continue;
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthXoauth2Error::MissingTagged;
+                        let err = ImapAuthOauthbearerError::MissingTagged;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthXoauth2Error::No(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::No(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthXoauth2Error::Bad(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -275,31 +283,31 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
+                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
                     if let Some(cr) = out.continuation_request {
                         self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![]);
+                        let auth = AuthenticateData::r#continue(vec![0x01]);
                         let codec = AuthenticateDataCodec::new();
                         self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
                         continue;
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthXoauth2Error::MissingTagged;
+                        let err = ImapAuthOauthbearerError::MissingTagged;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthXoauth2Error::No(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::No(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthXoauth2Error::Bad(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -321,12 +329,12 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
+                        let err = ImapAuthOauthbearerError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthXoauth2Error::MissingTagged;
+                        let err = ImapAuthOauthbearerError::MissingTagged;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
@@ -334,13 +342,13 @@ impl ImapCoroutine for ImapAuthXoauth2 {
 
                     let StatusKind::No = body.kind else {
                         let kind = body.kind;
-                        let err = ImapAuthXoauth2Error::UnexpectedStatus { kind, info };
+                        let err = ImapAuthOauthbearerError::UnexpectedStatus { kind, info };
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let err = match self.error.take() {
-                        Some(err) => ImapAuthXoauth2Error::NoWithError { info, err },
-                        None => ImapAuthXoauth2Error::No(info),
+                        Some(err) => ImapAuthOauthbearerError::NoWithError { info, err },
+                        None => ImapAuthOauthbearerError::No(info),
                     };
 
                     return ImapCoroutineState::Complete(Err(err));
@@ -386,22 +394,26 @@ mod tests {
 
     /// SASL-IR happy path: credentials sent inline, server accepts on the first
     /// round-trip with tagged OK.
-    ///
-    /// Refs: https://github.com/pimalaya/io-imap/issues/1
     #[test]
     fn ir_success_returns_ok() {
-        let opts = ImapAuthXoauth2Options {
+        let opts = ImapAuthOauthbearerOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthXoauth2::new("user@example.org", "oauth-token", opts);
+        let mut auth = ImapAuthOauthbearer::new(
+            "user@example.org",
+            "imap.example.org",
+            993,
+            "oauth-token",
+            opts,
+        );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
-        assert!(line.contains("AUTHENTICATE XOAUTH2 "));
+        assert!(line.contains("AUTHENTICATE OAUTHBEARER "));
 
         expect_wants_read(&mut auth, &mut frag);
 
@@ -410,15 +422,22 @@ mod tests {
     }
 
     /// SASL-IR error path: server rejects the inline credentials in the very
-    /// first continuation.
+    /// first continuation. Per RFC 7628 §3.2.3 the client acknowledges with a
+    /// single `\x01` byte (base64 `AQ==`) before reading the tagged NO.
     #[test]
     fn ir_invalid_token_returns_no_with_error() {
-        let opts = ImapAuthXoauth2Options {
+        let opts = ImapAuthOauthbearerOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthXoauth2::new("user@example.org", "expired-token", opts);
+        let mut auth = ImapAuthOauthbearer::new(
+            "user@example.org",
+            "imap.example.org",
+            993,
+            "expired-token",
+            opts,
+        );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -429,14 +448,14 @@ mod tests {
         let (err_json_b64, err_json) = fake_json_error();
         let challenge = format!("+ {err_json_b64}\r\n");
         let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
-        assert_eq!(b"\r\n", &*ack);
+        assert_eq!(b"AQ==\r\n", &*ack);
 
         expect_wants_read(&mut auth, &mut frag);
 
         let reply = format!("{tag} NO SASL authentication failed\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthXoauth2Error::NoWithError { info, err } = err else {
-            panic!("expected ImapAuthXoauth2Error::NoWithError, got {err:?}");
+        let ImapAuthOauthbearerError::NoWithError { info, err } = err else {
+            panic!("expected ImapAuthOauthbearerError::NoWithError, got {err:?}");
         };
         assert_eq!(info, "SASL authentication failed");
         assert_eq!(err, err_json);
@@ -445,12 +464,18 @@ mod tests {
     /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
-        let opts = ImapAuthXoauth2Options {
+        let opts = ImapAuthOauthbearerOptions {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthXoauth2::new("user@example.org", "oauth-token", opts);
+        let mut auth = ImapAuthOauthbearer::new(
+            "user@example.org",
+            "imap.example.org",
+            993,
+            "oauth-token",
+            opts,
+        );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -460,25 +485,31 @@ mod tests {
 
         let reply = format!("{tag} BAD AUTHENTICATE not enabled\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthXoauth2Error::Bad(text) = err else {
-            panic!("expected ImapAuthXoauth2Error::NoWithError, got {err:?}");
+        let ImapAuthOauthbearerError::Bad(text) = err else {
+            panic!("expected ImapAuthOauthbearerError::Bad, got {err:?}");
         };
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
     /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client sends base64-encoded credentials as
+    /// empty continuation challenge, client sends the GS2-framed credentials as
     /// continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
-        let opts = ImapAuthXoauth2Options::default();
-        let mut auth = ImapAuthXoauth2::new("user@example.org", "oauth-token", opts);
+        let opts = ImapAuthOauthbearerOptions::default();
+        let mut auth = ImapAuthOauthbearer::new(
+            "user@example.org",
+            "imap.example.org",
+            993,
+            "oauth-token",
+            opts,
+        );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
-        assert!(line.trim_end().ends_with("AUTHENTICATE XOAUTH2"));
+        assert!(line.trim_end().ends_with("AUTHENTICATE OAUTHBEARER"));
 
         expect_wants_read(&mut auth, &mut frag);
 
@@ -491,13 +522,19 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded credentials with a base64
-    /// JSON error in a continuation; client acknowledges with empty `\r\n`,
+    /// Non-IR error path: server rejects the uploaded credentials with a JSON
+    /// error in a continuation; client acknowledges with `\x01` (base64 `AQ==`),
     /// server returns tagged NO.
     #[test]
     fn non_ir_invalid_token_returns_no_with_error() {
-        let opts = ImapAuthXoauth2Options::default();
-        let mut auth = ImapAuthXoauth2::new("user@example.org", "expired-token", opts);
+        let opts = ImapAuthOauthbearerOptions::default();
+        let mut auth = ImapAuthOauthbearer::new(
+            "user@example.org",
+            "imap.example.org",
+            993,
+            "expired-token",
+            opts,
+        );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -510,14 +547,14 @@ mod tests {
         let (err_json_b64, err_json) = fake_json_error();
         let challenge = format!("+ {err_json_b64}\r\n");
         let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
-        assert_eq!(b"\r\n", &*ack);
+        assert_eq!(b"AQ==\r\n", &*ack);
 
         expect_wants_read(&mut auth, &mut frag);
 
         let reply = format!("{tag} NO SASL authentication failed\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
-        let ImapAuthXoauth2Error::NoWithError { info, err } = err else {
-            panic!("expected ImapAuthXoauth2Error::NoWithError, got {err:?}");
+        let ImapAuthOauthbearerError::NoWithError { info, err } = err else {
+            panic!("expected ImapAuthOauthbearerError::NoWithError, got {err:?}");
         };
         assert_eq!(info, "SASL authentication failed");
         assert_eq!(err, err_json);
@@ -526,7 +563,7 @@ mod tests {
     // --- utils
 
     fn expect_wants_write(
-        cor: &mut ImapAuthXoauth2,
+        cor: &mut ImapAuthOauthbearer,
         frag: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> Vec<u8> {
@@ -536,14 +573,14 @@ mod tests {
         }
     }
 
-    fn expect_wants_read(cor: &mut ImapAuthXoauth2, frag: &mut Fragmentizer) {
+    fn expect_wants_read(cor: &mut ImapAuthOauthbearer, frag: &mut Fragmentizer) {
         match cor.resume(frag, None) {
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
             state => panic!("expected WantsRead, got {state:?}"),
         }
     }
 
-    fn expect_complete_ok(cor: &mut ImapAuthXoauth2, frag: &mut Fragmentizer, reply: &[u8]) {
+    fn expect_complete_ok(cor: &mut ImapAuthOauthbearer, frag: &mut Fragmentizer, reply: &[u8]) {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(_)) => {}
             state => panic!("expected Complete(Ok), got {state:?}"),
@@ -551,10 +588,10 @@ mod tests {
     }
 
     fn expect_complete_err(
-        cor: &mut ImapAuthXoauth2,
+        cor: &mut ImapAuthOauthbearer,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapAuthXoauth2Error {
+    ) -> ImapAuthOauthbearerError {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Err(err)) => err,
             state => panic!("expected Complete(Err), got {state:?}"),
@@ -569,8 +606,8 @@ mod tests {
 
     fn fake_json_error() -> (&'static str, &'static str) {
         (
-            "eyJzdGF0dXMiOiI0MDEiLCJzY2hlbWVzIjoiQmVhcmVyIiwic2NvcGUiOiJodHRwczovL21haWwuZ29vZ2xlLmNvbS8ifQ==",
-            "{\"status\":\"401\",\"schemes\":\"Bearer\",\"scope\":\"https://mail.google.com/\"}",
+            "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIiwic2NvcGUiOiJleGFtcGxlX3Njb3BlIiwib3BlbmlkLWNvbmZpZ3VyYXRpb24iOiJodHRwczovL2V4YW1wbGUuY29tLy53ZWxsLWtub3duL29wZW5pZC1jb25maWd1cmF0aW9uIn0=",
+            "{\"status\":\"invalid_token\",\"scope\":\"example_scope\",\"openid-configuration\":\"https://example.com/.well-known/openid-configuration\"}",
         )
     }
 }

@@ -131,7 +131,7 @@ pub enum ImapClientStdError {
     #[error(transparent)]
     AuthAnonymous(#[from] ImapAuthAnonymousError),
     #[error(transparent)]
-    AuthOAuthBearer(#[from] ImapAuthOAuthBearerError),
+    AuthOAuthBearer(#[from] ImapAuthOauthbearerError),
     #[error(transparent)]
     AuthXOAuth2(#[from] ImapAuthXoauth2Error),
     #[cfg(feature = "scram")]
@@ -432,17 +432,20 @@ impl ImapClientStd {
         self.run(ImapAuthPlain::new(params, true, auto_id))
     }
 
-    /// Runs [`ImapAuthOAuthBearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
-    /// RFC 7628) with `ensure_capabilities=true`. The `token` is an
-    /// OAuth 2.0 bearer access token: the connection must be
-    /// TLS-protected before calling this method. Honours
-    /// [`Self::auto_id`].
+    /// Runs [`ImapAuthOauthbearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
+    /// RFC 7628). `opts.initial_request` selects between the non-IR
+    /// and SASL-IR (RFC 4959) flows. The `token` is an OAuth 2.0
+    /// bearer access token: the connection must be TLS-protected
+    /// before calling this method. Honours [`Self::auto_id`].
     pub fn auth_oauthbearer(
         &mut self,
-        params: ImapAuthOAuthBearerParams,
+        user: impl AsRef<str>,
+        host: impl AsRef<str>,
+        port: u16,
+        token: impl AsRef<str>,
+        opts: ImapAuthOauthbearerOptions,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthOAuthBearer::new(params, true, auto_id))
+        self.run(ImapAuthOauthbearer::new(user, host, port, token, opts))
     }
 
     /// Runs [`ImapAuthXoauth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
@@ -981,8 +984,13 @@ impl ImapClientStd {
                     port,
                     token,
                 }) => {
-                    let params = ImapAuthOAuthBearerParams::new(username, host, port, token, ir);
-                    client.auth_oauthbearer(params)?
+                    let opts = ImapAuthOauthbearerOptions {
+                        initial_request: ir,
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.auth_oauthbearer(username, host, port, token.expose_secret(), opts)?
                 }
                 Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
                     let opts = ImapAuthXoauth2Options {
