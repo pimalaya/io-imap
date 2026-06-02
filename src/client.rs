@@ -472,15 +472,16 @@ impl ImapClientStd {
     }
 
     /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
-    /// RFC 7677) with `ensure_capabilities=true`. Honours
-    /// [`Self::auto_id`].
+    /// RFC 7677). `opts.initial_request` selects between the non-IR
+    /// and SASL-IR (RFC 4959) flows. Honours [`Self::auto_id`].
     #[cfg(feature = "scram")]
     pub fn auth_scram_sha256(
         &mut self,
-        params: ImapAuthScramSha256Params,
+        user: impl AsRef<str>,
+        password: impl AsRef<str>,
+        opts: ImapAuthScramSha256Options,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthScramSha256::new(params, true, auto_id))
+        self.run(ImapAuthScramSha256::new(user, password, opts))
     }
 
     /// Runs [`ImapLogout`] (`LOGOUT`).
@@ -1019,8 +1020,13 @@ impl ImapClientStd {
                 }
                 #[cfg(feature = "scram")]
                 Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
-                    let params = ImapAuthScramSha256Params::new(username, password, ir);
-                    client.auth_scram_sha256(params)?
+                    let opts = ImapAuthScramSha256Options {
+                        initial_request: ir,
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.auth_scram_sha256(username, password.expose_secret(), opts)?
                 }
                 #[cfg(not(feature = "scram"))]
                 Sasl::ScramSha256(_) => {
