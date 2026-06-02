@@ -780,7 +780,11 @@ impl ImapClientStd {
         date: Option<DateTime>,
         message: LiteralOrLiteral8<'static>,
     ) -> Result<ImapAppendOutput, ImapClientStdError> {
-        self.run(ImapMessageAppend::new(mailbox, flags, date, message))
+        self.run(ImapMessageAppend::new(
+            mailbox,
+            message,
+            ImapMessageAppendOptions { flags, date },
+        ))
     }
 
     // ---- RFC 5256: SORT / THREAD ------------------------------------------

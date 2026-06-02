@@ -92,9 +92,8 @@ fn main() {
 
     let mut coroutine = ImapMessageAppend::new(
         mbox.try_into().unwrap(),
-        Default::default(),
-        None,
         LiteralOrLiteral8::Literal(Literal::unvalidated(include_bytes!("./emacs.eml"))),
+        ImapMessageAppendOptions::default(),
     );
     let mut arg: Option<&[u8]> = None;
 
