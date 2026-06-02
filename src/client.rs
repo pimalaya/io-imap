@@ -341,17 +341,17 @@ impl ImapClientStd {
         Ok(self.run(ImapGreetingGet::new(true))?.capability)
     }
 
-    /// Runs [`ImapLogin`] (`LOGIN`) with the `ensure_capabilities` flag
-    /// set so the capability list is always refreshed before returning.
-    /// Honours [`Self::auto_id`]: when set, chains an RFC 2971 `ID`
-    /// round-trip after the tagged `OK`; the field is consumed and
-    /// reset to [`None`].
+    /// Runs [`ImapLogin`] (`LOGIN`, RFC 3501 §6.2.3). The connection
+    /// must be TLS-protected. Honours [`Self::auto_id`]: when set,
+    /// chains an RFC 2971 `ID` round-trip after the tagged `OK`; the
+    /// field is consumed and reset to [`None`].
     pub fn login(
         &mut self,
-        params: ImapLoginParams,
+        user: impl AsRef<str>,
+        password: impl AsRef<str>,
+        opts: ImapLoginOptions,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapLogin::new(params, true, auto_id))
+        self.run(ImapLogin::new(user, password, opts)?)
     }
 
     /// Runs [`ImapStartTls`] (`STARTTLS`, RFC 3501 §6.2.1). The IMAP-layer
@@ -979,8 +979,12 @@ impl ImapClientStd {
                     client.auth_anonymous(message, opts)?
                 }
                 Sasl::Login(SaslLogin { username, password }) => {
-                    let params = ImapLoginParams::new(username, password)?;
-                    client.login(params)?
+                    let opts = ImapLoginOptions {
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.login(username, password.expose_secret(), opts)?
                 }
                 Sasl::Plain(SaslPlain {
                     authzid,
