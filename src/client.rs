@@ -424,14 +424,17 @@ impl ImapClientStd {
         self.run(ImapAuthLogin::new(user, password, opts))
     }
 
-    /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616) with
-    /// `ensure_capabilities=true`. Honours [`Self::auto_id`].
+    /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616).
+    /// `opts.initial_request` selects between the non-IR and SASL-IR
+    /// (RFC 4959) flows. Honours [`Self::auto_id`].
     pub fn auth_plain(
         &mut self,
-        params: ImapAuthPlainParams,
+        authzid: Option<impl AsRef<str>>,
+        authcid: impl AsRef<str>,
+        password: impl AsRef<str>,
+        opts: ImapAuthPlainOptions,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthPlain::new(params, true, auto_id))
+        self.run(ImapAuthPlain::new(authzid, authcid, password, opts))
     }
 
     /// Runs [`ImapAuthOauthbearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
@@ -977,8 +980,13 @@ impl ImapClientStd {
                     authcid,
                     passwd,
                 }) => {
-                    let params = ImapAuthPlainParams::new(authzid, authcid, passwd, ir);
-                    client.auth_plain(params)?
+                    let opts = ImapAuthPlainOptions {
+                        initial_request: ir,
+                        ensure_capabilities: true,
+                        auto_id: client.auto_id.take(),
+                    };
+
+                    client.auth_plain(authzid, authcid, passwd.expose_secret(), opts)?
                 }
                 Sasl::Oauthbearer(SaslOauthbearer {
                     username,
