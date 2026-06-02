@@ -23,6 +23,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use log::trace;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -74,11 +75,12 @@ impl ImapLogin {
         let username = user.as_ref().to_string().try_into()?;
         let password = Secret::new(password.as_ref().to_string().try_into()?);
 
-        let command = Command {
+        let cmd = Command {
             tag: TagGenerator::new().generate(),
             body: CommandBody::Login { username, password },
         };
-        let send = SendImapCommand::new(CommandCodec::new(), command);
+        trace!("send IMAP command {cmd:?}");
+        let send = SendImapCommand::new(CommandCodec::new(), cmd);
 
         Ok(Self {
             state: State::Send(send),

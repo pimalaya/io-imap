@@ -33,6 +33,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use log::trace;
 use rand::{Rng, distributions::Alphanumeric};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -136,17 +137,18 @@ impl ImapAuthScramSha256 {
                 mechanism: AuthMechanism::ScramSha256,
                 initial_response: Some(Secret::new(client_first_message.into_bytes().into())),
             };
-            State::SendIr(SendImapCommand::new(
-                CommandCodec::new(),
-                Command { tag, body },
-            ))
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
+            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::ScramSha256,
                 initial_response: None,
             };
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
             State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), Command { tag, body }),
+                send: SendImapCommand::new(CommandCodec::new(), cmd),
                 client_first_message,
             }
         };

@@ -35,6 +35,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use log::trace;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -103,6 +104,8 @@ impl ImapAuthOauthbearer {
         token: impl AsRef<str>,
         opts: ImapAuthOauthbearerOptions,
     ) -> Self {
+        let tag = TagGenerator::new().generate();
+
         let u = user.as_ref();
         let h = host.as_ref();
         let t = token.as_ref();
@@ -115,25 +118,17 @@ impl ImapAuthOauthbearer {
                 mechanism: AuthMechanism::OAuthBearer,
                 initial_response: Some(Secret::new(payload)),
             };
-            State::SendIr(SendImapCommand::new(
-                CommandCodec::new(),
-                Command {
-                    tag: TagGenerator::new().generate(),
-                    body,
-                },
-            ))
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
+            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::OAuthBearer,
                 initial_response: None,
             };
-            let send = SendImapCommand::new(
-                CommandCodec::new(),
-                Command {
-                    tag: TagGenerator::new().generate(),
-                    body,
-                },
-            );
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
+            let send = SendImapCommand::new(CommandCodec::new(), cmd);
             State::Send { payload, send }
         };
 

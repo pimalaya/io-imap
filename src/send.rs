@@ -183,7 +183,6 @@ impl<T: Encoder> SendImapCommand<T> {
                         // or further data once the read state is entered).
                         self.state = State::Read;
                     } else {
-                        trace!("command to write: {}", escape_byte_string(&buf));
                         self.wants_write = Some(buf);
                         self.state = State::Read;
                     }

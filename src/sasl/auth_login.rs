@@ -27,6 +27,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use log::trace;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -100,17 +101,18 @@ impl ImapAuthLogin {
                 mechanism: AuthMechanism::Login,
                 initial_response: Some(Secret::new(user.as_bytes().to_vec().into())),
             };
-            State::SendIr(SendImapCommand::new(
-                CommandCodec::new(),
-                Command { tag, body },
-            ))
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
+            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::Login,
                 initial_response: None,
             };
+            let cmd = Command { tag, body };
+            trace!("send IMAP command {cmd:?}");
             State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), Command { tag, body }),
+                send: SendImapCommand::new(CommandCodec::new(), cmd),
                 user: user.to_string(),
             }
         };
