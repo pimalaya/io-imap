@@ -61,7 +61,7 @@ use thiserror::Error;
 
 use crate::{
     coroutine::*,
-    rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleYield},
+    rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
         fetch::{ImapMessageFetch, ImapMessageFetchError},
         select::{ImapMailboxSelect, ImapMailboxSelectError, SelectData},
@@ -413,7 +413,7 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                     self.idle_done.store(false, Ordering::SeqCst);
                     self.idle_saw_data = false;
-                    let idle = ImapIdle::new(self.idle_done.clone());
+                    let idle = ImapIdle::new(self.idle_done.clone(), ImapIdleOptions::default());
                     self.state = State::Idle(idle);
                 }
 

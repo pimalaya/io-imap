@@ -91,7 +91,7 @@ fn main() {
     }
 
     let idle = Arc::new(AtomicBool::new(false));
-    let mut coroutine = ImapIdle::new(idle.clone());
+    let mut coroutine = ImapIdle::new(idle.clone(), ImapIdleOptions::default());
     let mut arg: Option<Vec<u8>> = None;
 
     // 1. set shorter read timeout for stream

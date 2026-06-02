@@ -1,11 +1,18 @@
-//! I/O-free coroutine to watch IMAP mailbox changes using the IDLE
-//! extension.
+//! I/O-free coroutine to watch IMAP mailbox changes using the IDLE extension
+//! (RFC 2177).
+//!
+//! Shutdown is cooperative: the caller flips the [`AtomicBool`] handed to
+//! [`ImapIdle::new`], the coroutine reads it on its next loop iteration and
+//! transitions from [`State::Read`] to [`State::Done`], sending `DONE` cleanly
+//! before completing with `Ok(())`. When the `client` feature is enabled, the
+//! coroutine also refreshes the IDLE every [`ImapIdleOptions::timeout`]
+//! (default 29s) to keep the connection alive against servers that drop long
+//! idle sockets.
 
-#[cfg(feature = "client")]
-use core::time::Duration;
 use core::{
-    mem,
+    fmt, mem,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
@@ -29,40 +36,41 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::send::*;
+use crate::{coroutine::*, imap_try, send::*};
 
+/// Default IDLE refresh window when no [`ImapIdleOptions::timeout`]
+/// override is supplied. Set conservatively below the 29-minute upper
+/// bound recommended by RFC 2177 §3 to survive aggressive middleboxes.
 #[cfg(feature = "client")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during IDLE progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapIdleError {
-    #[error("IMAP IDLE unexpected OK: {0}")]
-    Ok(String),
-    #[error("IMAP IDLE missing continuation request")]
-    ContinuationRequest,
+    #[error("IMAP IDLE failed: NO {0}")]
+    No(String),
+    #[error("IMAP IDLE failed: BAD {0}")]
+    Bad(String),
+    #[error("IMAP IDLE failed: BYE {0}")]
+    Bye(String),
 
-    #[error("Reached unexpected EOF on IMAP stream")]
+    #[error("IMAP IDLE failed: server returned a tagged response before the continuation request")]
+    UnexpectedTagged,
+    #[error("IMAP IDLE failed: server did not send the expected continuation request")]
+    ExpectedContinuationRequest,
+    #[error("IMAP IDLE failed: server did not return a tagged response to DONE")]
+    MissingTagged,
+    #[error("IMAP IDLE failed: reached unexpected EOF on stream")]
     Eof,
-
-    #[error("Decode IMAP response error")]
+    #[error("IMAP IDLE failed: decode response error")]
     DecodingFailure(Secret<Box<[u8]>>),
-    #[error("Parse IMAP response error: message is poisoned")]
+    #[error("IMAP IDLE failed: parse response error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
-    #[error("Parse IMAP response error: message is too long")]
+    #[error("IMAP IDLE failed: parse response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
 
-    #[error("Send IMAP DONE command error")]
-    Done(#[from] SendImapCommandError),
-    #[error("IMAP IDLE DONE NO error: {0}")]
-    No(String),
-    #[error("IMAP IDLE DONE BAD error: {0}")]
-    Bad(String),
-    #[error("IMAP IDLE DONE BYE error: {0}")]
-    Bye(String),
-    #[error("No IMAP IDLE DONE tagged response returned by the server")]
-    Tagged,
+    #[error("IMAP IDLE failed: {0}")]
+    Send(#[from] SendImapCommandError),
 }
 
 /// One batch of unilateral untagged responses delivered during an
@@ -73,39 +81,43 @@ pub struct ImapIdleEvent {
     pub data: Vec<Data<'static>>,
 }
 
-/// Per-coroutine Yield: socket I/O step requests on one axis,
-/// untagged-response batches on the other. The driver dispatches on
-/// the variant: I/O variants pump the IMAP socket; [`Self::Event`] is
-/// delivered to the caller (callback / channel / async stream).
+/// Per-coroutine Yield: socket I/O step requests on one axis, untagged-response
+/// batches on the other. The driver dispatches on the variant: I/O variants
+/// pump the IMAP socket; [`Self::Event`] is delivered to the caller (callback /
+/// channel / async stream).
 #[derive(Debug)]
 pub enum ImapIdleYield {
-    /// Socket: read more bytes and feed them back on the next
-    /// resume.
+    /// Socket: read more bytes and feed them back on the next resume.
     WantsRead,
-    /// Socket: write these bytes; the next resume typically takes
-    /// `None`.
+    /// Socket: write these bytes; the next resume typically takes `None`.
     WantsWrite(Vec<u8>),
-    /// Domain: one batch of unilateral untagged responses received
-    /// during the IDLE.
+    /// Domain: one batch of unilateral untagged responses received during the
+    /// IDLE.
     Event(ImapIdleEvent),
 }
 
-enum State {
-    /// Send the IDLE command and await the continuation request.
-    Idle(SendImapCommand<CommandCodec>),
-    /// Read unilateral responses until the shutdown flag is set or the
-    /// internal refresh timeout elapses.
-    Read,
-    /// Send the DONE command and await the tagged response.
-    Done(SendImapCommand<IdleDoneCodec>),
+impl From<ImapYield> for ImapIdleYield {
+    fn from(y: ImapYield) -> Self {
+        match y {
+            ImapYield::WantsRead => ImapIdleYield::WantsRead,
+            ImapYield::WantsWrite(bytes) => ImapIdleYield::WantsWrite(bytes),
+        }
+    }
 }
 
-/// I/O-free coroutine to watch IMAP mailbox changes via IDLE.
-///
-/// Shutdown is cooperative: the caller flips the [`AtomicBool`]
-/// handed to [`ImapIdle::new`], the coroutine reads it on its next
-/// loop iteration and transitions from `Read` to `Done`, sending
-/// `DONE` cleanly before exiting.
+/// Optional knobs for [`ImapIdle::new`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImapIdleOptions {
+    /// Server-side refresh interval. When the `client` feature is on and the
+    /// timer elapses, the coroutine sends `DONE` and re-issues `IDLE` to keep
+    /// the connection from being dropped by aggressive middleboxes. When
+    /// `None`, falls back to [`IDLE_DEFAULT_TIMEOUT`]. Without the `client`
+    /// feature this field is unused since [`Instant`] is unavailable in
+    /// `no_std`.
+    pub timeout: Option<Duration>,
+}
+
+/// I/O-free coroutine watching IMAP mailbox changes via IDLE.
 pub struct ImapIdle {
     tag: TagGenerator,
     state: State,
@@ -115,6 +127,8 @@ pub struct ImapIdle {
     untagged: Vec<StatusBody<'static>>,
     bye: Option<Bye<'static>>,
     done: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    opts: ImapIdleOptions,
     #[cfg(feature = "client")]
     timer: Option<Instant>,
 }
@@ -122,14 +136,20 @@ pub struct ImapIdle {
 impl ImapIdle {
     /// Creates a new coroutine.
     ///
-    /// `done` is the shared shutdown flag: flip it to `true` to ask
-    /// the coroutine to wind down at its next chance (sends `DONE`
-    /// and completes with `Ok(())`). Pass `Arc::new(AtomicBool::new(false))`
-    /// when no external shutdown is needed.
-    pub fn new(done: Arc<AtomicBool>) -> Self {
+    /// `done` is the shared shutdown flag: flip it to `true` to ask the
+    /// coroutine to wind down at its next chance (sends `DONE` and completes
+    /// with `Ok(())`). Pass `Arc::new(AtomicBool::new(false))` when no external
+    /// shutdown is needed.
+    pub fn new(done: Arc<AtomicBool>, opts: ImapIdleOptions) -> Self {
         let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), CommandBody::Idle).unwrap();
+
+        let command = Command {
+            tag: tag.generate(),
+            body: CommandBody::Idle,
+        };
+
+        trace!("send IMAP command {command:?}");
+
         let state = State::Idle(SendImapCommand::new(CommandCodec::new(), command));
 
         Self {
@@ -141,9 +161,23 @@ impl ImapIdle {
             untagged: Vec::new(),
             bye: None,
             done,
+            opts,
             #[cfg(feature = "client")]
             timer: None,
         }
+    }
+
+    #[cfg(feature = "client")]
+    fn timeout(&self) -> Duration {
+        self.opts.timeout.unwrap_or(IDLE_DEFAULT_TIMEOUT)
+    }
+
+    #[cfg(feature = "client")]
+    fn timed_out(&self) -> bool {
+        self.timer
+            .as_ref()
+            .map(|t| t.elapsed() >= self.timeout())
+            .unwrap_or(false)
     }
 }
 
@@ -162,99 +196,68 @@ impl ImapCoroutine for ImapIdle {
         }
 
         loop {
+            trace!("idle: {}", self.state);
+
             if mem::take(&mut self.wants_read) {
                 return ImapCoroutineState::Yielded(ImapIdleYield::WantsRead);
             }
 
             match &mut self.state {
-                State::Idle(coroutine) => {
-                    // An IMAP server can legally pack the
-                    // continuation-request line and one or more
-                    // unsolicited untagged responses into the same
-                    // physical send, e.g. `+ idling\r\n* 10 FETCH …`
-                    // when a flag change happens just before the
-                    // server processes our `IDLE`. The inner
-                    // `SendImapCommand` parses them all in one resume
-                    // and returns them via `data` / `untagged`. If we
-                    // dropped those vectors here, the unsolicited
-                    // responses would be silently lost; we'd only
-                    // learn about the change at the next IDLE / DONE
-                    // refresh.
-                    let (tagged, cr, bye, data, untagged) = match coroutine
-                        .resume(fragmentizer, arg.take())
-                    {
-                        SendImapCommandResult::WantsRead => {
-                            return ImapCoroutineState::Yielded(ImapIdleYield::WantsRead);
-                        }
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes));
-                        }
-                        SendImapCommandResult::Ok {
-                            tagged,
-                            continuation_request,
-                            bye,
-                            data,
-                            untagged,
-                            ..
-                        } => (tagged, continuation_request, bye, data, untagged),
-                        SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Complete(Err(err.into()));
-                        }
-                    };
+                State::Idle(send) => {
+                    // NOTE: an IMAP server can legally pack the
+                    // continuation-request line and one or more unsolicited
+                    // untagged responses into the same physical send, e.g. `+
+                    // idling\r\n* 10 FETCH …` when a flag change happens just
+                    // before the server processes our `IDLE`. SendImapCommand
+                    // parses them all in one resume and returns them via `data`
+                    // / `untagged`; surface them here so the caller sees the
+                    // changes immediately instead of waiting for the next
+                    // socket read.
+                    let out = imap_try!(send, fragmentizer, arg.take());
 
-                    if let Some(bye) = bye {
-                        return ImapCoroutineState::Complete(Err(ImapIdleError::Bye(
-                            bye.text.to_string(),
-                        )));
-                    }
-
-                    if let Some(Tagged { body, .. }) = tagged {
-                        let text = body.text.to_string();
-                        let err = match body.kind {
-                            StatusKind::Ok => ImapIdleError::Ok(text),
-                            StatusKind::No => ImapIdleError::No(text),
-                            StatusKind::Bad => ImapIdleError::Bad(text),
-                        };
+                    if let Some(bye) = out.bye {
+                        let err = ImapIdleError::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    if cr.is_none() {
-                        return ImapCoroutineState::Complete(Err(
-                            ImapIdleError::ContinuationRequest,
-                        ));
+                    if let Some(Tagged { body, .. }) = out.tagged {
+                        let err = match body.kind {
+                            StatusKind::Ok => ImapIdleError::UnexpectedTagged,
+                            StatusKind::No => ImapIdleError::No(body.text.to_string()),
+                            StatusKind::Bad => ImapIdleError::Bad(body.text.to_string()),
+                        };
+
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    // Unsolicited responses can piggy-back on the
-                    // continuation-request frame (`+ idling\r\n*
-                    // FETCH …`). The inner `SendImapCommand` already
-                    // parsed them into `data` / `untagged`; surface
-                    // them now so the caller sees the changes
-                    // immediately instead of waiting for the next
-                    // socket read.
+                    if out.continuation_request.is_none() {
+                        let err = ImapIdleError::ExpectedContinuationRequest;
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
                     self.state = State::Read;
-                    if !data.is_empty() || !untagged.is_empty() {
-                        return ImapCoroutineState::Yielded(ImapIdleYield::Event(ImapIdleEvent {
-                            data,
-                            untagged,
-                        }));
+
+                    if !out.data.is_empty() || !out.untagged.is_empty() {
+                        let event = ImapIdleEvent {
+                            data: out.data,
+                            untagged: out.untagged,
+                        };
+
+                        return ImapCoroutineState::Yielded(ImapIdleYield::Event(event));
                     }
                 }
                 State::Read => {
                     let done = self.done.load(Ordering::SeqCst);
                     #[cfg(feature = "client")]
-                    let timed_out = self
-                        .timer
-                        .as_ref()
-                        .map(|t| t.elapsed() >= IDLE_DEFAULT_TIMEOUT)
-                        .unwrap_or(false);
+                    let timed_out = self.timed_out();
                     #[cfg(not(feature = "client"))]
                     let timed_out = false;
 
                     if done || timed_out {
                         trace!("idle done: {done}");
                         trace!("idle timed out: {timed_out}");
-                        self.state =
-                            State::Done(SendImapCommand::new(IdleDoneCodec::new(), IdleDone));
+                        let send = SendImapCommand::new(IdleDoneCodec::new(), IdleDone);
+                        self.state = State::Done(send);
                         continue;
                     }
 
@@ -262,9 +265,9 @@ impl ImapCoroutine for ImapIdle {
                         Some(&[]) => {
                             return ImapCoroutineState::Complete(Err(ImapIdleError::Eof));
                         }
-                        Some(data) => {
-                            trace!("read bytes: {}", escape_byte_string(data));
-                            fragmentizer.enqueue_bytes(data);
+                        Some(bytes) => {
+                            trace!("read bytes: {}", escape_byte_string(bytes));
+                            fragmentizer.enqueue_bytes(bytes);
                         }
                         None => {
                             self.wants_read = true;
@@ -290,13 +293,13 @@ impl ImapCoroutine for ImapIdle {
                                         self.untagged.push(status.into_static());
                                     }
                                     Ok(Response::Status(Status::Tagged(_))) => {
-                                        // ignore tagged
+                                        // ignore tagged during IDLE.
                                     }
                                     Ok(Response::Status(Status::Bye(bye))) => {
                                         self.bye.replace(bye.into_static());
                                     }
                                     Ok(Response::CommandContinuationRequest(_)) => {
-                                        // ignore continuation request
+                                        // ignore continuation request during IDLE.
                                     }
                                     Err(decode_err) => {
                                         let bytes = fragmentizer.message_bytes();
@@ -322,45 +325,33 @@ impl ImapCoroutine for ImapIdle {
                                 trace!("read literal fragment ({} bytes)", bytes.len());
                             }
                             None => {
-                                return ImapCoroutineState::Yielded(ImapIdleYield::Event(
-                                    ImapIdleEvent {
-                                        data: mem::take(&mut self.data),
-                                        untagged: mem::take(&mut self.untagged),
-                                    },
-                                ));
+                                let event = ImapIdleEvent {
+                                    data: mem::take(&mut self.data),
+                                    untagged: mem::take(&mut self.untagged),
+                                };
+
+                                return ImapCoroutineState::Yielded(ImapIdleYield::Event(event));
                             }
                         }
                     }
                 }
-                State::Done(coroutine) => {
-                    let (tagged, bye) = match coroutine.resume(fragmentizer, arg.take()) {
-                        SendImapCommandResult::WantsRead => {
-                            return ImapCoroutineState::Yielded(ImapIdleYield::WantsRead);
-                        }
-                        SendImapCommandResult::WantsWrite(bytes) => {
-                            return ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes));
-                        }
-                        SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-                        SendImapCommandResult::Err(err) => {
-                            return ImapCoroutineState::Complete(Err(err.into()));
-                        }
-                    };
+                State::Done(send) => {
+                    let out = imap_try!(send, fragmentizer, arg.take());
 
-                    if let Some(bye) = bye {
-                        return ImapCoroutineState::Complete(Err(ImapIdleError::Bye(
-                            bye.text.to_string(),
-                        )));
+                    if let Some(bye) = out.bye {
+                        let err = ImapIdleError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    let Some(Tagged { body, .. }) = tagged else {
-                        return ImapCoroutineState::Complete(Err(ImapIdleError::Tagged));
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        return ImapCoroutineState::Complete(Err(ImapIdleError::MissingTagged));
                     };
 
                     #[cfg(feature = "client")]
                     let timed_out = self
                         .timer
                         .take()
-                        .map(|t| t.elapsed() >= IDLE_DEFAULT_TIMEOUT)
+                        .map(|t| t.elapsed() >= self.timeout())
                         .unwrap_or(false);
                     #[cfg(not(feature = "client"))]
                     let timed_out = false;
@@ -368,11 +359,12 @@ impl ImapCoroutine for ImapIdle {
                     return match body.kind {
                         StatusKind::Ok if timed_out => {
                             trace!("reached timeout, starting a new IDLE command");
-                            // SAFETY: tag is always valid
-                            let command =
-                                Command::new(self.tag.generate(), CommandBody::Idle).unwrap();
-                            self.state =
-                                State::Idle(SendImapCommand::new(CommandCodec::new(), command));
+                            let command = Command {
+                                tag: self.tag.generate(),
+                                body: CommandBody::Idle,
+                            };
+                            let send = SendImapCommand::new(CommandCodec::new(), command);
+                            self.state = State::Idle(send);
                             continue;
                         }
                         StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
@@ -386,5 +378,198 @@ impl ImapCoroutine for ImapIdle {
                 }
             }
         }
+    }
+}
+
+enum State {
+    /// Send the IDLE command and await the continuation request.
+    Idle(SendImapCommand<CommandCodec>),
+    /// Read unilateral responses until the shutdown flag is set or the refresh
+    /// timeout elapses.
+    Read,
+    /// Send the DONE command and await the tagged response.
+    Done(SendImapCommand<IdleDoneCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle(_) => f.write_str("send idle"),
+            Self::Read => f.write_str("read events"),
+            Self::Done(_) => f.write_str("send done"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::borrow::ToOwned;
+
+    use super::*;
+
+    /// Happy path: client sends `IDLE`, server replies with the
+    /// continuation request, caller flips the shutdown flag, client
+    /// sends `DONE`, server returns tagged OK.
+    #[test]
+    fn shutdown_returns_ok() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.trim_end().ends_with("IDLE"));
+
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        done.store(true, Ordering::SeqCst);
+        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        assert_eq!(b"DONE\r\n", &*bytes);
+
+        expect_wants_read(&mut idle, &mut frag);
+
+        let reply = format!("{tag} OK IDLE terminated\r\n");
+        expect_complete_ok(&mut idle, &mut frag, reply.as_bytes());
+    }
+
+    /// Unilateral responses arriving during the read phase are
+    /// emitted as a single `Event`.
+    #[test]
+    fn unsolicited_during_read_yields_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        let event = expect_event(&mut idle, &mut frag, b"* 5 EXISTS\r\n");
+        assert_eq!(1, event.data.len());
+        assert!(event.untagged.is_empty());
+    }
+
+    /// Server piggy-backs unsolicited responses on the continuation
+    /// request frame: the coroutine emits them immediately, then
+    /// transitions to the read phase.
+    #[test]
+    fn unsolicited_piggyback_on_continuation_yields_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_read(&mut idle, &mut frag);
+
+        let event = expect_event(&mut idle, &mut frag, b"+ idling\r\n* 10 EXISTS\r\n");
+        assert_eq!(1, event.data.len());
+    }
+
+    /// Tagged BAD before the continuation request: surface text
+    /// verbatim.
+    #[test]
+    fn idle_tagged_bad_returns_bad_error() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut idle, &mut frag);
+
+        let reply = format!("{tag} BAD IDLE not supported\r\n");
+        let err = expect_complete_err(&mut idle, &mut frag, reply.as_bytes());
+        let ImapIdleError::Bad(text) = err else {
+            panic!("expected ImapIdleError::Bad, got {err:?}");
+        };
+        assert_eq!(text, "IDLE not supported");
+    }
+
+    /// Tagged NO returned after DONE: surface text verbatim.
+    #[test]
+    fn done_tagged_no_returns_no_error() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        done.store(true, Ordering::SeqCst);
+        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_read(&mut idle, &mut frag);
+
+        let reply = format!("{tag} NO IDLE aborted\r\n");
+        let err = expect_complete_err(&mut idle, &mut frag, reply.as_bytes());
+        let ImapIdleError::No(text) = err else {
+            panic!("expected ImapIdleError::No, got {err:?}");
+        };
+        assert_eq!(text, "IDLE aborted");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapIdle,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapIdle, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapIdleYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read_after(cor: &mut ImapIdle, frag: &mut Fragmentizer, arg: &[u8]) {
+        match cor.resume(frag, Some(arg)) {
+            ImapCoroutineState::Yielded(ImapIdleYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_event(cor: &mut ImapIdle, frag: &mut Fragmentizer, arg: &[u8]) -> ImapIdleEvent {
+        match cor.resume(frag, Some(arg)) {
+            ImapCoroutineState::Yielded(ImapIdleYield::Event(event)) => event,
+            state => panic!("expected Event, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(cor: &mut ImapIdle, frag: &mut Fragmentizer, reply: &[u8]) {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(())) => {}
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapIdle,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapIdleError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
