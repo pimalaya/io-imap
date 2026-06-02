@@ -407,19 +407,21 @@ impl ImapClientStd {
         self.run(ImapAuthAnonymous::new(params, true, auto_id))
     }
 
-    /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy two-prompt
-    /// mechanism) with `ensure_capabilities=true`. Prefer [`auth_plain`] or
-    /// [`auth_scram_sha256`] when the server supports them. Honours
+    /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy
+    /// two-prompt mechanism). `opts.initial_request` selects between
+    /// the non-IR and SASL-IR (RFC 4959) flows. Prefer [`auth_plain`]
+    /// or [`auth_scram_sha256`] when the server supports them. Honours
     /// [`Self::auto_id`].
     ///
     /// [`auth_plain`]: ImapClientStd::auth_plain
     /// [`auth_scram_sha256`]: ImapClientStd::auth_scram_sha256
     pub fn auth_login(
         &mut self,
-        params: ImapAuthLoginParams,
+        user: impl AsRef<str>,
+        password: impl AsRef<str>,
+        opts: ImapAuthLoginOptions,
     ) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        let auto_id = self.auto_id.take();
-        self.run(ImapAuthLogin::new(params, true, auto_id))
+        self.run(ImapAuthLogin::new(user, password, opts))
     }
 
     /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616) with
