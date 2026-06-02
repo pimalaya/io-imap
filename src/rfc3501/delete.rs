@@ -1,4 +1,9 @@
-//! I/O-free coroutine to send an IMAP DELETE command.
+//! I/O-free coroutine to send an IMAP DELETE command (RFC 3501 §6.3.4).
+//!
+//! Asks the server to permanently remove a mailbox. No state is returned;
+//! success is signalled by the tagged OK alone.
+
+use core::fmt;
 
 use alloc::string::{String, ToString};
 
@@ -12,44 +17,48 @@ use imap_codec::{
         response::{StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::{rfc3501::mailbox::encode_inplace, send::*};
+use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during DELETE progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxDeleteError {
-    #[error("IMAP DELETE NO error: {0}")]
+    #[error("IMAP DELETE failed: NO {0}")]
     No(String),
-    #[error("IMAP DELETE BAD error: {0}")]
+    #[error("IMAP DELETE failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP DELETE BYE error: {0}")]
+    #[error("IMAP DELETE failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP DELETE tagged response returned by the server")]
+    #[error("IMAP DELETE failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP DELETE command error")]
+    #[error("IMAP DELETE failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP DELETE command.
+/// I/O-free IMAP DELETE coroutine.
 pub struct ImapMailboxDelete {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapMailboxDelete {
-    /// Creates a new coroutine.
+    /// Creates a new DELETE coroutine.
     pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
-        let body = CommandBody::Delete { mailbox };
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), body).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Delete { mailbox },
+        };
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
     }
 }
 
@@ -62,37 +71,173 @@ impl ImapCoroutine for ImapMailboxDelete {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-            }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
-        };
+        loop {
+            trace!("delete: {}", self.state);
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapMailboxDeleteError::Bye(
-                bye.text.to_string(),
-            )));
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapMailboxDeleteError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapMailboxDeleteError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    return match body.kind {
+                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                        StatusKind::No => {
+                            let err = ImapMailboxDeleteError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapMailboxDeleteError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
+            }
         }
+    }
+}
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapMailboxDeleteError::MissingTagged));
-        };
+enum State {
+    /// Send DELETE and await the tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
 
-        match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-            StatusKind::No => {
-                ImapCoroutineState::Complete(Err(ImapMailboxDeleteError::No(body.text.to_string())))
-            }
-            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMailboxDeleteError::Bad(
-                body.text.to_string(),
-            ))),
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send delete"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, vec::Vec};
+
+    use super::*;
+
+    /// Happy path: tagged OK closes the command.
+    #[test]
+    fn success_returns_ok() {
+        let mut delete = ImapMailboxDelete::new("Archive".try_into().expect("valid mailbox"));
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut delete, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.contains("DELETE Archive"));
+
+        expect_wants_read(&mut delete, &mut frag);
+
+        let reply = format!("{tag} OK DELETE completed\r\n");
+        expect_complete_ok(&mut delete, &mut frag, reply.as_bytes());
+    }
+
+    /// Tagged NO (e.g. mailbox does not exist): surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut delete = ImapMailboxDelete::new("Archive".try_into().expect("valid mailbox"));
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut delete, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut delete, &mut frag);
+
+        let reply = format!("{tag} NO mailbox does not exist\r\n");
+        let err = expect_complete_err(&mut delete, &mut frag, reply.as_bytes());
+        let ImapMailboxDeleteError::No(text) = err else {
+            panic!("expected ImapMailboxDeleteError::No, got {err:?}");
+        };
+        assert_eq!(text, "mailbox does not exist");
+    }
+
+    /// Tagged BAD: surface text verbatim.
+    #[test]
+    fn tagged_bad_returns_bad_error() {
+        let mut delete = ImapMailboxDelete::new("Archive".try_into().expect("valid mailbox"));
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut delete, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut delete, &mut frag);
+
+        let reply = format!("{tag} BAD DELETE syntax error\r\n");
+        let err = expect_complete_err(&mut delete, &mut frag, reply.as_bytes());
+        let ImapMailboxDeleteError::Bad(text) = err else {
+            panic!("expected ImapMailboxDeleteError::Bad, got {err:?}");
+        };
+        assert_eq!(text, "DELETE syntax error");
+    }
+
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut delete = ImapMailboxDelete::new("Archive".try_into().expect("valid mailbox"));
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut delete, &mut frag, None);
+        expect_wants_read(&mut delete, &mut frag);
+
+        let err = expect_complete_err(&mut delete, &mut frag, b"* BYE going down\r\n");
+        let ImapMailboxDeleteError::Bye(text) = err else {
+            panic!("expected ImapMailboxDeleteError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "going down");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapMailboxDelete,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapMailboxDelete, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(cor: &mut ImapMailboxDelete, frag: &mut Fragmentizer, reply: &[u8]) {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(())) => {}
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapMailboxDelete,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMailboxDeleteError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
