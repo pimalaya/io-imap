@@ -1,6 +1,9 @@
-//! I/O-free coroutine to send an IMAP EXPUNGE command.
+//! I/O-free coroutine to send an IMAP EXPUNGE command (RFC 3501 §6.4.3).
+//!
+//! Permanently removes all messages in the selected mailbox that are flagged
+//! `\Deleted`. Returns the list of expunged sequence numbers in server order.
 
-use core::num::NonZeroU32;
+use core::{fmt, num::NonZeroU32};
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -13,42 +16,52 @@ use imap_codec::{
         response::{Data, StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::send::*;
+use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during EXPUNGE progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxExpungeError {
-    #[error("IMAP EXPUNGE NO error: {0}")]
+    #[error("IMAP EXPUNGE failed: NO {0}")]
     No(String),
-    #[error("IMAP EXPUNGE BAD error: {0}")]
+    #[error("IMAP EXPUNGE failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP EXPUNGE BYE error: {0}")]
+    #[error("IMAP EXPUNGE failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP EXPUNGE tagged response returned by the server")]
+    #[error("IMAP EXPUNGE failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP EXPUNGE command error")]
+    #[error("IMAP EXPUNGE failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP EXPUNGE command.
+/// I/O-free IMAP EXPUNGE coroutine.
 pub struct ImapMailboxExpunge {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapMailboxExpunge {
-    /// Creates a new coroutine.
+    /// Creates a new EXPUNGE coroutine.
     pub fn new() -> Self {
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), CommandBody::Expunge).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Expunge,
+        };
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
+    }
+}
+
+impl Default for ImapMailboxExpunge {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -61,52 +74,188 @@ impl ImapCoroutine for ImapMailboxExpunge {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-            }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok {
-                data, tagged, bye, ..
-            } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
-        };
+        loop {
+            trace!("expunge: {}", self.state);
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::Bye(
-                bye.text.to_string(),
-            )));
-        }
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::MissingTagged));
-        };
+                    if let Some(bye) = out.bye {
+                        let err = ImapMailboxExpungeError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
-        let mut expunged = Vec::new();
-        for data in data {
-            if let Data::Expunge(seq) = data {
-                expunged.push(seq);
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapMailboxExpungeError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    let mut expunged = Vec::new();
+                    for data in out.data {
+                        if let Data::Expunge(seq) = data {
+                            expunged.push(seq);
+                        }
+                    }
+
+                    return match body.kind {
+                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(expunged)),
+                        StatusKind::No => {
+                            let err = ImapMailboxExpungeError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapMailboxExpungeError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
             }
-        }
-
-        match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Complete(Ok(expunged)),
-            StatusKind::No => ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::No(
-                body.text.to_string(),
-            ))),
-            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapMailboxExpungeError::Bad(
-                body.text.to_string(),
-            ))),
         }
     }
 }
 
-impl Default for ImapMailboxExpunge {
-    fn default() -> Self {
-        Self::new()
+enum State {
+    /// Send EXPUNGE and await the tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send expunge"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::borrow::ToOwned;
+
+    use super::*;
+
+    /// Happy path: server emits `* N EXPUNGE` lines for each removed
+    /// message, then tagged OK; the coroutine returns the sequence
+    /// numbers in server order.
+    #[test]
+    fn success_collects_expunged_seqs() {
+        let mut expunge = ImapMailboxExpunge::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut expunge, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.trim_end().ends_with("EXPUNGE"));
+
+        expect_wants_read(&mut expunge, &mut frag);
+
+        let reply =
+            format!("* 3 EXPUNGE\r\n* 3 EXPUNGE\r\n* 7 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n",);
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        assert_eq!(3, seqs.len());
+        assert_eq!(3, seqs[0].get());
+        assert_eq!(3, seqs[1].get());
+        assert_eq!(7, seqs[2].get());
+    }
+
+    /// Happy path with nothing to expunge: empty list, still Ok.
+    #[test]
+    fn empty_returns_empty_vec() {
+        let mut expunge = ImapMailboxExpunge::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut expunge, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut expunge, &mut frag);
+
+        let reply = format!("{tag} OK EXPUNGE completed\r\n");
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        assert!(seqs.is_empty());
+    }
+
+    /// Tagged NO: surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut expunge = ImapMailboxExpunge::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut expunge, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut expunge, &mut frag);
+
+        let reply = format!("{tag} NO mailbox is read-only\r\n");
+        let err = expect_complete_err(&mut expunge, &mut frag, reply.as_bytes());
+        let ImapMailboxExpungeError::No(text) = err else {
+            panic!("expected ImapMailboxExpungeError::No, got {err:?}");
+        };
+        assert_eq!(text, "mailbox is read-only");
+    }
+
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut expunge = ImapMailboxExpunge::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut expunge, &mut frag, None);
+        expect_wants_read(&mut expunge, &mut frag);
+
+        let err = expect_complete_err(&mut expunge, &mut frag, b"* BYE going down\r\n");
+        let ImapMailboxExpungeError::Bye(text) = err else {
+            panic!("expected ImapMailboxExpungeError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "going down");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapMailboxExpunge,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapMailboxExpunge, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapMailboxExpunge,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> Vec<NonZeroU32> {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapMailboxExpunge,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMailboxExpungeError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
