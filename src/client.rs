@@ -263,8 +263,8 @@ impl ImapClientStd {
         self.stream = Box::new(stream);
     }
 
-    /// Drives a standard-shape coroutine to completion. Richer yields
-    /// (IDLE events, watch deltas) need their own per-method loops.
+    /// Drives a standard-shape coroutine to completion. Richer yields (IDLE
+    /// events, watch deltas) need their own per-method loops.
     pub fn run<C, T, E>(&mut self, mut coroutine: C) -> Result<T, ImapClientStdError>
     where
         C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
@@ -942,9 +942,9 @@ fn run_starttls(
     }
 }
 
-/// Auto-implemented for `Read + Write + Send + 'static`. `as_any_mut`
-/// supports downcasting back to the concrete stream when needed
-/// (e.g. for `set_read_timeout`).
+/// Auto-implemented for `Read + Write + Send + 'static`. `as_any_mut` supports
+/// downcasting back to the concrete stream when needed (e.g. for
+/// `set_read_timeout`).
 pub trait ImapStream: Read + Write + Send + Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
