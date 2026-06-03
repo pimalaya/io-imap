@@ -13,7 +13,7 @@ This library is composed of 3 feature-gated layers:
 - [Features](#features)
 - [RFC coverage](#rfc-coverage)
 - [Usage](#usage)
-  - [I/O-free coroutines](#io-free-coroutines)
+  - [Coroutine](#coroutine)
   - [Light client](#light-client)
   - [Full client](#full-client)
 - [Examples](#examples)
@@ -68,83 +68,96 @@ This library is composed of 3 feature-gated layers:
 
 ## Usage
 
-I/O-IMAP can be consumed three ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
+I/O IMAP can be consumed at three layers, depending on how much of the I/O stack you want to own:
 
-Whichever mode you pick, every coroutine implements the `ImapCoroutine` trait (in `crate::coroutine`). Its `resume(&mut Fragmentizer, Option<&[u8]>)` method returns an `ImapCoroutineState<Yield, Return>` with two shapes:
+- **Coroutines**: `no_std`-friendly state machines. You own the socket and the bytes; the library produces commands and parses responses. Works under any blocking, async, or fuzz harness.
+- **Light client** (`client` feature): a `Read + Write` wrapper exposing one method per IMAP command. You still open the socket and negotiate TLS, then hand over a ready stream.
+- **Full client** (`rustls-ring` / `rustls-aws` / `native-tls`): TCP, TLS, greeting and SASL handled for you; pass in a URL + SASL config, get back an authenticated session.
 
-- `Yielded(yield)`: intermediate progression carrying the coroutine's `Yield` associated type. For the standard `ImapYield`, that is `WantsRead` (caller reads more bytes and feeds them back; pass `Some(&[])` to signal EOF) or `WantsWrite(Vec<u8>)` (caller writes these bytes; the next call typically passes `None`). Streaming coroutines (`ImapIdle`, `ImapMailboxWatch`) and `ImapStartTls` declare their own `Yield` enums mixing the standard I/O variants with extra variants (`Event(...)`, `WantsStartTls(...)`).
-- `Complete(result)`: terminal payload, by convention `Result<Output, Error>`. The "ok" arm carries the coroutine's final output; the "error" arm carries the cause.
+Every coroutine implements the `ImapCoroutine` trait (`crate::coroutine`). `resume(&mut Fragmentizer, Option<&[u8]>)` returns `ImapCoroutineState<Yield, Return>`:
 
-### I/O-free coroutines
+- `Yielded(y)`: intermediate progress. The standard `ImapYield` is `WantsRead` (caller reads more bytes and feeds them back; pass `Some(&[])` on EOF) or `WantsWrite(Vec<u8>)` (caller writes these bytes; next resume usually takes `None`). Coroutines that surface domain events (`ImapIdle`, `ImapMailboxWatch`) declare their own `Yield` enum with an extra `Event(...)` variant.
+- `Complete(result)`: terminal payload, `Result<Output, Error>`.
 
-No features required: works in `#![no_std]`, no sockets, no async runtime. You own the loop and the bytes; the library only produces command bytes and consumes server responses.
+The three snippets below all connect to a server (`HOST` / `PORT` env vars; `URL` for the full client), read the greeting, and print the CAPABILITY list. They are the verbatim sources of `cargo run --example <name>`.
 
-Read the IMAP greeting against a blocking TCP socket (the same shape works under async, fuzzing, or in-memory replay):
+### Coroutine
 
-```rust,no_run
-use std::{io::Read, net::TcpStream};
-
-use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::greeting::*};
-
-let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
-let mut buf = [0u8; 16 * 1024];
-let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
-
-let mut coroutine = ImapGreetingGet::new(true);
-let mut arg: Option<&[u8]> = None;
-
-let capability = loop {
-    match coroutine.resume(&mut fragmentizer, arg.take()) {
-        ImapCoroutineState::Complete(Ok(ImapGreetingOk { capability, .. })) => break capability,
-        ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
-        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-            let n = stream.read(&mut buf).unwrap();
-            arg = Some(&buf[..n]);
-        }
-        ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => unreachable!(),
-    }
-};
-```
-
-Drive a multi-step command (LIST) the same way:
+No io-imap features required. The same shape works under async or fuzz harnesses, only the I/O glue changes.
 
 ```rust,no_run
-use std::{io::{Read, Write}, net::TcpStream};
-
-use imap_codec::imap_types::mailbox::{ListMailbox, Mailbox};
-use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::list::*};
-
-# let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
-# let mut buf = [0u8; 16 * 1024];
-# let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
-let reference = Mailbox::try_from("").unwrap();
-let pattern = ListMailbox::try_from("*").unwrap();
-let mut coroutine = ImapMailboxList::new(reference, pattern);
-let mut arg: Option<&[u8]> = None;
-
-let mailboxes = loop {
-    match coroutine.resume(&mut fragmentizer, arg.take()) {
-        ImapCoroutineState::Complete(Ok(mailboxes)) => break mailboxes,
-        ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
-        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-            let n = stream.read(&mut buf).unwrap();
-            arg = Some(&buf[..n]);
-        }
-        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-            stream.write_all(&bytes).unwrap();
-            arg = None;
-        }
-    }
+use std::{
+    env,
+    error::Error,
+    io::{Read, Write},
+    net::TcpStream,
+    sync::Arc,
 };
 
-for (mailbox, _delimiter, _flags) in mailboxes {
-    println!("{mailbox:?}");
+use io_imap::{
+    codec::fragmentizer::Fragmentizer,
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+    rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions},
+};
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_platform_verifier::ConfigVerifierExt;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+
+    let host = env::var("HOST").unwrap();
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(993);
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let config = Arc::new(ClientConfig::with_platform_verifier()?);
+    let server_name = rustls::pki_types::ServerName::try_from(host.as_str())?.to_owned();
+    let tls = ClientConnection::new(config, server_name)?;
+    let sock = TcpStream::connect((host.as_str(), port))?;
+    let mut stream = StreamOwned::new(tls, sock);
+
+    let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+    let mut buf = [0u8; 4096];
+
+    let opts = ImapGreetingGetOptions {
+        ensure_capabilities: true,
+    };
+    let mut coroutine = ImapGreetingGet::new(opts);
+    let mut arg = None;
+
+    let greeting = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                stream.write_all(&bytes)?;
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                let n = stream.read(&mut buf)?;
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::Complete(Ok(greeting)) => break greeting,
+            ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+        }
+    };
+
+    for capability in greeting.capability {
+        println!("{capability:?}");
+    }
+
+    Ok(())
 }
 ```
 
+> [!INFO]
+> See the tokio-based alternative at [examples/tokio_coroutine.rs](https://github.com/pimalaya/io-imap/blob/master/examples/tokio_coroutine.rs).
+
 ### Light client
 
-Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Read + Write` and exposes one method per IMAP command. You still open the TCP socket, run TLS / STARTTLS yourself, authenticate, and hand over a ready-to-talk stream; the client takes it from there.
+Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Read + Write` and exposes one method per IMAP command. You still open the TCP socket, negotiate TLS, authenticate; the client takes it from there.
 
 ```toml,ignore
 [dependencies]
@@ -152,27 +165,45 @@ io-imap = { version = "0.0.1", default-features = false, features = ["client"] }
 ```
 
 ```rust,no_run
-use std::net::TcpStream;
+use std::{env, error::Error, net::TcpStream, sync::Arc};
 
 use io_imap::client::ImapClientStd;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_platform_verifier::ConfigVerifierExt;
 
-let stream = TcpStream::connect("imap.example.com:143")?;
-let mut client = ImapClientStd::new(stream);
+fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
 
-let capabilities = client.greeting()?;
-println!("server capabilities: {capabilities:?}");
+    let host = env::var("HOST").unwrap();
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(993);
 
-let reference = "".try_into()?;
-let pattern = "*".try_into()?;
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
-for (mailbox, _, _) in client.list(reference, pattern)? {
-    println!("{mailbox:?}");
+    let config = Arc::new(ClientConfig::with_platform_verifier()?);
+    let server_name = rustls::pki_types::ServerName::try_from(host.as_str())?.to_owned();
+    let tls = ClientConnection::new(config, server_name)?;
+    let sock = TcpStream::connect((host.as_str(), port))?;
+    let stream = StreamOwned::new(tls, sock);
+
+    let mut client = ImapClientStd::new(stream);
+    let capabilities = client.greeting()?;
+
+    for capability in capabilities {
+        println!("{capability:?}");
+    }
+
+    Ok(())
 }
 ```
 
 ### Full client
 
-Enable one of the TLS feature flags: `rustls-ring` (default), `rustls-aws`, or `native-tls`. `ImapClientStd::connect(url, tls, starttls, sasl)` opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream), drives the optional STARTTLS upgrade, reads the greeting + capability list, and runs the chosen SASL mechanism, returning a ready-to-use authenticated client.
+Enable one of the TLS feature flags: `rustls-ring` (default), `rustls-aws`, or `native-tls`. `ImapClientStd::connect(url, tls, starttls, sasl, auto_id)` opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream), drives the optional STARTTLS upgrade, reads the greeting + capability list, and runs the chosen SASL mechanism, returning a ready-to-use authenticated client.
 
 ```toml,ignore
 [dependencies]
@@ -180,23 +211,26 @@ io-imap = { version = "0.0.1", default-features = false, features = ["rustls-rin
 ```
 
 ```rust,no_run
+use std::{env, error::Error};
+
 use io_imap::client::ImapClientStd;
-use pimalaya_stream::{sasl::SaslLogin, tls::Tls};
-use secrecy::SecretString;
+use pimalaya_stream::{sasl::Sasl, tls::Tls};
 use url::Url;
 
-let url = Url::parse("imaps://imap.example.com")?;
-let tls = Tls::default();
-let sasl = SaslLogin {
-    username: "alice@example.com".into(),
-    password: SecretString::from("hunter2".to_owned()),
-};
+fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
 
-let (mut client, _capability) = ImapClientStd::connect(&url, &tls, false, Some(sasl))?;
+    let url = env::var("URL").unwrap();
+    let url = Url::parse(&url)?;
+    let tls = Tls::default();
 
-// session is already authenticated; issue further commands directly
-for (mailbox, _, _) in client.list("".try_into()?, "*".try_into()?)? {
-    println!("{mailbox:?}");
+    let (_client, capabilities) = ImapClientStd::connect(&url, &tls, false, None::<Sasl>, None)?;
+
+    for capability in capabilities {
+        println!("{capability:?}");
+    }
+
+    Ok(())
 }
 ```
 
@@ -204,7 +238,7 @@ The `sasl` argument is `Option<impl Into<Sasl>>`, so any of the per-mechanism st
 
 ## Examples
 
-See complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).
+See the complete examples at [./examples](https://github.com/pimalaya/io-imap/blob/master/examples).
 
 Have also a look at real-world projects built on top of this library:
 

@@ -17,7 +17,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["client"]
+default = ["scram", "rustls-ring"]
 scram = ["dep:hmac", "dep:pbkdf2", "dep:rand", "dep:sha2"]
 client = []
 rustls-ring = ["client", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:url"]
@@ -26,8 +26,30 @@ native-tls = ["client", "pimalaya-stream/native-tls", "dep:anyhow", "dep:url"]
 vendored = ["pimalaya-stream?/vendored"]
 
 [dev-dependencies]
-ctrlc = "3.5"
 env_logger = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-platform-verifier = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-rustls = "0.26"
+url = "2"
+
+[[example]]
+name = "std_coroutine"
+path = "examples/std_coroutine.rs"
+
+[[example]]
+name = "tokio_coroutine"
+path = "examples/tokio_coroutine.rs"
+
+[[example]]
+name = "std_client_light"
+path = "examples/std_client_light.rs"
+required-features = ["client"]
+
+[[example]]
+name = "std_client_full"
+path = "examples/std_client_full.rs"
+required-features = ["rustls-ring"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
