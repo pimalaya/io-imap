@@ -903,7 +903,7 @@ impl ImapClientStd {
     ///
     /// - `imap://`  goes through plain TCP (port defaults to 143).
     /// - `imaps://` goes through implicit TLS (port defaults to 993).
-    /// - `tls` carries the rustls/native-tls knobs *and* the ALPN list
+    /// - `tls` carries the rustls/native-tls options *and* the ALPN list
     ///   (see [`default_alpn`] for the IMAP-conformant `["imap"]`).
     ///   Set `tls.rustls.alpn` to an empty vec to skip ALPN.
     /// - `starttls = true` (only valid on `imap://`) performs the IMAP

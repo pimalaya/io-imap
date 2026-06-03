@@ -58,7 +58,7 @@ pub enum ImapMailboxExamineError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Optional knobs for [`ImapMailboxExamine::new`].
+/// Options for [`ImapMailboxExamine::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMailboxExamineOptions {
     /// SELECT/EXAMINE parameters (RFC 4466). Pass CONDSTORE

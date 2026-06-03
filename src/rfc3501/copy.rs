@@ -48,7 +48,7 @@ pub enum ImapMessageCopyError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Optional knobs for [`ImapMessageCopy::new`].
+/// Options for [`ImapMessageCopy::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageCopyOptions {
     /// When `true`, send `UID COPY` (RFC 3501 §6.4.8); the `sequence_set` then

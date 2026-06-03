@@ -47,7 +47,7 @@ pub enum ImapMessageAppendError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Optional knobs for [`ImapMessageAppend::new`].
+/// Options for [`ImapMessageAppend::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageAppendOptions {
     /// Per-message flags attached on append. Default: empty (server applies no

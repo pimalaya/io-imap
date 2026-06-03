@@ -105,7 +105,7 @@ impl From<ImapYield> for ImapIdleYield {
     }
 }
 
-/// Optional knobs for [`ImapIdle::new`].
+/// Options for [`ImapIdle::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapIdleOptions {
     /// Server-side refresh interval. When the `client` feature is on and the

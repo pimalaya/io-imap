@@ -49,13 +49,13 @@ pub enum ImapMessageFetchError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Optional knobs for [`ImapMessageFetch::new`] and
+/// Options for [`ImapMessageFetch::new`] and
 /// [`ImapMessageFetchFirst::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageFetchOptions {
-    /// When `true`, send `UID FETCH` (RFC 3501 §6.4.8); the
-    /// `sequence_set` / `id` then holds UIDs rather than sequence
-    /// numbers. Default: `false` (plain `FETCH` on sequence numbers).
+    /// When `true`, send `UID FETCH` (RFC 3501 §6.4.8); the `sequence_set` /
+    /// `id` then holds UIDs rather than sequence numbers. Default: `false`
+    /// (plain `FETCH` on sequence numbers).
     pub uid: bool,
     /// FETCH modifiers (RFC 4466). Pass
     /// `[FetchModifier::ChangedSince(m)]` for CONDSTORE-style

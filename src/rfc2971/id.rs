@@ -39,7 +39,7 @@ pub enum ImapServerIdError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Optional knobs for [`ImapServerId::new`].
+/// Options for [`ImapServerId::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapServerIdOptions {
     /// Parameter list sent on the wire. When `None`, the coroutine sends `ID
