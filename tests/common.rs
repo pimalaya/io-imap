@@ -46,7 +46,9 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     // ── GREETING + CAPABILITY ─────────────────────────────────────────────────
 
-    let mut coroutine = ImapGreetingGet::new(true);
+    let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions {
+        ensure_capabilities: true,
+    });
     let mut arg: Option<&[u8]> = None;
 
     loop {

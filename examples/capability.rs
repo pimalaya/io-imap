@@ -20,7 +20,9 @@ fn main() {
     let tls = Tls::default();
     let mut stream = StreamStd::connect_tls(&host, port, &tls).unwrap();
 
-    let mut coroutine = ImapGreetingGet::new(true);
+    let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions {
+        ensure_capabilities: true,
+    });
     let mut arg: Option<&[u8]> = None;
     let mut buf = [0u8; 16 * 1024];
 

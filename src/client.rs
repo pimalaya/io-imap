@@ -340,7 +340,11 @@ impl ImapClientStd {
     /// [`new`]: ImapClientStd::new
     /// [`connect`]: ImapClientStd::connect
     pub fn greeting(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
-        Ok(self.run(ImapGreetingGet::new(true))?.capability)
+        Ok(self
+            .run(ImapGreetingGet::new(ImapGreetingGetOptions {
+                ensure_capabilities: true,
+            }))?
+            .capability)
     }
 
     /// Runs [`ImapLogin`] (`LOGIN`, RFC 3501 §6.2.3). The connection

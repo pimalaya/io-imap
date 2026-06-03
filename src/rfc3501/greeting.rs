@@ -1,6 +1,12 @@
-//! I/O-free coroutine to read the greeting from an IMAP server.
+//! I/O-free coroutine to read the IMAP server greeting (RFC 3501 §7.1).
+//!
+//! Server-initiated: no command is sent. The coroutine drains bytes from the
+//! socket into the fragmentizer until a complete greeting line is available,
+//! then decodes it. If [`ImapGreetingGetOptions::ensure_capabilities`] is set
+//! and the greeting did not carry a `[CAPABILITY ...]` response code, an extra
+//! `CAPABILITY` round-trip runs before completing.
 
-use core::mem;
+use core::{fmt, mem};
 
 use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 
@@ -17,63 +23,63 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{coroutine::*, rfc3501::capability::*};
+use crate::{coroutine::*, imap_try, rfc3501::capability::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during greeting progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapGreetingGetError {
-    #[error("Reached unexpected EOF on IMAP stream")]
-    Eof,
-
-    #[error("Parse IMAP greeting error")]
-    DecodingFailure(Secret<Box<[u8]>>),
-    #[error("Parse IMAP greeting poisoned error")]
-    MessageIsPoisoned(Secret<Box<[u8]>>),
-    #[error("Parse IMAP greeting too long error")]
-    MessageTooLong(Secret<Box<[u8]>>),
-
-    #[error("Parse IMAP greeting BYE error: {0}")]
+    #[error("IMAP greeting failed: BYE {0}")]
     Bye(String),
+
+    #[error("IMAP greeting failed: reached unexpected EOF on stream")]
+    Eof,
+    #[error("IMAP greeting failed: decode error")]
+    DecodingFailure(Secret<Box<[u8]>>),
+    #[error("IMAP greeting failed: parse error: message is poisoned")]
+    MessageIsPoisoned(Secret<Box<[u8]>>),
+    #[error("IMAP greeting failed: parse error: message is too long")]
+    MessageTooLong(Secret<Box<[u8]>>),
 
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
 }
 
 /// Terminal success payload of [`ImapGreetingGet`].
+#[derive(Debug)]
 pub struct ImapGreetingOk {
     pub capability: Vec<Capability<'static>>,
     pub pre_authenticated: bool,
 }
 
-enum State {
-    Read,
-    Deserialize,
-    Capability(ImapCapabilityGet),
+/// Options for [`ImapGreetingGet::new`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImapGreetingGetOptions {
+    /// When `true` and the greeting carried no `[CAPABILITY ...]`
+    /// code, drive an extra `CAPABILITY` round-trip before completing.
+    /// Default: `false`.
+    pub ensure_capabilities: bool,
 }
 
-/// I/O-free coroutine to read the greeting from an IMAP server.
+/// I/O-free IMAP greeting-read coroutine.
 pub struct ImapGreetingGet {
     codec: GreetingCodec,
     state: State,
     wants_read: bool,
     observed: Vec<Capability<'static>>,
     pre_authenticated: bool,
-    ensure_capabilities: bool,
+    opts: ImapGreetingGetOptions,
 }
 
 impl ImapGreetingGet {
-    /// Creates a new coroutine. When `ensure_capabilities` is true and
-    /// the server did not piggyback a capability list on the greeting,
-    /// the coroutine drives an extra `CAPABILITY` round-trip before
-    /// completing.
-    pub fn new(ensure_capabilities: bool) -> Self {
+    /// Creates a new greeting coroutine.
+    pub fn new(opts: ImapGreetingGetOptions) -> Self {
         Self {
             codec: GreetingCodec::new(),
             state: State::Read,
             wants_read: false,
             observed: Vec::new(),
             pre_authenticated: false,
-            ensure_capabilities,
+            opts,
         }
     }
 }
@@ -88,6 +94,8 @@ impl ImapCoroutine for ImapGreetingGet {
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
+            trace!("greeting: {}", self.state);
+
             if mem::take(&mut self.wants_read) {
                 return ImapCoroutineState::Yielded(ImapYield::WantsRead);
             }
@@ -97,9 +105,9 @@ impl ImapCoroutine for ImapGreetingGet {
                     Some(&[]) => {
                         return ImapCoroutineState::Complete(Err(ImapGreetingGetError::Eof));
                     }
-                    Some(data) => {
-                        trace!("read bytes: {}", escape_byte_string(data));
-                        fragmentizer.enqueue_bytes(data);
+                    Some(bytes) => {
+                        trace!("read bytes: {}", escape_byte_string(bytes));
+                        fragmentizer.enqueue_bytes(bytes);
                         self.state = State::Deserialize;
                     }
                     None => {
@@ -117,9 +125,8 @@ impl ImapCoroutine for ImapGreetingGet {
 
                         match fragmentizer.decode_message(&self.codec) {
                             Ok(greeting) if greeting.kind == GreetingKind::Bye => {
-                                return ImapCoroutineState::Complete(Err(
-                                    ImapGreetingGetError::Bye(greeting.text.to_string()),
-                                ));
+                                let err = ImapGreetingGetError::Bye(greeting.text.to_string());
+                                return ImapCoroutineState::Complete(Err(err));
                             }
                             Ok(greeting) => {
                                 self.pre_authenticated = greeting.kind == GreetingKind::PreAuth;
@@ -128,7 +135,7 @@ impl ImapCoroutine for ImapGreetingGet {
                                     self.observed = capability.into_static().into_iter().collect();
                                 }
 
-                                if self.ensure_capabilities && self.observed.is_empty() {
+                                if self.opts.ensure_capabilities && self.observed.is_empty() {
                                     self.state = State::Capability(ImapCapabilityGet::new());
                                     continue;
                                 }
@@ -158,26 +165,163 @@ impl ImapCoroutine for ImapGreetingGet {
                         }
                     }
                     Some(FragmentInfo::Literal { .. }) => {
-                        // not used by client
+                        // NOTE: greetings never carry literals; the
+                        // fragmentizer should not produce one here.
                         unreachable!();
                     }
                     None => {
                         self.state = State::Read;
                     }
                 },
-                State::Capability(coroutine) => match coroutine.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::Yielded(y) => return ImapCoroutineState::Yielded(y),
-                    ImapCoroutineState::Complete(Ok(capability)) => {
-                        return ImapCoroutineState::Complete(Ok(ImapGreetingOk {
-                            capability,
-                            pre_authenticated: self.pre_authenticated,
-                        }));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return ImapCoroutineState::Complete(Err(err.into()));
-                    }
-                },
+                State::Capability(capability) => {
+                    let caps = imap_try!(capability, fragmentizer, arg.take());
+                    return ImapCoroutineState::Complete(Ok(ImapGreetingOk {
+                        capability: caps,
+                        pre_authenticated: self.pre_authenticated,
+                    }));
+                }
             }
+        }
+    }
+}
+
+enum State {
+    /// Drain bytes into the fragmentizer until a complete greeting
+    /// line is available.
+    Read,
+    /// Decode the assembled greeting line.
+    Deserialize,
+    /// Run an extra CAPABILITY round-trip when the greeting did not
+    /// piggyback a capability list.
+    Capability(ImapCapabilityGet),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read => f.write_str("read greeting"),
+            Self::Deserialize => f.write_str("decode greeting"),
+            Self::Capability(_) => f.write_str("fetch capabilities"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    /// Happy path: greeting carries an inline `[CAPABILITY ...]` code;
+    /// the coroutine surfaces the capability list directly without an
+    /// extra CAPABILITY round-trip.
+    #[test]
+    fn ok_with_inline_capability_returns_ok() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions {
+            ensure_capabilities: true,
+        });
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let reply = b"* OK [CAPABILITY IMAP4REV1 IDLE] hello\r\n";
+        let ok = expect_complete_ok(&mut greeting, &mut frag, reply);
+        assert!(!ok.pre_authenticated);
+        assert_eq!(2, ok.capability.len());
+    }
+
+    /// Greeting with no capability code triggers an extra CAPABILITY
+    /// round-trip when ensure_capabilities is set.
+    #[test]
+    fn ok_without_inline_capability_drives_extra_round_trip() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions {
+            ensure_capabilities: true,
+        });
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+        expect_wants_write_after(&mut greeting, &mut frag, b"* OK hello\r\n");
+    }
+
+    /// PREAUTH greeting: pre_authenticated flag is set.
+    #[test]
+    fn preauth_sets_flag() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let reply = b"* PREAUTH [CAPABILITY IMAP4REV1] welcome\r\n";
+        let ok = expect_complete_ok(&mut greeting, &mut frag, reply);
+        assert!(ok.pre_authenticated);
+    }
+
+    /// BYE greeting: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let err = expect_complete_err(&mut greeting, &mut frag, b"* BYE service unavailable\r\n");
+        let ImapGreetingGetError::Bye(text) = err else {
+            panic!("expected ImapGreetingGetError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "service unavailable");
+    }
+
+    /// EOF on the initial read: surface Eof.
+    #[test]
+    fn eof_returns_eof_error() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let err = expect_complete_err(&mut greeting, &mut frag, b"");
+        assert!(matches!(err, ImapGreetingGetError::Eof));
+    }
+
+    // --- utils
+
+    fn expect_wants_read(cor: &mut ImapGreetingGet, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_write_after(
+        cor: &mut ImapGreetingGet,
+        frag: &mut Fragmentizer,
+        arg: &[u8],
+    ) -> Vec<u8> {
+        match cor.resume(frag, Some(arg)) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapGreetingGet,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapGreetingOk {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapGreetingGet,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapGreetingGetError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
         }
     }
 }

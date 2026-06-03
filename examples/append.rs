@@ -30,7 +30,9 @@ fn main() {
     let mut buf = [0u8; 16 * 1024];
     let mut fragmentizer = Fragmentizer::new(100 * 1024 * 1024);
 
-    let mut coroutine = ImapGreetingGet::new(true);
+    let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions {
+        ensure_capabilities: true,
+    });
     let mut arg: Option<&[u8]> = None;
 
     loop {

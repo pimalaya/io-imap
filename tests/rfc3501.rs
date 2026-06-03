@@ -21,7 +21,7 @@ fn run_greeting(
     response: &'static [u8],
 ) -> ImapCoroutineState<ImapYield, Result<ImapGreetingOk, ImapGreetingGetError>> {
     let mut fragmentizer = new_fragmentizer();
-    let mut coroutine = ImapGreetingGet::new(false);
+    let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions::default());
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
@@ -71,7 +71,9 @@ fn run_greeting_with_capability(
     response: &'static [u8],
 ) -> ImapCoroutineState<ImapYield, Result<ImapGreetingOk, ImapGreetingGetError>> {
     let mut fragmentizer = new_fragmentizer();
-    let mut coroutine = ImapGreetingGet::new(true);
+    let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions {
+        ensure_capabilities: true,
+    });
     let mut arg: Option<&[u8]> = None;
     let mut fed = false;
 
