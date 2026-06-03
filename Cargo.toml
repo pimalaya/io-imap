@@ -65,10 +65,13 @@ sha2 = { version = "0.10", optional = true }
 thiserror = { version = "2", default-features = false }
 url = { version = "2.2", default-features = false, optional = true }
 
-# [patch.crates-io]
-# imap-codec.git = "https://github.com/soywod/imap-codec"
+[patch.crates-io]
+# waiting for https://github.com/duesee/imap-codec/pull/706
+# and for a new release
+imap-codec.git = "https://github.com/soywod/imap-codec"
+
+# local
 # pimalaya-stream.path = "../stream"
 
-[patch.crates-io]
-imap-codec.git = "https://github.com/soywod/imap-codec"
-pimalaya-stream.git = "https://github.com/pimalaya/stream"
+# git
+# pimalaya-stream.git = "https://github.com/pimalaya/stream"
