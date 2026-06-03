@@ -9,24 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added basic I/O-free coroutines.
+- Added the `ImapCoroutine` mirroring `core::ops::Coroutine`.
 
-- Added standard, blocking client.
+  The trait is composed of `Yield` and `Return` associated types, as well as a two-variant `ImapCoroutineState<Y, R>` (`Yielded(Y)` and `Complete(R)`). Standard coroutines pick the shared `ImapYield { WantsRead, WantsWrite(Vec<u8>) }`; coroutines that surface domain events declare their own Yield enum with an extra `Event(...)` variant.
 
-- Added the `crate::watch::ImapMailboxWatch` I/O-free coroutine: composes `SELECT (CONDSTORE)`, `FETCH 1:* (UID FLAGS)`, `ImapIdle` and `SELECT (QRESYNC ...)` into a single state machine that emits `ImapMailboxWatchEvent::EnvelopeAdded` / `FlagsAdded` / `FlagsRemoved` / `EnvelopeRemoved` events. Requires server-side QRESYNC; bails otherwise.
+- Added the `imap_try!` macro: coroutine equivalent of `?`.
 
-- Added `ImapClientStd::watch_mailbox(self, mailbox) -> ImapMailboxWatchStream`: consumes the client, spawns a background thread that drives `ImapMailboxWatch` over the socket, and returns an `Iterator` of events backed by a bounded mpsc channel. `close()` flips the shared shutdown atomic and joins the worker cleanly.
+  Advances one inner resume step, re-yields intermediate `Yielded(y)` (via `Into`), and short-circuits on `Complete(Err(_))`.
 
-### Changed
+- Added I/O-free IMAP IDLE coroutine following RFC 2177.
 
-- Added an `auto_id: Option<Vec<(IString<'static>, NString<'static>)>>` constructor argument to every auth coroutine (`ImapLogin`, `ImapAuthAnonymous`, `ImapAuthLogin`, `ImapAuthPlain`, `ImapAuthOAuthBearer`, `ImapAuthXOAuth2`, `ImapAuthScramSha256`). When `Some`, the coroutine chains an RFC 2971 `ID` round-trip after the tagged auth response (empty vec → `ID NIL`, non-empty → `ID (key val …)`); each error enum gained a `ServerId(#[from] ImapServerIdError)` variant. `ImapClientStd` gained a matching `pub auto_id` field consumed by every `auth_*`/`login` method (moved into the coroutine then reset to `None`). `ImapClientStd::connect` takes the same `auto_id` argument and threads it through the SASL dispatch so providers that require `ID` after auth (mail.qq.com, fastmail) are reachable end-to-end.
+  Yields `ImapIdleYield::Event(ImapIdleEvent)` on every unilateral untagged batch, refreshes every 29 s by default to survive middle-boxes that drop long-idle sockets.
 
-- Flattened `ImapIdleDone` into a plain `Arc<AtomicBool>`: `ImapIdle::new` now takes `done: Arc<AtomicBool>` directly. Callers use `done.store(true, Ordering::SeqCst)` / `done.load(Ordering::SeqCst)` instead of the wrapper's `done()` / `is_done()` methods.
+- Added I/O-free IMAP ID coroutine following RFC 2971.
 
-- Unified all standard-shape coroutines under a single `ImapCoroutine` trait (in `crate::coroutine`) with associated `Output` and `Error`. `resume` now returns `ImapCoroutineState<Output, Error>` directly; the per-coroutine `Imap*Result` enums are gone. `ImapClientStd::run<C: ImapCoroutine>` drives any coroutine to completion. Exempt (kept as-is with their own result enum): `ImapStartTls`, `ImapIdle`, `ImapMailboxWatch`.
+  Returns the server's identification parameters, or `ID NIL` when no parameters are passed.
 
-- Migrated `ImapCoroutine` to the generator-shape pattern: `type Yield` + `type Return` + two-variant `ImapCoroutineState<Y, R>` (`Yielded(Y)` / `Complete(R)`), mirroring `core::ops::Coroutine`. Standard coroutines pick `type Yield = ImapYield { WantsRead, WantsWrite(Vec<u8>) }` and `type Return = Result<Output, Error>`. The previously-exempt streaming coroutines now also implement the trait with per-coroutine `Yield` enums: `ImapStartTls` declares `ImapStartTlsYield { WantsRead, WantsWrite, WantsStartTls(Vec<u8>) }`, `ImapIdle` declares `ImapIdleYield { WantsRead, WantsWrite, Event(ImapIdleEvent) }`, `ImapMailboxWatch` declares `ImapMailboxWatchYield { WantsRead, WantsWrite, Event(ImapMailboxWatchEvent) }`. `ImapClientStd::run<C, T, E>` is now generic over `C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>`; streaming coroutines and `starttls` keep dedicated per-method loops.
+- Added I/O-free IMAP4rev1 coroutines following RFC 3501.
 
-- Added `ImapGreetingOk { capability, pre_authenticated }` as the `ImapGreetingGet` output struct (replaces the multi-field `Ok` variant of the dropped `ImapGreetingGetResult`).
+  greeting, capability, login, logout, starttls, list, lsub, status, create, delete, rename, subscribe, unsubscribe, select, examine, close, check, expunge, fetch (range + single-message), search, store (echo + silent), copy, append, noop.
+
+- Added I/O-free IMAP UNSELECT coroutine following RFC 3691.
+
+  Closes the selected mailbox without expunging `\Deleted` messages.
+
+- Added I/O-free IMAP APPENDUID-only coroutine following RFC 4315 (UIDPLUS).
+
+  Lighter than `ImapMessageAppend`; drops the EXISTS count and surfaces only the `NonZeroU32` APPENDUID pair.
+
+- Added I/O-free IMAP ENABLE coroutine following RFC 5161.
+
+  Returns the server's `ENABLED` capability list.
+
+- Added I/O-free IMAP SORT and THREAD coroutines following RFC 5256.
+
+  Each supports the `UID` variant via its options struct.
+
+- Added I/O-free IMAP MOVE coroutine following RFC 6851.
+
+  Surfaces the optional `[COPYUID …]` triple when the server announces UIDPLUS.
+
+- Added I/O-free SASL coroutines under `crate::sasl`: ANONYMOUS, LOGIN, PLAIN, XOAUTH2.
+
+  Each supports both the non-IR and SASL-IR (RFC 4959) flows.
+
+- Added I/O-free SASL OAUTHBEARER coroutine following RFC 7628.
+
+  Supports both non-IR and SASL-IR flows.
+
+- Added I/O-free SASL SCRAM-SHA-256 coroutine following RFC 7677, behind the `scram` cargo feature.
+
+- Added the optional `auto_id` field on every auth/login coroutine.
+
+  Applies to `ImapLogin`, `ImapAuthAnonymous`, `ImapAuthLogin`, `ImapAuthPlain`, `ImapAuthOauthbearer`, `ImapAuthXoauth2` and `ImapAuthScramSha256`. When set, chains an RFC 2971 `ID` round-trip immediately after the tagged auth response (empty vec sends `ID NIL`, non-empty sends `ID (key val …)`). Required by providers such as mail.qq.com and fastmail.
+
+- Added the `ImapMailboxWatch` composite coroutine.
+
+  Chains ENABLE QRESYNC, SELECT (CONDSTORE), FETCH 1:* baseline seed, IDLE wake-loop and SELECT (QRESYNC) delta pulls. Emits UID-keyed `EnvelopeAdded` / `FlagsAdded` / `FlagsRemoved` / `EnvelopeRemoved` events. Bails when the server does not advertise QRESYNC.
+
+- Added the `client` cargo feature enabling `ImapClientStd::new(stream)`.
+
+  Blocking light client wrapping any `Read + Write` stream with a per-connection `Fragmentizer` and exposing one method per IMAP coroutine.
+
+- Added `ImapClientStd::watch_mailbox(self, mailbox, capability) -> ImapMailboxWatchStream`.
+
+  Consumes the client, spawns a worker thread that drives `ImapMailboxWatch` over the socket, exposes events on a bounded mpsc channel. `close()` flips the shared shutdown atomic and joins the worker cleanly.
+
+- Added the `rustls-ring` cargo feature (default) enabling `ImapClientStd::connect(url, tls, starttls, sasl, auto_id)`.
+
+  Opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream) with rustls + ring crypto provider, drives optional STARTTLS upgrade, reads greeting and capability, runs the chosen SASL mechanism, returns an authenticated client.
+
+- Added the `rustls-aws` cargo feature.
+
+  Same full client as `rustls-ring` but with the aws-lc-rs crypto provider.
+
+- Added the `native-tls` cargo feature.
+
+  Same full client backed by the platform's `native-tls` implementation.
+
+- Added the `vendored` cargo feature.
+
+  Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
 [unreleased]: https://github.com/pimalaya/io-imap/compare/root..HEAD
