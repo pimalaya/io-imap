@@ -1,4 +1,47 @@
 //! IMAP STATUS coroutine returning the requested status items.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::status::ImapMailboxStatus,
+//!     types::status::StatusDataItemName,
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let mailbox = "INBOX".try_into().unwrap();
+//! let item_names = vec![StatusDataItemName::Messages, StatusDataItemName::Recent];
+//! let mut coroutine = ImapMailboxStatus::new(mailbox, item_names);
+//! let mut arg = None;
+//!
+//! let items = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(items)) => break items,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{items:?}");
+//! ```
 
 use core::fmt;
 

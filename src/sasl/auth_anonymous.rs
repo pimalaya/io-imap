@@ -3,6 +3,48 @@
 //!
 //! ANONYMOUS: <https://www.rfc-editor.org/rfc/rfc4505>
 //! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     sasl::auth_anonymous::{ImapAuthAnonymous, ImapAuthAnonymousOptions},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let message = Some("trace@example.org");
+//! let opts = ImapAuthAnonymousOptions::default();
+//! let mut coroutine = ImapAuthAnonymous::new(message, opts);
+//! let mut arg = None;
+//!
+//! let capability = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(capability)) => break capability,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{capability:?}");
+//! ```
 
 use core::{fmt, mem};
 

@@ -3,6 +3,47 @@
 //!
 //! SCRAM: <https://www.rfc-editor.org/rfc/rfc5802>
 //! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc7677::auth_scram_sha_256::{ImapAuthScramSha256, ImapAuthScramSha256Options},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let opts = ImapAuthScramSha256Options::default();
+//! let mut coroutine = ImapAuthScramSha256::new("alice", "secret", opts);
+//! let mut arg = None;
+//!
+//! let capability = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(capability)) => break capability,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{capability:?}");
+//! ```
 
 use core::{fmt, mem};
 

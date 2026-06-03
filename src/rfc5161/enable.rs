@@ -1,4 +1,46 @@
 //! IMAP ENABLE coroutine returning the server's ENABLED list.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::Vec1},
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc5161::enable::ImapExtensionEnable,
+//!     types::extensions::enable::CapabilityEnable,
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let capabilities = Vec1::try_from(vec![CapabilityEnable::CondStore]).unwrap();
+//! let mut coroutine = ImapExtensionEnable::new(capabilities);
+//! let mut arg = None;
+//!
+//! let enabled = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(enabled)) => break enabled,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{enabled:?}");
+//! ```
 
 use core::fmt;
 

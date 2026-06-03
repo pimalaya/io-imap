@@ -10,6 +10,53 @@
 //!
 //! Connection is dedicated. Flip the shared [`AtomicBool`] to wind
 //! down cleanly.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use core::sync::atomic::AtomicBool;
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//!     sync::Arc,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState},
+//!     types::response::Capability,
+//!     watch::{ImapMailboxWatch, ImapMailboxWatchYield},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let capability = [Capability::QResync];
+//! let mailbox = "INBOX".try_into().unwrap();
+//! let shutdown = Arc::new(AtomicBool::new(false));
+//! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone()).unwrap();
+//! let mut arg = None;
+//!
+//! loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(event)) => {
+//!             println!("{event:?}");
+//!         }
+//!         ImapCoroutineState::Complete(Ok(())) => break,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! }
+//! ```
 
 use core::{
     mem,

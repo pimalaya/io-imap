@@ -1,6 +1,47 @@
 //! IMAP STARTTLS coroutine; returns any bytes received past the tagged
 //! response. RFC 3501 §6.2.1 forbids trailing bytes, so a non-empty return
 //! value is a STARTTLS-injection signal: refuse the upgrade.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::starttls::ImapStartTls,
+//! };
+//!
+//! // Ready stream needed (TCP-connected, plain IMAP)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let mut coroutine = ImapStartTls::new();
+//! let mut arg = None;
+//!
+//! let leftover = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(leftover)) => break leftover,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! assert!(leftover.is_empty(), "STARTTLS-injection: refuse the upgrade");
+//! // Now upgrade `stream` to TLS before sending further IMAP commands.
+//! ```
 
 use core::{fmt, mem};
 

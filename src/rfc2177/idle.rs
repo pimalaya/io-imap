@@ -1,4 +1,48 @@
 //! IMAP IDLE coroutine yielding mailbox change events.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use core::sync::atomic::AtomicBool;
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//!     sync::Arc,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState},
+//!     rfc2177::idle::{ImapIdle, ImapIdleOptions, ImapIdleYield},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let shutdown = Arc::new(AtomicBool::new(false));
+//! let mut coroutine = ImapIdle::new(shutdown.clone(), ImapIdleOptions::default());
+//! let mut arg = None;
+//!
+//! loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapIdleYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Yielded(ImapIdleYield::Event(event)) => {
+//!             println!("{event:?}");
+//!         }
+//!         ImapCoroutineState::Complete(Ok(())) => break,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! }
+//! ```
 
 use core::{
     fmt, mem,

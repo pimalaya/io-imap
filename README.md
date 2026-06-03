@@ -81,7 +81,7 @@ No features required: works in `#![no_std]`, no sockets, no async runtime. You o
 
 Read the IMAP greeting against a blocking TCP socket (the same shape works under async, fuzzing, or in-memory replay):
 
-```rust,ignore
+```rust,no_run
 use std::{io::Read, net::TcpStream};
 
 use io_imap::{codec::fragmentizer::Fragmentizer, coroutine::*, rfc3501::greeting::*};
@@ -108,7 +108,7 @@ let capability = loop {
 
 Drive a multi-step command (LIST) the same way:
 
-```rust,ignore
+```rust,no_run
 use std::{io::{Read, Write}, net::TcpStream};
 
 use imap_codec::imap_types::mailbox::{ListMailbox, Mailbox};
@@ -151,7 +151,7 @@ Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Re
 io-imap = { version = "0.0.1", default-features = false, features = ["client"] }
 ```
 
-```rust,ignore
+```rust,no_run
 use std::net::TcpStream;
 
 use io_imap::client::ImapClientStd;
@@ -179,7 +179,7 @@ Enable one of the TLS feature flags: `rustls-ring` (default), `rustls-aws`, or `
 io-imap = { version = "0.0.1", default-features = false, features = ["rustls-ring"] }
 ```
 
-```rust,ignore
+```rust,no_run
 use io_imap::client::ImapClientStd;
 use pimalaya_stream::{sasl::SaslLogin, tls::Tls};
 use secrecy::SecretString;

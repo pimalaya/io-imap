@@ -1,5 +1,48 @@
 //! IMAP server greeting reader; optionally forces a CAPABILITY round-trip
 //! if the greeting carries none.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let opts = ImapGreetingGetOptions {
+//!     ensure_capabilities: true,
+//! };
+//! let mut coroutine = ImapGreetingGet::new(opts);
+//! let mut arg = None;
+//!
+//! let greeting = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(greeting)) => break greeting,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{greeting:?}");
+//! ```
 
 use core::{fmt, mem};
 

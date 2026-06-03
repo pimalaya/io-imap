@@ -1,4 +1,47 @@
 //! IMAP SEARCH coroutine returning the matched ids in server order.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::Vec1},
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::search::{ImapMessageSearch, ImapMessageSearchOptions},
+//!     types::search::SearchKey,
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let criteria = Vec1::try_from(vec![SearchKey::Unseen]).unwrap();
+//! let opts = ImapMessageSearchOptions::default();
+//! let mut coroutine = ImapMessageSearch::new(criteria, opts);
+//! let mut arg = None;
+//!
+//! let ids = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(ids)) => break ids,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{ids:?}");
+//! ```
 
 use core::{fmt, num::NonZeroU32};
 

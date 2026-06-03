@@ -1,4 +1,53 @@
 //! IMAP APPEND coroutine returning EXISTS count and APPENDUID pair.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::append::{ImapMessageAppend, ImapMessageAppendOptions},
+//!     types::{
+//!         core::Literal,
+//!         extensions::binary::LiteralOrLiteral8,
+//!     },
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let mailbox = "INBOX".try_into().unwrap();
+//! let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(
+//!     b"From: a@b\r\nSubject: hi\r\n\r\nhello",
+//! ));
+//! let opts = ImapMessageAppendOptions::default();
+//! let mut coroutine = ImapMessageAppend::new(mailbox, message, opts);
+//! let mut arg = None;
+//!
+//! let (exists, appenduid) = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(out)) => break out,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("exists={exists:?} appenduid={appenduid:?}");
+//! ```
 
 use core::fmt;
 

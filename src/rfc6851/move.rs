@@ -1,4 +1,47 @@
 //! IMAP MOVE coroutine surfacing the optional COPYUID triple.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc6851::r#move::{ImapMessageMove, ImapMessageMoveOptions},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let sequence_set = "1:3".try_into().unwrap();
+//! let mailbox = "Archive".try_into().unwrap();
+//! let opts = ImapMessageMoveOptions::default();
+//! let mut coroutine = ImapMessageMove::new(sequence_set, mailbox, opts);
+//! let mut arg = None;
+//!
+//! let copyuid = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(copyuid)) => break copyuid,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{copyuid:?}");
+//! ```
 
 use core::fmt;
 

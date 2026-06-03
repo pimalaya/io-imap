@@ -1,5 +1,96 @@
 //! IMAP FETCH coroutines: range ([`ImapMessageFetch`]) and single-message
 //! ([`ImapMessageFetchFirst`]) variants.
+//!
+//! # Examples
+//!
+//! Range variant over an arbitrary `SequenceSet`:
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::fetch::{ImapMessageFetch, ImapMessageFetchOptions},
+//!     types::fetch::{Macro, MacroOrMessageDataItemNames},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let sequence_set = "1:*".try_into().unwrap();
+//! let items = MacroOrMessageDataItemNames::Macro(Macro::Full);
+//! let opts = ImapMessageFetchOptions::default();
+//! let mut coroutine = ImapMessageFetch::new(sequence_set, items, opts);
+//! let mut arg = None;
+//!
+//! let messages = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(messages)) => break messages,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{} message(s) fetched", messages.len());
+//! ```
+//!
+//! Single-message variant:
+//!
+//! ```rust,no_run
+//! use core::num::NonZeroU32;
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     rfc3501::fetch::{ImapMessageFetchFirst, ImapMessageFetchOptions},
+//!     types::fetch::{Macro, MacroOrMessageDataItemNames},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let id = NonZeroU32::new(42).unwrap();
+//! let items = MacroOrMessageDataItemNames::Macro(Macro::Full);
+//! let opts = ImapMessageFetchOptions::default();
+//! let mut coroutine = ImapMessageFetchFirst::new(id, items, opts);
+//! let mut arg = None;
+//!
+//! let items = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(items)) => break items,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{items:?}");
+//! ```
 
 use core::{fmt, num::NonZeroU32};
 

@@ -4,6 +4,47 @@
 //!
 //! XOAUTH2: <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>
 //! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use std::{
+//!     io::{Read, Write},
+//!     net::TcpStream,
+//! };
+//!
+//! use io_imap::{
+//!     codec::fragmentizer::Fragmentizer,
+//!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+//!     sasl::auth_xoauth2::{ImapAuthXoauth2, ImapAuthXoauth2Options},
+//! };
+//!
+//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! let mut stream = TcpStream::connect("localhost:143").unwrap();
+//!
+//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+//! let mut buf = [0u8; 4096];
+//!
+//! let opts = ImapAuthXoauth2Options::default();
+//! let mut coroutine = ImapAuthXoauth2::new("alice@example.org", "oauth-token", opts);
+//! let mut arg = None;
+//!
+//! let capability = loop {
+//!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+//!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+//!             let n = stream.read(&mut buf).unwrap();
+//!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Complete(Ok(capability)) => break capability,
+//!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
+//!     }
+//! };
+//!
+//! println!("{capability:?}");
+//! ```
 
 use core::{fmt, mem};
 
