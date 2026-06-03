@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP CLOSE command (RFC 3501 §6.4.2).
-//!
-//! Closes the currently selected mailbox: permanently removes all messages
-//! flagged `\Deleted` and returns the connection to the authenticated state. No
-//! state is returned; success is signalled by the tagged OK alone.
+//! IMAP CLOSE coroutine: expunge \Deleted and unselect.
 
 use core::fmt;
 
@@ -22,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during CLOSE progression.
+/// Failure causes during the IMAP CLOSE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxCloseError {
     #[error("IMAP CLOSE failed: NO {0}")]
@@ -45,7 +41,6 @@ pub struct ImapMailboxClose {
 }
 
 impl ImapMailboxClose {
-    /// Creates a new CLOSE coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -110,7 +105,6 @@ impl ImapCoroutine for ImapMailboxClose {
 }
 
 enum State {
-    /// Send CLOSE and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -130,7 +124,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut close = ImapMailboxClose::new();
@@ -147,7 +140,6 @@ mod tests {
         expect_complete_ok(&mut close, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut close = ImapMailboxClose::new();
@@ -166,7 +158,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut close = ImapMailboxClose::new();
@@ -185,7 +176,6 @@ mod tests {
         assert_eq!(text, "CLOSE syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut close = ImapMailboxClose::new();

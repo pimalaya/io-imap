@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP RENAME command (RFC 3501 §6.3.5).
-//!
-//! Asks the server to rename a mailbox from `from` to `to`. No state is
-//! returned; success is signalled by the tagged OK alone.
+//! IMAP RENAME coroutine renaming a mailbox.
 
 use core::fmt;
 
@@ -22,7 +19,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during RENAME progression.
+/// Failure causes during the IMAP RENAME flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxRenameError {
     #[error("IMAP RENAME failed: NO {0}")]
@@ -45,7 +42,6 @@ pub struct ImapMailboxRename {
 }
 
 impl ImapMailboxRename {
-    /// Creates a new RENAME coroutine.
     pub fn new(mut from: Mailbox<'static>, mut to: Mailbox<'static>) -> Self {
         encode_inplace(&mut from);
         encode_inplace(&mut to);
@@ -107,7 +103,6 @@ impl ImapCoroutine for ImapMailboxRename {
 }
 
 enum State {
-    /// Send RENAME and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -127,7 +122,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut rename = ImapMailboxRename::new(
@@ -147,7 +141,6 @@ mod tests {
         expect_complete_ok(&mut rename, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut rename = ImapMailboxRename::new(
@@ -169,7 +162,6 @@ mod tests {
         assert_eq!(text, "target mailbox already exists");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut rename = ImapMailboxRename::new(

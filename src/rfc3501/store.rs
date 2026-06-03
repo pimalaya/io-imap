@@ -1,12 +1,5 @@
-//! I/O-free coroutines to send an IMAP STORE command (RFC 3501 §6.4.6),
-//! optionally as the `UID STORE` variant.
-//!
-//! Two flavours:
-//! - [`ImapMessageStore`]: server sends back `FETCH` responses for each
-//!   modified message (`StoreResponse::Answer`); returns a sequence-keyed
-//!   [`BTreeMap`] of FETCH items.
-//! - [`ImapMessageStoreSilent`]: server suppresses the FETCH responses
-//!   (`StoreResponse::Silent`); returns `()`.
+//! IMAP STORE coroutines: echo ([`ImapMessageStore`]) and silent
+//! ([`ImapMessageStoreSilent`]) variants.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -29,8 +22,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during STORE progression. Shared by both
-/// [`ImapMessageStore`] and [`ImapMessageStoreSilent`].
+/// Failure causes during the IMAP STORE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageStoreError {
     #[error("IMAP STORE failed: NO {0}")]
@@ -47,22 +39,19 @@ pub enum ImapMessageStoreError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Options for [`ImapMessageStore::new`] and [`ImapMessageStoreSilent::new`].
+/// Options for the IMAP STORE coroutines.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageStoreOptions {
-    /// When `true`, send `UID STORE` (RFC 3501 §6.4.8); the `sequence_set` then
-    /// holds UIDs rather than sequence numbers.  Default: `false` (plain
-    /// `STORE`).
+    /// When `true`, send `UID STORE` and treat `sequence_set` as UIDs.
     pub uid: bool,
 }
 
-/// I/O-free IMAP STORE coroutine (echo variant).
+/// Echo variant: server returns FETCH for each modified message.
 pub struct ImapMessageStore {
     state: State,
 }
 
 impl ImapMessageStore {
-    /// Creates a new STORE coroutine that requests FETCH echoes.
     pub fn new(
         sequence_set: SequenceSet,
         kind: StoreType,
@@ -141,13 +130,12 @@ impl ImapCoroutine for ImapMessageStore {
     }
 }
 
-/// I/O-free IMAP STORE coroutine (silent variant).
+/// Silent variant: server suppresses the FETCH echoes.
 pub struct ImapMessageStoreSilent {
     state: State,
 }
 
 impl ImapMessageStoreSilent {
-    /// Creates a new silent STORE coroutine.
     pub fn new(
         sequence_set: SequenceSet,
         kind: StoreType,
@@ -218,7 +206,6 @@ impl ImapCoroutine for ImapMessageStoreSilent {
 }
 
 enum State {
-    /// Send STORE (or UID STORE) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -242,8 +229,6 @@ mod tests {
         vec![Flag::Seen]
     }
 
-    /// Echo variant happy path: server returns FETCH echoes then
-    /// tagged OK.
     #[test]
     fn echo_success_returns_map() {
         let mut store = ImapMessageStore::new(
@@ -264,7 +249,6 @@ mod tests {
         assert_eq!(1, map.len());
     }
 
-    /// UID flag flips the wire keyword to `UID STORE`.
     #[test]
     fn echo_uid_variant_sends_uid_store() {
         let mut store = ImapMessageStore::new(
@@ -280,8 +264,6 @@ mod tests {
         assert!(line.contains("UID STORE 42 "));
     }
 
-    /// Silent variant happy path: no echoes, tagged OK closes the
-    /// command.
     #[test]
     fn silent_success_returns_ok() {
         let mut store = ImapMessageStoreSilent::new(
@@ -303,7 +285,6 @@ mod tests {
         expect_complete_ok_silent(&mut store, &mut frag, reply.as_bytes());
     }
 
-    /// Echo variant tagged NO: surface text verbatim.
     #[test]
     fn echo_tagged_no_returns_no_error() {
         let mut store = ImapMessageStore::new(

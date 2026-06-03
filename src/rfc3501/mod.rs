@@ -1,3 +1,7 @@
+//! IMAP4rev1 base protocol.
+//!
+//! <https://www.rfc-editor.org/rfc/rfc3501>
+
 pub mod append;
 pub mod capability;
 pub mod check;

@@ -1,12 +1,8 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL PLAIN (RFC
-//! 4616). Both flows are supported:
+//! IMAP SASL PLAIN coroutine; supports both the non-IR and SASL-IR
+//! (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthPlain::new`] with `initial_request: false`): bare
-//!   `AUTHENTICATE PLAIN`, then the credentials are uploaded as continuation
-//!   data after the server's empty SASL challenge.
-//! * SASL-IR (RFC 4959, `initial_request: true`): credentials embedded inline
-//!   as the initial response so the auth completes in a single round-trip on
-//!   success.
+//! PLAIN: <https://www.rfc-editor.org/rfc/rfc4616>
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -32,7 +28,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during PLAIN progression.
+/// Failure causes during the SASL PLAIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthPlainError {
     #[error("IMAP AUTHENTICATE PLAIN failed: NO {0}")]
@@ -63,23 +59,17 @@ pub enum ImapAuthPlainError {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the PLAIN sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthPlain::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthPlainOptions {
-    /// When `true`, embed credentials inline as the SASL initial
-    /// response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the credentials are uploaded
-    /// as continuation data after the server's empty challenge; the
-    /// coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline credentials);
+    /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL PLAIN coroutine. The initial [`State`] variant
-/// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
-/// and SASL-IR flows.
+/// I/O-free SASL PLAIN coroutine.
 pub struct ImapAuthPlain {
     state: State,
     observed: Vec<Capability<'static>>,
@@ -87,13 +77,8 @@ pub struct ImapAuthPlain {
 }
 
 impl ImapAuthPlain {
-    /// Creates a new PLAIN coroutine. `opts.initial_request` selects
-    /// between the non-IR flow ([`State::Send`]) and the SASL-IR flow
-    /// ([`State::SendIr`]).
-    ///
-    /// `authzid` is the optional authorization identity (RFC 4616);
-    /// pass `None` to omit it. `authcid` is the authentication
-    /// identity (typically the username).
+    /// `authzid` is the optional RFC 4616 authorization identity;
+    /// `authcid` is the authentication identity (typically username).
     pub fn new(
         authzid: Option<impl AsRef<str>>,
         authcid: impl AsRef<str>,
@@ -355,8 +340,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: credentials sent inline, server accepts on the first
-    /// round-trip with tagged OK.
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthPlainOptions {
@@ -378,7 +361,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server rejects the inline credentials with tagged NO.
     #[test]
     fn ir_invalid_credentials_returns_no_error() {
         let opts = ImapAuthPlainOptions {
@@ -402,7 +384,6 @@ mod tests {
         assert_eq!(text, "authentication failed");
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthPlainOptions {
@@ -426,9 +407,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client sends base64-encoded credentials as
-    /// continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthPlainOptions::default();
@@ -451,8 +429,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded credentials with tagged
-    /// NO.
     #[test]
     fn non_ir_invalid_credentials_returns_no_error() {
         let opts = ImapAuthPlainOptions::default();

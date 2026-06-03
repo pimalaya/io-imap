@@ -1,13 +1,8 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL
-//! ANONYMOUS (RFC 4505). Both flows are supported:
+//! IMAP SASL ANONYMOUS coroutine; supports both the non-IR and SASL-IR
+//! (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthAnonymous::new`] with `initial_request:
-//!   false`): bare `AUTHENTICATE ANONYMOUS`, then the optional trace
-//!   message is uploaded as continuation data after the server's
-//!   empty SASL challenge.
-//! * SASL-IR (RFC 4959, `initial_request: true`): the trace message
-//!   is embedded inline as the initial response so the auth completes
-//!   in a single round-trip on success.
+//! ANONYMOUS: <https://www.rfc-editor.org/rfc/rfc4505>
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -33,7 +28,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during ANONYMOUS progression.
+/// Failure causes during the SASL ANONYMOUS flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthAnonymousError {
     #[error("IMAP AUTHENTICATE ANONYMOUS failed: NO {0}")]
@@ -64,23 +59,17 @@ pub enum ImapAuthAnonymousError {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the ANONYMOUS sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthAnonymous::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthAnonymousOptions {
-    /// When `true`, embed the trace message inline as the SASL
-    /// initial response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the message is uploaded as
-    /// continuation data after the server's empty challenge; the
-    /// coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline trace message);
+    /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL ANONYMOUS coroutine. The initial [`State`] variant
-/// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
-/// and SASL-IR flows.
+/// I/O-free SASL ANONYMOUS coroutine.
 pub struct ImapAuthAnonymous {
     state: State,
     observed: Vec<Capability<'static>>,
@@ -88,10 +77,7 @@ pub struct ImapAuthAnonymous {
 }
 
 impl ImapAuthAnonymous {
-    /// Creates a new ANONYMOUS coroutine. `opts.initial_request`
-    /// selects between the non-IR flow ([`State::Send`]) and the
-    /// SASL-IR flow ([`State::SendIr`]). `message` is the optional
-    /// trace identifier (RFC 4505 §2); pass `None` to omit it.
+    /// `message` is the optional RFC 4505 §2 trace identifier.
     pub fn new(message: Option<impl AsRef<str>>, opts: ImapAuthAnonymousOptions) -> Self {
         let payload = message
             .map(|m| m.as_ref().as_bytes().to_vec())
@@ -346,8 +332,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: trace message embedded inline, server accepts on the
-    /// first round-trip with tagged OK.
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthAnonymousOptions {
@@ -369,7 +353,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server rejects ANONYMOUS with tagged NO.
     #[test]
     fn ir_rejected_returns_no_error() {
         let opts = ImapAuthAnonymousOptions {
@@ -393,7 +376,6 @@ mod tests {
         assert_eq!(text, "anonymous access disabled");
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthAnonymousOptions {
@@ -417,9 +399,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client uploads the (possibly empty) trace
-    /// message as continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthAnonymousOptions::default();
@@ -442,7 +421,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded trace with tagged NO.
     #[test]
     fn non_ir_rejected_returns_no_error() {
         let opts = ImapAuthAnonymousOptions::default();

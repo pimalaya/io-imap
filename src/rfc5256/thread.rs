@@ -1,6 +1,4 @@
-//! I/O-free coroutine to send an IMAP THREAD command (RFC 5256), optionally as
-//! the `UID THREAD` variant. Returns the thread tree the server built from the
-//! matched messages.
+//! IMAP THREAD coroutine returning the server-built thread tree.
 
 use core::fmt;
 
@@ -22,7 +20,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during THREAD progression.
+/// Failure causes during the IMAP THREAD flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageThreadError {
     #[error("IMAP THREAD failed: NO {0}")]
@@ -44,8 +42,7 @@ pub enum ImapMessageThreadError {
 /// Options for [`ImapMessageThread::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageThreadOptions {
-    /// When `true`, send `UID THREAD`; the returned ids are UIDs
-    /// rather than sequence numbers. Default: `false`.
+    /// When `true`, send `UID THREAD`; returned ids are UIDs.
     pub uid: bool,
 }
 
@@ -55,7 +52,6 @@ pub struct ImapMessageThread {
 }
 
 impl ImapMessageThread {
-    /// Creates a new THREAD coroutine.
     pub fn new(
         algorithm: ThreadingAlgorithm<'static>,
         search_criteria: Vec1<SearchKey<'static>>,
@@ -135,7 +131,6 @@ impl ImapCoroutine for ImapMessageThread {
 }
 
 enum State {
-    /// Send THREAD (or UID THREAD) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -163,7 +158,6 @@ mod tests {
         Vec1::try_from(vec![SearchKey::All]).expect("one search criterion")
     }
 
-    /// Happy path: server returns `* THREAD ...` then tagged OK.
     #[test]
     fn success_returns_threads() {
         let mut thread = ImapMessageThread::new(
@@ -185,7 +179,6 @@ mod tests {
         assert_eq!(2, threads.len());
     }
 
-    /// Server skips `* THREAD`: surface MissingData.
     #[test]
     fn missing_data_returns_missing_data_error() {
         let mut thread = ImapMessageThread::new(
@@ -205,7 +198,6 @@ mod tests {
         assert!(matches!(err, ImapMessageThreadError::MissingData));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut thread = ImapMessageThread::new(
@@ -228,7 +220,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut thread = ImapMessageThread::new(

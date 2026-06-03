@@ -1,9 +1,5 @@
-//! I/O-free coroutine to send an IMAP APPEND command and surface only the
-//! `[APPENDUID uidvalidity uid]` response code (UIDPLUS, RFC 4315).
-//!
-//! Lighter than [`crate::rfc3501::append::ImapMessageAppend`]: drops the EXISTS
-//! count, keeps the NonZeroU32 typing on the pair. Use this variant when only
-//! the appended UID matters.
+//! IMAP APPEND coroutine returning only the APPENDUID pair (NonZeroU32).
+//! Lighter than [`crate::rfc3501::append::ImapMessageAppend`]; drops EXISTS.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -27,7 +23,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during APPEND progression.
+/// Failure causes during the APPENDUID-only APPEND flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAppendUidError {
     #[error("IMAP APPEND failed: NO {0}")]
@@ -47,20 +43,16 @@ pub enum ImapAppendUidError {
 /// Options for [`ImapAppendUid::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAppendUidOptions {
-    /// Per-message flags attached on append. Default: empty.
     pub flags: Vec<Flag<'static>>,
-    /// Internal date stamp recorded by the server. Default: `None`
-    /// (server uses its current time).
     pub date: Option<DateTime>,
 }
 
-/// I/O-free APPEND coroutine returning the APPENDUID pair.
+/// I/O-free IMAP APPEND coroutine returning the APPENDUID pair.
 pub struct ImapAppendUid {
     state: State,
 }
 
 impl ImapAppendUid {
-    /// Creates a new APPEND coroutine.
     pub fn new(
         mut mailbox: Mailbox<'static>,
         message: LiteralOrLiteral8<'static>,
@@ -138,8 +130,6 @@ impl ImapCoroutine for ImapAppendUid {
 }
 
 enum State {
-    /// Send APPEND (including the literal data) and await the tagged
-    /// response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -161,8 +151,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns APPENDUID; the coroutine surfaces
-    /// the pair.
     #[test]
     fn success_with_appenduid_returns_pair() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -185,7 +173,6 @@ mod tests {
         assert_eq!(7, pair.1.get());
     }
 
-    /// Server omits APPENDUID: still succeed with `None`.
     #[test]
     fn success_without_appenduid_returns_none() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -206,7 +193,6 @@ mod tests {
         assert!(pair.is_none());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -230,7 +216,6 @@ mod tests {
         assert_eq!(text, "mailbox is read-only");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));

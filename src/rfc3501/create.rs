@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP CREATE command (RFC 3501 §6.3.3).
-//!
-//! Asks the server to create a new mailbox. No state is returned; success is
-//! signalled by the tagged OK alone.
+//! IMAP CREATE coroutine creating a new mailbox.
 
 use core::fmt;
 
@@ -22,7 +19,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during CREATE progression.
+/// Failure causes during the IMAP CREATE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxCreateError {
     #[error("IMAP CREATE failed: NO {0}")]
@@ -45,7 +42,6 @@ pub struct ImapMailboxCreate {
 }
 
 impl ImapMailboxCreate {
-    /// Creates a new CREATE coroutine.
     pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -106,7 +102,6 @@ impl ImapCoroutine for ImapMailboxCreate {
 }
 
 enum State {
-    /// Send CREATE and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -126,7 +121,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut create = ImapMailboxCreate::new("Archive".try_into().expect("valid mailbox"));
@@ -143,7 +137,6 @@ mod tests {
         expect_complete_ok(&mut create, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO (e.g. mailbox already exists): surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut create = ImapMailboxCreate::new("Archive".try_into().expect("valid mailbox"));
@@ -162,7 +155,6 @@ mod tests {
         assert_eq!(text, "mailbox already exists");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut create = ImapMailboxCreate::new("Archive".try_into().expect("valid mailbox"));
@@ -181,7 +173,6 @@ mod tests {
         assert_eq!(text, "CREATE syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut create = ImapMailboxCreate::new("Archive".try_into().expect("valid mailbox"));

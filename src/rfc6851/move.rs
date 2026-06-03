@@ -1,9 +1,4 @@
-//! I/O-free coroutine to send an IMAP MOVE command (RFC 6851), optionally as
-//! the `UID MOVE` variant.
-//!
-//! Surfaces the `[COPYUID uidvalidity src-uids dst-uids]` response code defined
-//! by UIDPLUS (RFC 4315) when the server announces it, decoded the same way as
-//! [`crate::rfc3501::copy::ImapMessageCopy`].
+//! IMAP MOVE coroutine surfacing the optional COPYUID triple.
 
 use core::fmt;
 
@@ -33,7 +28,7 @@ use crate::{
     send::*,
 };
 
-/// Errors that can occur during MOVE progression.
+/// Failure causes during the IMAP MOVE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageMoveError {
     #[error("IMAP MOVE failed: NO {0}")]
@@ -53,8 +48,7 @@ pub enum ImapMessageMoveError {
 /// Options for [`ImapMessageMove::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageMoveOptions {
-    /// When `true`, send `UID MOVE`; the `sequence_set` then holds
-    /// UIDs rather than sequence numbers. Default: `false`.
+    /// When `true`, send `UID MOVE` and treat `sequence_set` as UIDs.
     pub uid: bool,
 }
 
@@ -64,7 +58,6 @@ pub struct ImapMessageMove {
 }
 
 impl ImapMessageMove {
-    /// Creates a new MOVE coroutine.
     pub fn new(
         sequence_set: SequenceSet,
         mut mailbox: Mailbox<'static>,
@@ -149,7 +142,6 @@ impl ImapCoroutine for ImapMessageMove {
 }
 
 enum State {
-    /// Send MOVE (or UID MOVE) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -169,8 +161,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path with COPYUID: server returns the `[COPYUID …]`
-    /// code; the coroutine decodes source/destination.
     #[test]
     fn success_with_copyuid_returns_uids() {
         let mut mov = ImapMessageMove::new(
@@ -196,7 +186,6 @@ mod tests {
         assert_eq!(vec![10, 11, 12], destination);
     }
 
-    /// UID flag flips the wire keyword to `UID MOVE`.
     #[test]
     fn uid_variant_sends_uid_move() {
         let mut mov = ImapMessageMove::new(
@@ -211,7 +200,6 @@ mod tests {
         assert!(line.contains("UID MOVE 42 Archive"));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut mov = ImapMessageMove::new(
@@ -234,7 +222,6 @@ mod tests {
         assert_eq!(text, "destination mailbox does not exist");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut mov = ImapMessageMove::new(

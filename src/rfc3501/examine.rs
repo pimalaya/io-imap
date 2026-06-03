@@ -1,11 +1,4 @@
-//! I/O-free coroutine to send an IMAP EXAMINE command (RFC 3501 §6.3.2).
-//!
-//! Read-only counterpart of SELECT: same response shape (FLAGS / EXISTS /
-//! RECENT / UNSEEN / PERMANENTFLAGS / UIDNEXT / UIDVALIDITY) plus the CONDSTORE
-//! / QRESYNC extras (HIGHESTMODSEQ, VANISHED (EARLIER), implicit FETCH) when
-//! the caller supplies the matching [`SelectParameter`]s. Reuses
-//! [`SelectData`]/[`SelectFetch`] from the SELECT coroutine since the wire
-//! responses are structurally identical.
+//! IMAP EXAMINE coroutine: read-only counterpart of SELECT.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -35,13 +28,12 @@ use crate::{
     send::*,
 };
 
-/// Alias for [`SelectData`] returned by EXAMINE.
+/// Decoded EXAMINE response (alias of [`SelectData`]).
 pub type ExamineData = SelectData;
-
-/// Alias for [`SelectFetch`] returned by EXAMINE under QRESYNC.
+/// Implicit FETCH item from a QRESYNC EXAMINE (alias of [`SelectFetch`]).
 pub type ExamineFetch = SelectFetch;
 
-/// Errors that can occur during EXAMINE progression.
+/// Failure causes during the IMAP EXAMINE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxExamineError {
     #[error("IMAP EXAMINE failed: NO {0}")]
@@ -61,10 +53,7 @@ pub enum ImapMailboxExamineError {
 /// Options for [`ImapMailboxExamine::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMailboxExamineOptions {
-    /// SELECT/EXAMINE parameters (RFC 4466). Pass CONDSTORE
-    /// ([`SelectParameter::CondStore`]) or QRESYNC
-    /// ([`SelectParameter::QResync`]) here to opt into the matching
-    /// extras in the response. Default: empty (plain EXAMINE).
+    /// SELECT/EXAMINE parameters (RFC 4466), e.g. CONDSTORE/QRESYNC.
     pub parameters: Vec<SelectParameter>,
 }
 
@@ -74,7 +63,6 @@ pub struct ImapMailboxExamine {
 }
 
 impl ImapMailboxExamine {
-    /// Creates a new EXAMINE coroutine.
     pub fn new(mut mailbox: Mailbox<'static>, opts: ImapMailboxExamineOptions) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -175,8 +163,6 @@ impl ImapCoroutine for ImapMailboxExamine {
 }
 
 enum State {
-    /// Send EXAMINE (with any opt-in parameters) and await the tagged
-    /// response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -188,9 +174,8 @@ impl fmt::Display for State {
     }
 }
 
-/// Expands a `SequenceSet` carried by `VANISHED (EARLIER)` into concrete
-/// UIDs. RFC 7162 §3.2.10 forbids `*` in the VANISHED uid-set, so any upper
-/// bound is safe; `u32::MAX` covers open-ended ranges that appear in the wild.
+/// Expand `VANISHED (EARLIER)` uid-set to concrete UIDs (RFC 7162 §3.2.10
+/// forbids `*`, so `u32::MAX` is a safe ceiling).
 fn expand_uid_set(uid_set: &SequenceSet) -> Vec<NonZeroU32> {
     let max = NonZeroU32::new(u32::MAX).unwrap();
     uid_set.iter(max).collect()
@@ -204,9 +189,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns FLAGS / EXISTS / RECENT plus
-    /// UIDVALIDITY in the tagged OK code; the coroutine surfaces all
-    /// of them.
     #[test]
     fn success_collects_response() {
         let mut examine = ImapMailboxExamine::new(
@@ -236,7 +218,6 @@ mod tests {
         assert!(data.flags.is_some());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut examine = ImapMailboxExamine::new(
@@ -258,7 +239,6 @@ mod tests {
         assert_eq!(text, "mailbox does not exist");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut examine = ImapMailboxExamine::new(
@@ -280,7 +260,6 @@ mod tests {
         assert_eq!(text, "EXAMINE syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut examine = ImapMailboxExamine::new(

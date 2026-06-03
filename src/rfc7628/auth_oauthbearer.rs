@@ -1,18 +1,7 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL
-//! OAUTHBEARER (RFC 7628). Both flows are supported:
+//! IMAP SASL OAUTHBEARER coroutine; supports both the non-IR and
+//! SASL-IR (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthOauthbearer::new`] with `initial_request:
-//!   false`): bare `AUTHENTICATE OAUTHBEARER`, then credentials
-//!   uploaded as continuation data after the server's empty SASL
-//!   challenge.
-//! * SASL-IR (RFC 4959, `initial_request: true`): credentials
-//!   embedded inline as the initial response so the auth completes in
-//!   a single round-trip on success.
-//!
-//! On authentication failure the server returns a continuation
-//! carrying a JSON error; the client acknowledges it with a single
-//! `\x01` byte (RFC 7628 §3.2.3) and the server then sends the final
-//! tagged NO.
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -40,7 +29,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during OAUTHBEARER progression.
+/// Failure causes during the SASL OAUTHBEARER flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthOauthbearerError {
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: NO {0}")]
@@ -73,23 +62,17 @@ pub enum ImapAuthOauthbearerError {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the OAUTHBEARER sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthOauthbearer::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthOauthbearerOptions {
-    /// When `true`, embed credentials inline as the SASL initial
-    /// response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the credentials are uploaded
-    /// as continuation data after the server's empty challenge; the
-    /// coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline credentials);
+    /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL OAUTHBEARER coroutine. The initial [`State`] variant
-/// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
-/// and SASL-IR flows.
+/// I/O-free SASL OAUTHBEARER coroutine.
 pub struct ImapAuthOauthbearer {
     state: State,
     error: Option<String>,
@@ -98,9 +81,6 @@ pub struct ImapAuthOauthbearer {
 }
 
 impl ImapAuthOauthbearer {
-    /// Creates a new OAUTHBEARER coroutine. `opts.initial_request` selects
-    /// between the non-IR flow ([`State::Send`]) and the SASL-IR flow
-    /// ([`State::SendIr`]).
     pub fn new(
         user: impl AsRef<str>,
         host: impl AsRef<str>,
@@ -407,8 +387,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: credentials sent inline, server accepts on the first
-    /// round-trip with tagged OK.
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthOauthbearerOptions {
@@ -436,9 +414,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server rejects the inline credentials in the very
-    /// first continuation. Per RFC 7628 §3.2.3 the client acknowledges with a
-    /// single `\x01` byte (base64 `AQ==`) before reading the tagged NO.
     #[test]
     fn ir_invalid_token_returns_no_with_error() {
         let opts = ImapAuthOauthbearerOptions {
@@ -476,7 +451,6 @@ mod tests {
         assert_eq!(err, err_json);
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthOauthbearerOptions {
@@ -506,9 +480,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client sends the GS2-framed credentials as
-    /// continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthOauthbearerOptions::default();
@@ -537,9 +508,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded credentials with a JSON
-    /// error in a continuation; client acknowledges with `\x01` (base64 `AQ==`),
-    /// server returns tagged NO.
     #[test]
     fn non_ir_invalid_token_returns_no_with_error() {
         let opts = ImapAuthOauthbearerOptions::default();

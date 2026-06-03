@@ -1,6 +1,4 @@
-//! I/O-free coroutine to send an IMAP LSUB command (RFC 3501 §6.3.9).
-//!
-//! Returns one row per subscribed mailbox matching the wildcard pattern.
+//! IMAP LSUB coroutine returning subscribed mailbox rows.
 
 use core::fmt;
 
@@ -29,7 +27,7 @@ use crate::{
     send::*,
 };
 
-/// Errors that can occur during LSUB progression.
+/// Failure causes during the IMAP LSUB flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxLsubError {
     #[error("IMAP LSUB failed: NO {0}")]
@@ -52,7 +50,6 @@ pub struct ImapMailboxLsub {
 }
 
 impl ImapMailboxLsub {
-    /// Creates a new LSUB coroutine.
     pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
         encode_inplace(&mut reference);
 
@@ -130,7 +127,6 @@ impl ImapCoroutine for ImapMailboxLsub {
 }
 
 enum State {
-    /// Send LSUB and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -150,7 +146,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns `* LSUB ...` rows then tagged OK.
     #[test]
     fn success_returns_rows() {
         let mut lsub = ImapMailboxLsub::new(
@@ -169,7 +164,6 @@ mod tests {
         assert_eq!(1, rows.len());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut lsub = ImapMailboxLsub::new(
@@ -191,7 +185,6 @@ mod tests {
         assert_eq!(text, "not allowed");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut lsub = ImapMailboxLsub::new(

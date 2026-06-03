@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP UNSELECT command (RFC 3691).
-//!
-//! Closes the currently selected mailbox without expunging `\Deleted` messages,
-//! returning the connection to the authenticated state. No state is returned;
-//! success is signalled by the tagged OK alone.
+//! IMAP UNSELECT coroutine: like CLOSE but without expunging \Deleted.
 
 use core::fmt;
 
@@ -22,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during UNSELECT progression.
+/// Failure causes during the IMAP UNSELECT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxUnselectError {
     #[error("IMAP UNSELECT failed: NO {0}")]
@@ -45,7 +41,6 @@ pub struct ImapMailboxUnselect {
 }
 
 impl ImapMailboxUnselect {
-    /// Creates a new UNSELECT coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -110,7 +105,6 @@ impl ImapCoroutine for ImapMailboxUnselect {
 }
 
 enum State {
-    /// Send UNSELECT and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -130,7 +124,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut unselect = ImapMailboxUnselect::new();
@@ -147,7 +140,6 @@ mod tests {
         expect_complete_ok(&mut unselect, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut unselect = ImapMailboxUnselect::new();
@@ -166,7 +158,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut unselect = ImapMailboxUnselect::new();
@@ -185,7 +176,6 @@ mod tests {
         assert_eq!(text, "UNSELECT not supported");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut unselect = ImapMailboxUnselect::new();

@@ -1,11 +1,4 @@
-//! I/O-free coroutine to fetch the IMAP server capability list (RFC 3501
-//! §6.1.1).
-//!
-//! Resolves the advertised capability from any of: the tagged OK response code,
-//! an untagged `CAPABILITY` data response, or an untagged status response
-//! carrying a `CAPABILITY` code. The first match wins; later matches overwrite
-//! earlier ones, mirroring how IMAP itself treats the most recent advertisement
-//! as authoritative.
+//! IMAP CAPABILITY coroutine returning the advertised capability list.
 
 use core::fmt;
 
@@ -25,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during CAPABILITY progression.
+/// Failure causes during the IMAP CAPABILITY flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapCapabilityGetError {
     #[error("IMAP CAPABILITY failed: NO {0}")]
@@ -50,7 +43,6 @@ pub struct ImapCapabilityGet {
 }
 
 impl ImapCapabilityGet {
-    /// Creates a new CAPABILITY coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -140,7 +132,6 @@ impl ImapCoroutine for ImapCapabilityGet {
 }
 
 enum State {
-    /// Send CAPABILITY and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -160,8 +151,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns an untagged CAPABILITY data
-    /// response followed by tagged OK.
     #[test]
     fn data_capability_returns_capabilities() {
         let mut cap = ImapCapabilityGet::new();
@@ -183,8 +172,6 @@ mod tests {
         assert!(caps.contains(&Capability::Idle));
     }
 
-    /// Capability advertised inside the tagged OK response code:
-    /// surface it just as if it had come on the untagged line.
     #[test]
     fn tagged_code_capability_returns_capabilities() {
         let mut cap = ImapCapabilityGet::new();
@@ -200,8 +187,6 @@ mod tests {
         assert_eq!(2, caps.len());
     }
 
-    /// Tagged OK without any CAPABILITY advertisement: surface
-    /// MissingCapability.
     #[test]
     fn no_capability_returns_missing_error() {
         let mut cap = ImapCapabilityGet::new();
@@ -217,7 +202,6 @@ mod tests {
         assert!(matches!(err, ImapCapabilityGetError::MissingCapability));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut cap = ImapCapabilityGet::new();
@@ -236,7 +220,6 @@ mod tests {
         assert_eq!(text, "server is sulking");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut cap = ImapCapabilityGet::new();

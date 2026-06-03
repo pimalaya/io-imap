@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP ID command (RFC 2971).
-//!
-//! Either form is supported: sending bare `ID NIL` to identify anonymously, or
-//! sending `ID (key val ...)` with the caller-supplied parameter list. The
-//! response parameter list (if any) is returned on success.
+//! IMAP ID coroutine returning the server's identification parameters.
 
 use core::fmt;
 
@@ -22,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during ID progression.
+/// Failure causes during the IMAP ID flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapServerIdError {
     #[error("IMAP ID failed: NO {0}")]
@@ -42,19 +38,16 @@ pub enum ImapServerIdError {
 /// Options for [`ImapServerId::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapServerIdOptions {
-    /// Parameter list sent on the wire. When `None`, the coroutine sends `ID
-    /// NIL` (RFC 2971 §3.1, anonymous identification). When `Some(_)`, the
-    /// coroutine sends `ID (key val ...)` with the caller-supplied pairs.
+    /// `None` sends `ID NIL`; `Some(_)` sends `ID (key val ...)`.
     pub parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free IMAP ID coroutine.
+/// I/O-free IMAP ID coroutine returning the server's identification.
 pub struct ImapServerId {
     state: State,
 }
 
 impl ImapServerId {
-    /// Creates a new ID coroutine.
     pub fn new(opts: ImapServerIdOptions) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -123,7 +116,6 @@ impl ImapCoroutine for ImapServerId {
 }
 
 enum State {
-    /// Send the ID command and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -143,8 +135,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path with `ID NIL`: server replies with `ID NIL`, the
-    /// coroutine returns `Ok(None)`.
     #[test]
     fn nil_success_returns_none() {
         let mut id = ImapServerId::new(ImapServerIdOptions::default());
@@ -162,8 +152,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// Happy path with server-side parameters: server returns
-    /// `ID (key val ...)`, the coroutine surfaces the parsed pairs.
     #[test]
     fn server_parameters_returns_some() {
         let mut id = ImapServerId::new(ImapServerIdOptions::default());
@@ -181,7 +169,6 @@ mod tests {
         assert_eq!(2, params.len());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut id = ImapServerId::new(ImapServerIdOptions::default());
@@ -200,7 +187,6 @@ mod tests {
         assert_eq!(text, "ID rejected");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut id = ImapServerId::new(ImapServerIdOptions::default());
@@ -219,7 +205,6 @@ mod tests {
         assert_eq!(text, "ID not supported");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut id = ImapServerId::new(ImapServerIdOptions::default());

@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP SEARCH command (RFC 3501 §6.4.4),
-//! optionally as the `UID SEARCH` variant.
-//!
-//! Returns the matched sequence numbers (or UIDs when `opts.uid` is set), in
-//! server order.
+//! IMAP SEARCH coroutine returning the matched ids in server order.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -23,7 +19,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during SEARCH progression.
+/// Failure causes during the IMAP SEARCH flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageSearchError {
     #[error("IMAP SEARCH failed: NO {0}")]
@@ -43,9 +39,7 @@ pub enum ImapMessageSearchError {
 /// Options for [`ImapMessageSearch::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageSearchOptions {
-    /// When `true`, send `UID SEARCH` (RFC 3501 §6.4.8); the returned numbers
-    /// are UIDs rather than sequence numbers. Default: `false` (plain
-    /// `SEARCH`).
+    /// When `true`, send `UID SEARCH`; returned ids are UIDs.
     pub uid: bool,
 }
 
@@ -55,7 +49,6 @@ pub struct ImapMessageSearch {
 }
 
 impl ImapMessageSearch {
-    /// Creates a new SEARCH coroutine.
     pub fn new(criteria: Vec1<SearchKey<'static>>, opts: ImapMessageSearchOptions) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -125,7 +118,6 @@ impl ImapCoroutine for ImapMessageSearch {
 }
 
 enum State {
-    /// Send SEARCH (or UID SEARCH) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -149,7 +141,6 @@ mod tests {
         Vec1::try_from(vec![SearchKey::All]).expect("one criterion")
     }
 
-    /// Happy path: server returns `* SEARCH ...` line then tagged OK.
     #[test]
     fn success_returns_ids() {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());
@@ -169,7 +160,6 @@ mod tests {
         assert_eq!(5, ids[2].get());
     }
 
-    /// UID flag flips the wire keyword to `UID SEARCH`.
     #[test]
     fn uid_variant_sends_uid_search() {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions { uid: true });
@@ -180,7 +170,6 @@ mod tests {
         assert!(line.contains("UID SEARCH "));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());
@@ -199,7 +188,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());

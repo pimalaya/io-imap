@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP EXPUNGE command (RFC 3501 §6.4.3).
-//!
-//! Permanently removes all messages in the selected mailbox that are flagged
-//! `\Deleted`. Returns the list of expunged sequence numbers in server order.
+//! IMAP EXPUNGE coroutine returning the expunged sequence numbers.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -21,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during EXPUNGE progression.
+/// Failure causes during the IMAP EXPUNGE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxExpungeError {
     #[error("IMAP EXPUNGE failed: NO {0}")]
@@ -44,7 +41,6 @@ pub struct ImapMailboxExpunge {
 }
 
 impl ImapMailboxExpunge {
-    /// Creates a new EXPUNGE coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -116,7 +112,6 @@ impl ImapCoroutine for ImapMailboxExpunge {
 }
 
 enum State {
-    /// Send EXPUNGE and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -136,9 +131,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server emits `* N EXPUNGE` lines for each removed
-    /// message, then tagged OK; the coroutine returns the sequence
-    /// numbers in server order.
     #[test]
     fn success_collects_expunged_seqs() {
         let mut expunge = ImapMailboxExpunge::new();
@@ -160,7 +152,6 @@ mod tests {
         assert_eq!(7, seqs[2].get());
     }
 
-    /// Happy path with nothing to expunge: empty list, still Ok.
     #[test]
     fn empty_returns_empty_vec() {
         let mut expunge = ImapMailboxExpunge::new();
@@ -176,7 +167,6 @@ mod tests {
         assert!(seqs.is_empty());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut expunge = ImapMailboxExpunge::new();
@@ -195,7 +185,6 @@ mod tests {
         assert_eq!(text, "mailbox is read-only");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut expunge = ImapMailboxExpunge::new();

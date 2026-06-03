@@ -1,32 +1,6 @@
-//! I/O-free coroutine to send an IMAP command and receive a response.
-//!
-//! This is the base coroutine that all higher-level IMAP coroutines delegate
-//! to. It serialises the command via `imap_codec`, drives the read/write cycle
-//! via [`SendImapCommandResult::WantsRead`] /
-//! [`SendImapCommandResult::WantsWrite`], and feeds the response bytes back
-//! through a borrowed [`Fragmentizer`].
-//!
-//! Callers drive the coroutine in a loop:
-//!
-//! ```rust,ignore
-//! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
-//! let mut send = SendImapCommand::new(codec, message);
-//! let mut arg: Option<&[u8]> = None;
-//!
-//! loop {
-//!     match send.resume(&mut fragmentizer, arg.take()) {
-//!         SendImapCommandResult::Ok { .. } => break,
-//!         SendImapCommandResult::Err(err) => panic!("{err}"),
-//!         SendImapCommandResult::WantsRead => {
-//!             let n = stream.read(&mut buf).unwrap();
-//!             arg = Some(&buf[..n]);
-//!         }
-//!         SendImapCommandResult::WantsWrite(bytes) => stream.write_all(&bytes).unwrap(),
-//!     }
-//! }
-//! ```
-//!
-//! [`Fragmentizer`]: imap_codec::fragmentizer::Fragmentizer
+//! Base coroutine that all higher-level IMAP coroutines delegate to:
+//! serialises a command via `imap_codec`, drives read/write, and feeds
+//! responses back through the borrowed `Fragmentizer`.
 
 use core::mem;
 
@@ -49,7 +23,7 @@ use thiserror::Error;
 
 use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
 
-/// Errors that can occur during the coroutine progression.
+/// Failure causes raised by [`SendImapCommand`].
 #[derive(Clone, Debug, Error)]
 pub enum SendImapCommandError {
     #[error("Reached unexpected EOF on IMAP stream")]
@@ -62,9 +36,8 @@ pub enum SendImapCommandError {
     MessageTooLong(Secret<Box<[u8]>>),
 }
 
-/// Output emitted when the coroutine terminates its progression.
+/// Step output emitted by [`SendImapCommand::resume`].
 pub enum SendImapCommandResult<T: Encoder> {
-    /// The coroutine has successfully terminated its execution.
     Ok {
         message: T::Message<'static>,
         data: Vec<Data<'static>>,
@@ -73,27 +46,19 @@ pub enum SendImapCommandResult<T: Encoder> {
         bye: Option<Bye<'static>>,
         continuation_request: Option<CommandContinuationRequest<'static>>,
     },
-    /// The coroutine needs more bytes to be read from the IMAP stream.
     WantsRead,
-    /// The coroutine wants the given bytes to be written to the IMAP stream.
     WantsWrite(Vec<u8>),
-    /// The coroutine encountered an error.
     Err(SendImapCommandError),
 }
 
 #[derive(Debug)]
 enum State {
-    /// Pull line/literal fragments from the encoder into a write buffer.
     Serialize,
-    /// Drain `arg` into the fragmentizer (or yield [`WantsRead`] when empty).
-    ///
-    /// [`WantsRead`]: SendImapCommandResult::WantsRead
     Read,
-    /// Decode the bytes accumulated in the fragmentizer.
     Deserialize,
 }
 
-/// I/O-free coroutine to send an IMAP command and receive a response.
+/// I/O-free coroutine sending one IMAP command and parsing its response.
 pub struct SendImapCommand<T: Encoder> {
     message: Option<T::Message<'static>>,
     state: State,
@@ -111,7 +76,6 @@ pub struct SendImapCommand<T: Encoder> {
 }
 
 impl<T: Encoder> SendImapCommand<T> {
-    /// Creates a new coroutine for the given message.
     pub fn new(encoder: T, message: T::Message<'static>) -> Self {
         let fragments = encoder.encode(&message).collect();
 
@@ -132,12 +96,8 @@ impl<T: Encoder> SendImapCommand<T> {
         }
     }
 
-    /// Advances the coroutine.
-    ///
-    /// Pass [`None`] when there is no data to provide (initial call,
-    /// after a write). Pass `Some(data)` with bytes read from the
-    /// stream after a [`SendImapCommandResult::WantsRead`]. Pass
-    /// `Some(&[])` to signal EOF.
+    /// Pass `None` initially or after `WantsWrite`, `Some(bytes)`
+    /// after `WantsRead`, `Some(&[])` on EOF.
     pub fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
@@ -177,15 +137,10 @@ impl<T: Encoder> SendImapCommand<T> {
                         }
                     }
 
-                    if buf.is_empty() {
-                        // Nothing pending to send: expect a server message
-                        // (e.g. tagged response after the previous write,
-                        // or further data once the read state is entered).
-                        self.state = State::Read;
-                    } else {
+                    if !buf.is_empty() {
                         self.wants_write = Some(buf);
-                        self.state = State::Read;
                     }
+                    self.state = State::Read;
                 }
                 State::Read => match arg.take() {
                     Some(&[]) => {
@@ -274,9 +229,7 @@ impl<T: Encoder> SendImapCommand<T> {
     }
 }
 
-/// Successful payload returned by [`SendImapCommand`] through the
-/// [`ImapCoroutine`] trait surface; mirrors the fields of
-/// [`SendImapCommandResult::Ok`].
+/// Trait-surface successful output: mirror of [`SendImapCommandResult::Ok`].
 #[derive(Debug)]
 pub struct SendImapCommandOk<T: Encoder> {
     pub message: T::Message<'static>,
@@ -296,8 +249,7 @@ impl<T: Encoder> ImapCoroutine for SendImapCommand<T> {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        // NOTE: fully qualified path keeps method resolution on the
-        // inherent `resume`, avoiding recursion into this trait impl.
+        // NOTE: qualified path avoids recursing into this trait impl.
         match SendImapCommand::<T>::resume(self, fragmentizer, arg) {
             SendImapCommandResult::WantsRead => ImapCoroutineState::Yielded(ImapYield::WantsRead),
             SendImapCommandResult::WantsWrite(bytes) => {

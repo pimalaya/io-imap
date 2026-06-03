@@ -1,9 +1,4 @@
-//! I/O-free coroutine to send an IMAP COPY command (RFC 3501 §6.4.7),
-//! optionally as the `UID COPY` variant.
-//!
-//! Surfaces the `[COPYUID uidvalidity src-uids dst-uids]` response code defined
-//! by UIDPLUS (RFC 4315) when the server announces it, decoded as
-//! `(uidvalidity, source UIDs, destination UIDs)`.
+//! IMAP COPY coroutine surfacing the optional COPYUID triple.
 
 use core::fmt;
 
@@ -26,12 +21,10 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Output of the IMAP `COPY` (and `MOVE`) command: the
-/// `[COPYUID uidvalidity src-uids dst-uids]` response code (RFC 4315)
-/// if the server returned one.
+/// `(uid_validity, source UIDs, destination UIDs)` from COPYUID.
 pub type ImapCopyUid = Option<(u32, Vec<u32>, Vec<u32>)>;
 
-/// Errors that can occur during COPY progression.
+/// Failure causes during the IMAP COPY flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageCopyError {
     #[error("IMAP COPY failed: NO {0}")]
@@ -51,9 +44,7 @@ pub enum ImapMessageCopyError {
 /// Options for [`ImapMessageCopy::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageCopyOptions {
-    /// When `true`, send `UID COPY` (RFC 3501 §6.4.8); the `sequence_set` then
-    /// holds UIDs rather than sequence numbers.  Default: `false` (plain `COPY`
-    /// on sequence numbers).
+    /// When `true`, send `UID COPY` and treat `sequence_set` as UIDs.
     pub uid: bool,
 }
 
@@ -63,7 +54,6 @@ pub struct ImapMessageCopy {
 }
 
 impl ImapMessageCopy {
-    /// Creates a new COPY coroutine.
     pub fn new(
         sequence_set: SequenceSet,
         mut mailbox: Mailbox<'static>,
@@ -148,7 +138,6 @@ impl ImapCoroutine for ImapMessageCopy {
 }
 
 enum State {
-    /// Send COPY (or UID COPY) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -160,9 +149,7 @@ impl fmt::Display for State {
     }
 }
 
-/// Expand a `UidSet` into a sorted `Vec<u32>`. Shared with the
-/// [`ImapMessageMove`](crate::rfc6851::r#move::ImapMessageMove) coroutine which
-/// surfaces the same `[COPYUID …]` code.
+/// Expand a `UidSet` into a sorted `Vec<u32>`; shared with MOVE.
 pub(crate) fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
     let mut uids = Vec::new();
 
@@ -194,8 +181,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path with COPYUID (UIDPLUS): server returns the
-    /// `[COPYUID …]` code; the coroutine decodes source/destination.
     #[test]
     fn success_with_copyuid_returns_uids() {
         let mut copy = ImapMessageCopy::new(
@@ -221,7 +206,6 @@ mod tests {
         assert_eq!(vec![10, 11, 12], destination);
     }
 
-    /// UID flag flips the wire keyword to `UID COPY`.
     #[test]
     fn uid_variant_sends_uid_copy() {
         let mut copy = ImapMessageCopy::new(
@@ -236,8 +220,6 @@ mod tests {
         assert!(line.contains("UID COPY 42 Archive"));
     }
 
-    /// Server omits COPYUID (UIDPLUS not advertised): still succeed
-    /// with `None`.
     #[test]
     fn success_without_copyuid_returns_none() {
         let mut copy = ImapMessageCopy::new(
@@ -257,7 +239,6 @@ mod tests {
         assert!(copyuid.is_none());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut copy = ImapMessageCopy::new(
@@ -280,7 +261,6 @@ mod tests {
         assert_eq!(text, "destination mailbox does not exist");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut copy = ImapMessageCopy::new(

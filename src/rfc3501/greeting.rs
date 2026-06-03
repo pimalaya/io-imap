@@ -1,10 +1,5 @@
-//! I/O-free coroutine to read the IMAP server greeting (RFC 3501 §7.1).
-//!
-//! Server-initiated: no command is sent. The coroutine drains bytes from the
-//! socket into the fragmentizer until a complete greeting line is available,
-//! then decodes it. If [`ImapGreetingGetOptions::ensure_capabilities`] is set
-//! and the greeting did not carry a `[CAPABILITY ...]` response code, an extra
-//! `CAPABILITY` round-trip runs before completing.
+//! IMAP server greeting reader; optionally forces a CAPABILITY round-trip
+//! if the greeting carries none.
 
 use core::{fmt, mem};
 
@@ -25,7 +20,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::capability::*};
 
-/// Errors that can occur during greeting progression.
+/// Failure causes while reading the IMAP greeting.
 #[derive(Clone, Debug, Error)]
 pub enum ImapGreetingGetError {
     #[error("IMAP greeting failed: BYE {0}")]
@@ -44,7 +39,7 @@ pub enum ImapGreetingGetError {
     Capability(#[from] ImapCapabilityGetError),
 }
 
-/// Terminal success payload of [`ImapGreetingGet`].
+/// Decoded greeting outcome.
 #[derive(Debug)]
 pub struct ImapGreetingOk {
     pub capability: Vec<Capability<'static>>,
@@ -54,9 +49,7 @@ pub struct ImapGreetingOk {
 /// Options for [`ImapGreetingGet::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapGreetingGetOptions {
-    /// When `true` and the greeting carried no `[CAPABILITY ...]`
-    /// code, drive an extra `CAPABILITY` round-trip before completing.
-    /// Default: `false`.
+    /// Fetch capabilities explicitly when the greeting carries none.
     pub ensure_capabilities: bool,
 }
 
@@ -71,7 +64,6 @@ pub struct ImapGreetingGet {
 }
 
 impl ImapGreetingGet {
-    /// Creates a new greeting coroutine.
     pub fn new(opts: ImapGreetingGetOptions) -> Self {
         Self {
             codec: GreetingCodec::new(),
@@ -164,11 +156,8 @@ impl ImapCoroutine for ImapGreetingGet {
                             }
                         }
                     }
-                    Some(FragmentInfo::Literal { .. }) => {
-                        // NOTE: greetings never carry literals; the
-                        // fragmentizer should not produce one here.
-                        unreachable!();
-                    }
+                    // NOTE: greetings never carry literals.
+                    Some(FragmentInfo::Literal { .. }) => unreachable!(),
                     None => {
                         self.state = State::Read;
                     }
@@ -186,13 +175,8 @@ impl ImapCoroutine for ImapGreetingGet {
 }
 
 enum State {
-    /// Drain bytes into the fragmentizer until a complete greeting
-    /// line is available.
     Read,
-    /// Decode the assembled greeting line.
     Deserialize,
-    /// Run an extra CAPABILITY round-trip when the greeting did not
-    /// piggyback a capability list.
     Capability(ImapCapabilityGet),
 }
 
@@ -212,9 +196,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: greeting carries an inline `[CAPABILITY ...]` code;
-    /// the coroutine surfaces the capability list directly without an
-    /// extra CAPABILITY round-trip.
     #[test]
     fn ok_with_inline_capability_returns_ok() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions {
@@ -230,8 +211,6 @@ mod tests {
         assert_eq!(2, ok.capability.len());
     }
 
-    /// Greeting with no capability code triggers an extra CAPABILITY
-    /// round-trip when ensure_capabilities is set.
     #[test]
     fn ok_without_inline_capability_drives_extra_round_trip() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions {
@@ -243,7 +222,6 @@ mod tests {
         expect_wants_write_after(&mut greeting, &mut frag, b"* OK hello\r\n");
     }
 
-    /// PREAUTH greeting: pre_authenticated flag is set.
     #[test]
     fn preauth_sets_flag() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
@@ -256,7 +234,6 @@ mod tests {
         assert!(ok.pre_authenticated);
     }
 
-    /// BYE greeting: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
@@ -271,7 +248,6 @@ mod tests {
         assert_eq!(text, "service unavailable");
     }
 
-    /// EOF on the initial read: surface Eof.
     #[test]
     fn eof_returns_eof_error() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());

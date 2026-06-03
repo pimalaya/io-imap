@@ -1,13 +1,4 @@
-//! I/O-free coroutine to watch IMAP mailbox changes using the IDLE extension
-//! (RFC 2177).
-//!
-//! Shutdown is cooperative: the caller flips the [`AtomicBool`] handed to
-//! [`ImapIdle::new`], the coroutine reads it on its next loop iteration and
-//! transitions from [`State::Read`] to [`State::Done`], sending `DONE` cleanly
-//! before completing with `Ok(())`. When the `client` feature is enabled, the
-//! coroutine also refreshes the IDLE every [`ImapIdleOptions::timeout`]
-//! (default 29s) to keep the connection alive against servers that drop long
-//! idle sockets.
+//! IMAP IDLE coroutine yielding mailbox change events.
 
 use core::{
     fmt, mem,
@@ -38,13 +29,11 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Default IDLE refresh window when no [`ImapIdleOptions::timeout`]
-/// override is supplied. Set conservatively below the 29-minute upper
-/// bound recommended by RFC 2177 §3 to survive aggressive middleboxes.
+/// Refresh interval kept under the 29-minute RFC 2177 §3 cap.
 #[cfg(feature = "client")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 
-/// Errors that can occur during IDLE progression.
+/// Failure causes during the IMAP IDLE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapIdleError {
     #[error("IMAP IDLE failed: NO {0}")]
@@ -73,26 +62,18 @@ pub enum ImapIdleError {
     Send(#[from] SendImapCommandError),
 }
 
-/// One batch of unilateral untagged responses delivered during an
-/// IDLE.
+/// Batch of unilateral untagged responses received during an IDLE.
 #[derive(Debug)]
 pub struct ImapIdleEvent {
     pub untagged: Vec<StatusBody<'static>>,
     pub data: Vec<Data<'static>>,
 }
 
-/// Per-coroutine Yield: socket I/O step requests on one axis, untagged-response
-/// batches on the other. The driver dispatches on the variant: I/O variants
-/// pump the IMAP socket; [`Self::Event`] is delivered to the caller (callback /
-/// channel / async stream).
+/// Yield variants from the IDLE coroutine.
 #[derive(Debug)]
 pub enum ImapIdleYield {
-    /// Socket: read more bytes and feed them back on the next resume.
     WantsRead,
-    /// Socket: write these bytes; the next resume typically takes `None`.
     WantsWrite(Vec<u8>),
-    /// Domain: one batch of unilateral untagged responses received during the
-    /// IDLE.
     Event(ImapIdleEvent),
 }
 
@@ -108,16 +89,12 @@ impl From<ImapYield> for ImapIdleYield {
 /// Options for [`ImapIdle::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapIdleOptions {
-    /// Server-side refresh interval. When the `client` feature is on and the
-    /// timer elapses, the coroutine sends `DONE` and re-issues `IDLE` to keep
-    /// the connection from being dropped by aggressive middleboxes. When
-    /// `None`, falls back to [`IDLE_DEFAULT_TIMEOUT`]. Without the `client`
-    /// feature this field is unused since [`Instant`] is unavailable in
-    /// `no_std`.
+    /// Refresh interval; defaults to [`IDLE_DEFAULT_TIMEOUT`]. Unused
+    /// without the `client` feature.
     pub timeout: Option<Duration>,
 }
 
-/// I/O-free coroutine watching IMAP mailbox changes via IDLE.
+/// I/O-free IMAP IDLE coroutine yielding mailbox change events.
 pub struct ImapIdle {
     tag: TagGenerator,
     state: State,
@@ -134,12 +111,7 @@ pub struct ImapIdle {
 }
 
 impl ImapIdle {
-    /// Creates a new coroutine.
-    ///
-    /// `done` is the shared shutdown flag: flip it to `true` to ask the
-    /// coroutine to wind down at its next chance (sends `DONE` and completes
-    /// with `Ok(())`). Pass `Arc::new(AtomicBool::new(false))` when no external
-    /// shutdown is needed.
+    /// Flip `done` to `true` to wind down with a clean `DONE`.
     pub fn new(done: Arc<AtomicBool>, opts: ImapIdleOptions) -> Self {
         let mut tag = TagGenerator::new();
 
@@ -204,15 +176,8 @@ impl ImapCoroutine for ImapIdle {
 
             match &mut self.state {
                 State::Idle(send) => {
-                    // NOTE: an IMAP server can legally pack the
-                    // continuation-request line and one or more unsolicited
-                    // untagged responses into the same physical send, e.g. `+
-                    // idling\r\n* 10 FETCH …` when a flag change happens just
-                    // before the server processes our `IDLE`. SendImapCommand
-                    // parses them all in one resume and returns them via `data`
-                    // / `untagged`; surface them here so the caller sees the
-                    // changes immediately instead of waiting for the next
-                    // socket read.
+                    // NOTE: servers may pack untagged responses into the same
+                    // frame as `+ idling`; surface them immediately.
                     let out = imap_try!(send, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
@@ -292,15 +257,11 @@ impl ImapCoroutine for ImapIdle {
                                     Ok(Response::Status(Status::Untagged(status))) => {
                                         self.untagged.push(status.into_static());
                                     }
-                                    Ok(Response::Status(Status::Tagged(_))) => {
-                                        // ignore tagged during IDLE.
-                                    }
+                                    Ok(Response::Status(Status::Tagged(_))) => {}
                                     Ok(Response::Status(Status::Bye(bye))) => {
                                         self.bye.replace(bye.into_static());
                                     }
-                                    Ok(Response::CommandContinuationRequest(_)) => {
-                                        // ignore continuation request during IDLE.
-                                    }
+                                    Ok(Response::CommandContinuationRequest(_)) => {}
                                     Err(decode_err) => {
                                         let bytes = fragmentizer.message_bytes();
                                         let bytes = Secret::new(bytes.into());
@@ -382,12 +343,8 @@ impl ImapCoroutine for ImapIdle {
 }
 
 enum State {
-    /// Send the IDLE command and await the continuation request.
     Idle(SendImapCommand<CommandCodec>),
-    /// Read unilateral responses until the shutdown flag is set or the refresh
-    /// timeout elapses.
     Read,
-    /// Send the DONE command and await the tagged response.
     Done(SendImapCommand<IdleDoneCodec>),
 }
 
@@ -409,9 +366,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: client sends `IDLE`, server replies with the
-    /// continuation request, caller flips the shutdown flag, client
-    /// sends `DONE`, server returns tagged OK.
     #[test]
     fn shutdown_returns_ok() {
         let done = Arc::new(AtomicBool::new(false));
@@ -436,8 +390,6 @@ mod tests {
         expect_complete_ok(&mut idle, &mut frag, reply.as_bytes());
     }
 
-    /// Unilateral responses arriving during the read phase are
-    /// emitted as a single `Event`.
     #[test]
     fn unsolicited_during_read_yields_event() {
         let done = Arc::new(AtomicBool::new(false));
@@ -453,9 +405,6 @@ mod tests {
         assert!(event.untagged.is_empty());
     }
 
-    /// Server piggy-backs unsolicited responses on the continuation
-    /// request frame: the coroutine emits them immediately, then
-    /// transitions to the read phase.
     #[test]
     fn unsolicited_piggyback_on_continuation_yields_event() {
         let done = Arc::new(AtomicBool::new(false));
@@ -469,8 +418,6 @@ mod tests {
         assert_eq!(1, event.data.len());
     }
 
-    /// Tagged BAD before the continuation request: surface text
-    /// verbatim.
     #[test]
     fn idle_tagged_bad_returns_bad_error() {
         let done = Arc::new(AtomicBool::new(false));
@@ -490,7 +437,6 @@ mod tests {
         assert_eq!(text, "IDLE not supported");
     }
 
-    /// Tagged NO returned after DONE: surface text verbatim.
     #[test]
     fn done_tagged_no_returns_no_error() {
         let done = Arc::new(AtomicBool::new(false));

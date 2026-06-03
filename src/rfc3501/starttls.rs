@@ -1,11 +1,6 @@
-//! I/O-free coroutine to perform STARTTLS negotiation (RFC 3501 §6.2.1).
-//!
-//! The coroutine discards the server greeting, sends a STARTTLS command, and
-//! discards the tagged response, then completes with the bytes received past
-//! that tagged response. RFC 3501 §6.2.1 forbids the server from sending
-//! anything past the tagged response; a non-empty return value is a classic
-//! STARTTLS-injection signal that the caller should refuse before upgrading
-//! the underlying socket to TLS.
+//! IMAP STARTTLS coroutine; returns any bytes received past the tagged
+//! response. RFC 3501 §6.2.1 forbids trailing bytes, so a non-empty return
+//! value is a STARTTLS-injection signal: refuse the upgrade.
 
 use core::{fmt, mem};
 
@@ -26,14 +21,14 @@ use thiserror::Error;
 
 use crate::coroutine::*;
 
-/// Errors that can occur during STARTTLS progression.
+/// Failure causes during the IMAP STARTTLS handshake.
 #[derive(Clone, Debug, Error)]
 pub enum ImapStartTlsError {
     #[error("IMAP STARTTLS failed: reached unexpected EOF on stream")]
     Eof,
 }
 
-/// I/O-free STARTTLS coroutine.
+/// I/O-free IMAP STARTTLS coroutine.
 pub struct ImapStartTls {
     tag_bytes: Vec<u8>,
     state: State,
@@ -43,7 +38,6 @@ pub struct ImapStartTls {
 }
 
 impl ImapStartTls {
-    /// Creates a new STARTTLS coroutine.
     pub fn new() -> Self {
         let tag_bytes = TagGenerator::new().generate().as_ref().as_bytes().to_vec();
 
@@ -168,12 +162,8 @@ impl ImapCoroutine for ImapStartTls {
 }
 
 enum State {
-    /// Discard the greeting line before sending STARTTLS.
     DiscardGreeting,
-    /// Push the STARTTLS command onto the write queue.
     WriteStartTls,
-    /// Discard the tagged STARTTLS response and return any trailing
-    /// bytes to the caller.
     DiscardStartTls,
 }
 

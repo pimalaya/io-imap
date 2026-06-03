@@ -1,18 +1,9 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL XOAUTH2
-//! (Google's pre-standard OAuth 2.0 mechanism, also accepted by Microsoft
-//! Exchange Online). Both flows are supported:
+//! IMAP SASL XOAUTH2 coroutine (Google's pre-standard OAuth 2.0
+//! mechanism, also accepted by Microsoft Exchange Online); supports
+//! both the non-IR and SASL-IR (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthXoauth2::new`]): bare `AUTHENTICATE XOAUTH2`, then
-//!   credentials uploaded as continuation data after the server's empty SASL
-//!   challenge.
-//! * SASL-IR (RFC 4959, [`ImapAuthXoauth2::new_ir`]): credentials embedded
-//!   inline as the initial response so the auth completes in a single
-//!   round-trip on success.
-//!
-//! On authentication failure the server returns a continuation carrying a
-//! base64 JSON error; the client acknowledges it with an empty line and the
-//! server then sends the final tagged NO. See
-//! <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>.
+//! XOAUTH2: <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -40,7 +31,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during XOAUTH2 progression.
+/// Failure causes during the SASL XOAUTH2 flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthXoauth2Error {
     #[error("IMAP AUTHENTICATE XOAUTH2 failed: NO {0}")]
@@ -73,23 +64,17 @@ pub enum ImapAuthXoauth2Error {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the XOAUTH2 sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthXoauth2::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthXoauth2Options {
-    /// When `true`, embed credentials inline as the SASL initial
-    /// response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the credentials are uploaded
-    /// as continuation data after the server's empty challenge; the
-    /// coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline credentials);
+    /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL XOAUTH2 coroutine. The initial [`State`] variant
-/// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
-/// and SASL-IR flows.
+/// I/O-free SASL XOAUTH2 coroutine.
 pub struct ImapAuthXoauth2 {
     state: State,
     error: Option<String>,
@@ -98,9 +83,6 @@ pub struct ImapAuthXoauth2 {
 }
 
 impl ImapAuthXoauth2 {
-    /// Creates a new XOAUTH2 coroutine. `opts.initial_request`
-    /// selects between the non-IR flow ([`State::Send`]) and the
-    /// SASL-IR flow ([`State::SendIr`]).
     pub fn new(
         user: impl AsRef<str>,
         token: impl AsRef<str>,
@@ -402,10 +384,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: credentials sent inline, server accepts on the first
-    /// round-trip with tagged OK.
-    ///
-    /// Refs: https://github.com/pimalaya/io-imap/issues/1
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthXoauth2Options {
@@ -427,8 +405,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server rejects the inline credentials in the very
-    /// first continuation.
     #[test]
     fn ir_invalid_token_returns_no_with_error() {
         let opts = ImapAuthXoauth2Options {
@@ -460,7 +436,6 @@ mod tests {
         assert_eq!(err, err_json);
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthXoauth2Options {
@@ -484,9 +459,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: client sends bare AUTHENTICATE, server answers with
-    /// empty continuation challenge, client sends base64-encoded credentials as
-    /// continuation data, server returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthXoauth2Options::default();
@@ -509,9 +481,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server rejects the uploaded credentials with a base64
-    /// JSON error in a continuation; client acknowledges with empty `\r\n`,
-    /// server returns tagged NO.
     #[test]
     fn non_ir_invalid_token_returns_no_with_error() {
         let opts = ImapAuthXoauth2Options::default();

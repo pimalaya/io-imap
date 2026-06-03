@@ -1,13 +1,8 @@
-//! I/O-free coroutine to authenticate an IMAP account via the SASL LOGIN
-//! mechanism (legacy two-prompt mechanism, no RFC: pre-dates the IETF SASL
-//! standardisation but is still widely deployed).  Both flows are supported:
+//! IMAP SASL LOGIN coroutine (legacy two-prompt mechanism, pre-IETF);
+//! supports both the non-IR and SASL-IR (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthLogin::new`] with `initial_request: false`): bare
-//!   `AUTHENTICATE LOGIN`, then the username and the password are each uploaded
-//!   as continuation data after the server's `Username:` and `Password:`
-//!   challenges.
-//! * SASL-IR (RFC 4959, `initial_request: true`): the username is embedded
-//!   inline as the initial response so only the password round-trip remains.
+//! Background: <https://datatracker.ietf.org/doc/html/draft-murchison-sasl-login>
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -32,7 +27,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during LOGIN progression.
+/// Failure causes during the SASL LOGIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthLoginError {
     #[error("IMAP AUTHENTICATE LOGIN failed: NO {0}")]
@@ -63,23 +58,17 @@ pub enum ImapAuthLoginError {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the LOGIN sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthLogin::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthLoginOptions {
-    /// When `true`, embed the username inline as the SASL initial
-    /// response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, the username is uploaded as
-    /// continuation data after the server's `Username:` challenge;
-    /// the coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline username);
+    /// `false` selects the non-IR two-prompt flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL LOGIN coroutine. The initial [`State`] variant
-/// ([`State::Send`] vs [`State::SendIr`]) selects between the non-IR
-/// and SASL-IR flows.
+/// I/O-free SASL LOGIN coroutine.
 pub struct ImapAuthLogin {
     state: State,
     password: String,
@@ -88,9 +77,6 @@ pub struct ImapAuthLogin {
 }
 
 impl ImapAuthLogin {
-    /// Creates a new LOGIN coroutine. `opts.initial_request` selects
-    /// between the non-IR flow ([`State::Send`]) and the SASL-IR flow
-    /// ([`State::SendIr`]).
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -365,8 +351,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: username embedded inline, only the password
-    /// continuation round-trip remains, server returns tagged OK.
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthLoginOptions {
@@ -394,8 +378,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server accepts the username but rejects the
-    /// password with tagged NO.
     #[test]
     fn ir_invalid_password_returns_no_error() {
         let opts = ImapAuthLoginOptions {
@@ -421,7 +403,6 @@ mod tests {
         assert_eq!(text, "authentication failed");
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthLoginOptions {
@@ -445,9 +426,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: client sends bare AUTHENTICATE, server walks
-    /// the client through `Username:` then `Password:` continuations,
-    /// returns tagged OK.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthLoginOptions::default();
@@ -477,8 +455,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: both username and password upload, server
-    /// returns tagged NO at the end.
     #[test]
     fn non_ir_invalid_password_returns_no_error() {
         let opts = ImapAuthLoginOptions::default();

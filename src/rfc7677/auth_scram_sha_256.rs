@@ -1,15 +1,8 @@
-//! I/O-free coroutine to authenticate an IMAP account via SASL
-//! SCRAM-SHA-256 (RFC 7677). Both flows are supported:
+//! IMAP SASL SCRAM-SHA-256 coroutine; supports both the non-IR and
+//! SASL-IR (RFC 4959) flows.
 //!
-//! * non-IR ([`ImapAuthScramSha256::new`] with `initial_request:
-//!   false`): bare `AUTHENTICATE SCRAM-SHA-256`, then the
-//!   client-first-message is uploaded as continuation data after the
-//!   server's empty SASL challenge.
-//! * SASL-IR (RFC 4959, `initial_request: true`): the
-//!   client-first-message is embedded inline as the initial response
-//!   so one round-trip is saved.
-//!
-//! Both flows converge on the client-final/server-final exchange.
+//! SCRAM: <https://www.rfc-editor.org/rfc/rfc5802>
+//! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 
 use core::{fmt, mem};
 
@@ -42,7 +35,7 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Errors that can occur during SCRAM-SHA-256 progression.
+/// Failure causes during the SASL SCRAM-SHA-256 flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthScramSha256Error {
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: NO {0}")]
@@ -94,23 +87,17 @@ pub enum ImapAuthScramSha256Error {
     ServerId(#[from] ImapServerIdError),
 }
 
-/// Selects the SCRAM-SHA-256 sub-flow and any post-authentication
-/// round-trips.
+/// Options for [`ImapAuthScramSha256::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapAuthScramSha256Options {
-    /// When `true`, embed the client-first-message inline as the SASL
-    /// initial response (RFC 4959); the coroutine starts in
-    /// [`State::SendIr`]. When `false`, it is uploaded as
-    /// continuation data after the server's empty challenge; the
-    /// coroutine starts in [`State::Send`].
+    /// `true` selects SASL-IR (RFC 4959, inline client-first-message);
+    /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
     pub ensure_capabilities: bool,
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free SASL SCRAM-SHA-256 coroutine. The initial [`State`]
-/// variant ([`State::Send`] vs [`State::SendIr`]) selects between the
-/// non-IR and SASL-IR flows.
+/// I/O-free SASL SCRAM-SHA-256 coroutine.
 pub struct ImapAuthScramSha256 {
     state: State,
     password: Vec<u8>,
@@ -122,9 +109,6 @@ pub struct ImapAuthScramSha256 {
 }
 
 impl ImapAuthScramSha256 {
-    /// Creates a new SCRAM-SHA-256 coroutine. `opts.initial_request`
-    /// selects between the non-IR flow ([`State::Send`]) and the
-    /// SASL-IR flow ([`State::SendIr`]).
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -210,8 +194,6 @@ impl ImapAuthScramSha256 {
         })))
     }
 
-    /// Processes the server-first-message and builds the
-    /// client-final-message.
     fn build_client_final(
         &mut self,
         server_first_bytes: &[u8],
@@ -244,8 +226,6 @@ impl ImapAuthScramSha256 {
         Ok(SendImapCommand::new(AuthenticateDataCodec::new(), auth))
     }
 
-    /// Verifies the server-final-message contains a valid server
-    /// signature.
     fn verify_server_final(
         &self,
         server_final_bytes: &[u8],
@@ -628,9 +608,6 @@ mod tests {
 
     use super::*;
 
-    /// SASL-IR happy path: client-first sent inline, then server-first
-    /// continuation, client-final, server-final continuation, empty ack,
-    /// tagged OK.
     #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options {
@@ -669,8 +646,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// SASL-IR error path: server signals an authentication failure via the
-    /// SCRAM `e=` field inside server-final.
     #[test]
     fn ir_server_error_returns_server_error() {
         let opts = ImapAuthScramSha256Options {
@@ -705,7 +680,6 @@ mod tests {
         assert_eq!(text, "invalid-proof");
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn ir_tagged_bad_returns_bad_error() {
         let opts = ImapAuthScramSha256Options {
@@ -729,8 +703,6 @@ mod tests {
         assert_eq!(text, "AUTHENTICATE not enabled");
     }
 
-    /// Non-IR happy path: bare AUTHENTICATE, empty SASL challenge, then the
-    /// usual client-first / server-first / client-final / server-final dance.
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options::default();
@@ -777,7 +749,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Non-IR error path: server signals SCRAM `e=` inside server-final.
     #[test]
     fn non_ir_server_error_returns_server_error() {
         let opts = ImapAuthScramSha256Options::default();
@@ -864,10 +835,6 @@ mod tests {
             .expect("first whitespace-separated token")
     }
 
-    /// Decodes the last whitespace-delimited token of `line` as
-    /// base64 and returns the decoded UTF-8 string. Used to parse
-    /// both the AUTH-IR initial response and any
-    /// `AuthenticateData::Continue` payload yielded by the client.
     fn decode_last_base64_token(line: &str) -> String {
         let b64 = line
             .trim_end()
@@ -885,8 +852,6 @@ mod tests {
             .1
     }
 
-    /// Builds a valid server-final-message (`v=<server-signature>`)
-    /// using the same SCRAM math as the implementation.
     fn build_server_final(client_first: &str, server_first: &str, client_final: &str) -> String {
         let client_first_bare = client_first.strip_prefix("n,,").expect("gs2 header");
         let client_final_without_proof = client_final

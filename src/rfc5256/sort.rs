@@ -1,5 +1,4 @@
-//! I/O-free coroutine to send an IMAP SORT command (RFC 5256), optionally as
-//! the `UID SORT` variant. Returns the matched ids in server order.
+//! IMAP SORT coroutine returning the matched ids in server-sorted order.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -21,7 +20,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during SORT progression.
+/// Failure causes during the IMAP SORT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxSortError {
     #[error("IMAP SORT failed: NO {0}")]
@@ -43,8 +42,7 @@ pub enum ImapMailboxSortError {
 /// Options for [`ImapMailboxSort::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMailboxSortOptions {
-    /// When `true`, send `UID SORT`; the returned ids are UIDs rather than
-    /// sequence numbers. Default: `false`.
+    /// When `true`, send `UID SORT`; returned ids are UIDs.
     pub uid: bool,
 }
 
@@ -54,7 +52,6 @@ pub struct ImapMailboxSort {
 }
 
 impl ImapMailboxSort {
-    /// Creates a new SORT coroutine.
     pub fn new(
         sort_criteria: Vec1<SortCriterion>,
         search_criteria: Vec1<SearchKey<'static>>,
@@ -134,7 +131,6 @@ impl ImapCoroutine for ImapMailboxSort {
 }
 
 enum State {
-    /// Send SORT (or UID SORT) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -166,7 +162,6 @@ mod tests {
         Vec1::try_from(vec![SearchKey::All]).expect("one search criterion")
     }
 
-    /// Happy path: server returns `* SORT ...` then tagged OK.
     #[test]
     fn success_returns_ids() {
         let mut sort = ImapMailboxSort::new(
@@ -188,7 +183,6 @@ mod tests {
         assert_eq!(3, ids.len());
     }
 
-    /// UID flag flips the wire keyword to `UID SORT`.
     #[test]
     fn uid_variant_sends_uid_sort() {
         let mut sort = ImapMailboxSort::new(
@@ -203,7 +197,6 @@ mod tests {
         assert!(line.contains("UID SORT "));
     }
 
-    /// Server skips `* SORT`: surface MissingData.
     #[test]
     fn missing_data_returns_missing_data_error() {
         let mut sort = ImapMailboxSort::new(
@@ -223,7 +216,6 @@ mod tests {
         assert!(matches!(err, ImapMailboxSortError::MissingData));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut sort = ImapMailboxSort::new(

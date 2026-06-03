@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP LOGOUT command (RFC 3501 §6.1.3).
-//!
-//! Asks the server to terminate the session. Success is signalled by an
-//! untagged BYE followed by the tagged OK; the absence of either is reported as
-//! a distinct error.
+//! IMAP LOGOUT coroutine terminating the session.
 
 use core::fmt;
 
@@ -22,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during LOGOUT progression.
+/// Failure causes during the IMAP LOGOUT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapLogoutError {
     #[error("IMAP LOGOUT failed: NO {0}")]
@@ -45,7 +41,6 @@ pub struct ImapLogout {
 }
 
 impl ImapLogout {
-    /// Creates a new LOGOUT coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -108,7 +103,6 @@ impl ImapCoroutine for ImapLogout {
 }
 
 enum State {
-    /// Send LOGOUT and await the BYE + tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -128,7 +122,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns BYE then tagged OK.
     #[test]
     fn success_returns_ok() {
         let mut logout = ImapLogout::new();
@@ -145,7 +138,6 @@ mod tests {
         expect_complete_ok(&mut logout, &mut frag, reply.as_bytes());
     }
 
-    /// Server skips the BYE: surface MissingBye.
     #[test]
     fn missing_bye_returns_missing_bye_error() {
         let mut logout = ImapLogout::new();
@@ -161,7 +153,6 @@ mod tests {
         assert!(matches!(err, ImapLogoutError::MissingBye));
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut logout = ImapLogout::new();

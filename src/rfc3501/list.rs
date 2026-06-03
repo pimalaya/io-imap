@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP LIST command (RFC 3501 §6.3.8).
-//!
-//! Returns one row per matched mailbox: `(mailbox, hierarchy delimiter,
-//! attributes)`.
+//! IMAP LIST coroutine returning matched mailbox rows.
 
 use core::fmt;
 
@@ -28,15 +25,14 @@ use crate::{
     send::*,
 };
 
-/// Output of the IMAP `LIST` (and `LSUB`) command: one row per
-/// matched mailbox `(mailbox, hierarchy delimiter, attributes)`.
+/// `(mailbox, hierarchy delimiter, attributes)` rows from LIST or LSUB.
 pub type ImapMailboxListing = Vec<(
     Mailbox<'static>,
     Option<QuotedChar>,
     Vec<FlagNameAttribute<'static>>,
 )>;
 
-/// Errors that can occur during LIST progression.
+/// Failure causes during the IMAP LIST flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxListError {
     #[error("IMAP LIST failed: NO {0}")]
@@ -59,7 +55,6 @@ pub struct ImapMailboxList {
 }
 
 impl ImapMailboxList {
-    /// Creates a new LIST coroutine.
     pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
         encode_inplace(&mut reference);
 
@@ -137,7 +132,6 @@ impl ImapCoroutine for ImapMailboxList {
 }
 
 enum State {
-    /// Send LIST and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -157,7 +151,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns `* LIST ...` rows then tagged OK.
     #[test]
     fn success_returns_rows() {
         let reference: Mailbox = "".try_into().expect("valid reference");
@@ -179,7 +172,6 @@ mod tests {
         assert_eq!(2, rows.len());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut list = ImapMailboxList::new(
@@ -201,7 +193,6 @@ mod tests {
         assert_eq!(text, "not allowed");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut list = ImapMailboxList::new(

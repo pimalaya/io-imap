@@ -1,9 +1,5 @@
-//! I/O-free coroutine to authenticate an IMAP account via the RFC
-//! 3501 `LOGIN` command. Unlike the SASL `AUTHENTICATE` mechanisms,
-//! `LOGIN` is a single-shot command: the credentials travel in the
-//! clear as IMAP atoms on the command line, so the connection must be
-//! TLS-protected. There is no SASL challenge and no initial-response
-//! flow.
+//! IMAP LOGIN coroutine; credentials travel in the clear, so the channel
+//! must be TLS-protected.
 
 use core::{fmt, mem};
 
@@ -28,7 +24,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
 
-/// Errors that can occur during LOGIN progression.
+/// Failure causes during the IMAP LOGIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapLoginError {
     #[error("IMAP LOGIN failed: NO {0}")]
@@ -56,7 +52,7 @@ pub struct ImapLoginOptions {
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
-/// I/O-free coroutine for RFC 3501 `LOGIN`.
+/// I/O-free IMAP LOGIN coroutine.
 pub struct ImapLogin {
     state: State,
     observed: Vec<Capability<'static>>,
@@ -64,9 +60,8 @@ pub struct ImapLogin {
 }
 
 impl ImapLogin {
-    /// Creates a new LOGIN coroutine. Fails with [`ValidationError`]
-    /// when `user` or `password` cannot be encoded as an IMAP AString
-    /// (e.g. contains NUL, CR or LF).
+    /// Fails on credentials that cannot be encoded as IMAP AStrings
+    /// (NUL, CR, LF).
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -212,8 +207,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: client sends `<tag> LOGIN <user> <pass>`, server
-    /// returns tagged OK.
     #[test]
     fn success_returns_ok() {
         let opts = ImapLoginOptions::default();
@@ -231,7 +224,6 @@ mod tests {
         expect_complete_ok(&mut auth, &mut frag, reply.as_bytes());
     }
 
-    /// Server rejects the credentials with tagged NO.
     #[test]
     fn invalid_credentials_returns_no_error() {
         let opts = ImapLoginOptions::default();
@@ -251,7 +243,6 @@ mod tests {
         assert_eq!(text, "authentication failed");
     }
 
-    /// Tagged BAD before any continuation: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let opts = ImapLoginOptions::default();
@@ -271,8 +262,6 @@ mod tests {
         assert_eq!(text, "LOGIN disabled");
     }
 
-    /// Server returns a tagged OK carrying a CAPABILITY response code:
-    /// the coroutine surfaces the advertised capabilities.
     #[test]
     fn success_with_capability_code_observes_capability() {
         let opts = ImapLoginOptions::default();
@@ -293,8 +282,6 @@ mod tests {
         assert!(caps.iter().any(|c| matches!(c, Capability::Idle)));
     }
 
-    /// Credentials containing a NUL byte are rejected at construction
-    /// before any I/O is attempted.
     #[test]
     fn nul_in_password_fails_at_construction() {
         let opts = ImapLoginOptions::default();

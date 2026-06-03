@@ -1,13 +1,5 @@
-//! I/O-free coroutines to send an IMAP FETCH command (RFC 3501 §6.4.5),
-//! optionally as the `UID FETCH` variant and optionally with FETCH modifiers
-//! (CONDSTORE `CHANGEDSINCE`, QRESYNC `VANISHED`, ...).
-//!
-//! Two flavours:
-//! - [`ImapMessageFetch`]: arbitrary [`SequenceSet`]; returns a sequence-keyed
-//!   [`BTreeMap`] of FETCH items.
-//! - [`ImapMessageFetchFirst`]: convenience over a single message; returns the
-//!   first FETCH item list directly or [`ImapMessageFetchError::MissingData`]
-//!   if the server returned nothing.
+//! IMAP FETCH coroutines: range ([`ImapMessageFetch`]) and single-message
+//! ([`ImapMessageFetchFirst`]) variants.
 
 use core::{fmt, num::NonZeroU32};
 
@@ -29,8 +21,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during FETCH progression. Shared by both
-/// [`ImapMessageFetch`] and [`ImapMessageFetchFirst`].
+/// Failure causes during the IMAP FETCH flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageFetchError {
     #[error("IMAP FETCH failed: NO {0}")]
@@ -49,29 +40,22 @@ pub enum ImapMessageFetchError {
     Send(#[from] SendImapCommandError),
 }
 
-/// Options for [`ImapMessageFetch::new`] and
-/// [`ImapMessageFetchFirst::new`].
+/// Options for the IMAP FETCH coroutines.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageFetchOptions {
-    /// When `true`, send `UID FETCH` (RFC 3501 §6.4.8); the `sequence_set` /
-    /// `id` then holds UIDs rather than sequence numbers. Default: `false`
-    /// (plain `FETCH` on sequence numbers).
+    /// When `true`, send `UID FETCH` and treat ids as UIDs.
     pub uid: bool,
-    /// FETCH modifiers (RFC 4466). Pass
-    /// `[FetchModifier::ChangedSince(m)]` for CONDSTORE-style
-    /// CHANGEDSINCE; pass
-    /// `[FetchModifier::ChangedSince(m), FetchModifier::Vanished]` for
-    /// the QRESYNC bundle. Default: empty.
+    /// FETCH modifiers (RFC 4466): CONDSTORE `CHANGEDSINCE`, QRESYNC
+    /// `VANISHED`, ...
     pub modifiers: Vec<FetchModifier>,
 }
 
-/// I/O-free IMAP FETCH coroutine over an arbitrary sequence set.
+/// FETCH over an arbitrary sequence set.
 pub struct ImapMessageFetch {
     state: State,
 }
 
 impl ImapMessageFetch {
-    /// Creates a new FETCH coroutine.
     pub fn new(
         sequence_set: SequenceSet,
         items: MacroOrMessageDataItemNames<'static>,
@@ -150,13 +134,12 @@ impl ImapCoroutine for ImapMessageFetch {
     }
 }
 
-/// I/O-free IMAP FETCH coroutine restricted to a single message.
+/// FETCH restricted to a single message.
 pub struct ImapMessageFetchFirst {
     state: State,
 }
 
 impl ImapMessageFetchFirst {
-    /// Creates a new single-message FETCH coroutine.
     pub fn new(
         id: NonZeroU32,
         items: MacroOrMessageDataItemNames<'static>,
@@ -236,7 +219,6 @@ impl ImapCoroutine for ImapMessageFetchFirst {
 }
 
 enum State {
-    /// Send FETCH (or UID FETCH) and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -256,8 +238,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: server returns multiple FETCH responses, the
-    /// coroutine groups them by sequence number.
     #[test]
     fn fetch_success_groups_by_seq() {
         let mut fetch = ImapMessageFetch::new(
@@ -280,7 +260,6 @@ mod tests {
         assert_eq!(2, out.len());
     }
 
-    /// UID flag flips the wire keyword to `UID FETCH`.
     #[test]
     fn uid_variant_sends_uid_fetch() {
         let mut fetch = ImapMessageFetch::new(
@@ -298,7 +277,6 @@ mod tests {
         assert!(line.contains("UID FETCH 42 "));
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn fetch_tagged_no_returns_no_error() {
         let mut fetch = ImapMessageFetch::new(
@@ -321,7 +299,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn fetch_bye_returns_bye_error() {
         let mut fetch = ImapMessageFetch::new(
@@ -341,7 +318,6 @@ mod tests {
         assert_eq!(text, "going down");
     }
 
-    /// First-message variant happy path.
     #[test]
     fn first_success_returns_items() {
         let id = NonZeroU32::new(42).expect("non-zero");
@@ -362,8 +338,6 @@ mod tests {
         assert_eq!(1, items.as_ref().len());
     }
 
-    /// First-message variant returns MissingData when the server emits
-    /// no FETCH response for the targeted id.
     #[test]
     fn first_missing_data_returns_missing_data_error() {
         let id = NonZeroU32::new(42).expect("non-zero");

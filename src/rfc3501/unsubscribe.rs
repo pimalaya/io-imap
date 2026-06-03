@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP UNSUBSCRIBE command (RFC 3501 §6.3.7).
-//!
-//! Removes a mailbox from the server's subscription list. No state is returned;
-//! success is signalled by the tagged OK alone.
+//! IMAP UNSUBSCRIBE coroutine removing a mailbox from the subscription list.
 
 use core::fmt;
 
@@ -22,7 +19,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during UNSUBSCRIBE progression.
+/// Failure causes during the IMAP UNSUBSCRIBE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxUnsubscribeError {
     #[error("IMAP UNSUBSCRIBE failed: NO {0}")]
@@ -45,7 +42,6 @@ pub struct ImapMailboxUnsubscribe {
 }
 
 impl ImapMailboxUnsubscribe {
-    /// Creates a new UNSUBSCRIBE coroutine.
     pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -106,7 +102,6 @@ impl ImapCoroutine for ImapMailboxUnsubscribe {
 }
 
 enum State {
-    /// Send UNSUBSCRIBE and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -126,7 +121,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut unsub = ImapMailboxUnsubscribe::new("Archive".try_into().expect("valid mailbox"));
@@ -143,7 +137,6 @@ mod tests {
         expect_complete_ok(&mut unsub, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut unsub = ImapMailboxUnsubscribe::new("Archive".try_into().expect("valid mailbox"));
@@ -162,7 +155,6 @@ mod tests {
         assert_eq!(text, "not subscribed");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut unsub = ImapMailboxUnsubscribe::new("Archive".try_into().expect("valid mailbox"));

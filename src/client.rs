@@ -1,24 +1,8 @@
-//! # Standard, blocking IMAP client
+//! Blocking IMAP client wrapping a `Read + Write` stream with a
+//! per-connection [`Fragmentizer`] and one method per coroutine.
 //!
-//! Holds a single stream (any blocking `Read + Write` impl) plus a
-//! per-connection [`Fragmentizer`], and exposes one method per common
-//! coroutine. The bare [`new`] constructor takes a pre-connected stream;
-//! callers handle TCP and TLS themselves. With one of the TLS feature flags
-//! enabled (`rustls-ring`, `rustls-aws`, `native-tls`), [`connect`] is also
-//! available and produces a ready-to-use authenticated client end-to-end:
-//! it opens the transport (plain TCP for `imap://`, implicit TLS for
-//! `imaps://`), optionally performs the STARTTLS upgrade, reads the
-//! greeting and capability list, then runs the chosen SASL mechanism if
-//! one was provided.
-//!
-//! Session state (current mailbox, authenticated flag, cached
-//! capability) is intentionally NOT stored on the client: it desyncs
-//! too easily from server state. Methods that observe a fresh
-//! capability list return it; callers that want a cached copy keep it
-//! themselves.
-//!
-//! [`new`]: ImapClientStd::new
-//! [`connect`]: ImapClientStd::connect
+//! Session state is intentionally not cached: callers retain what
+//! they need (capability list, selected mailbox, ...).
 
 use core::{
     any::Any,
@@ -117,7 +101,7 @@ use crate::{
     watch::*,
 };
 
-/// Errors returned by [`ImapClientStd`].
+/// Failure causes returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
 pub enum ImapClientStdError {
     #[error(transparent)]
@@ -249,23 +233,14 @@ pub enum ImapClientStdError {
 const READ_BUFFER_SIZE: usize = 16 * 1024;
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
-/// Default ALPN protocol identifier offered during the TLS handshake
-/// for IMAP connections (RFC 7595 registers the `imap` token).
-/// Re-exported so config-driven callers can use it as a serde default
-/// and so wizard/discovery code shares a single source of truth.
+/// Default ALPN identifier for IMAP TLS (RFC 7595).
 pub fn default_alpn() -> Vec<String> {
     vec![String::from("imap")]
 }
 
-/// Std-blocking IMAP client wrapping a single boxed stream plus a
-/// per-connection [`Fragmentizer`].
-///
-/// `auto_id` is the optional RFC 2971 payload sent by every auth_*/
-/// login method straight after authentication: [`None`] skips the
-/// extra round-trip (default); [`Some`] with an empty vec sends
-/// `ID NIL`; [`Some`] with parameters sends `ID (key val …)`. Some
-/// providers (notably mail.qq.com, fastmail) require an ID exchange
-/// before they will accept further commands.
+/// `auto_id` is consumed by every auth_*/login: `None` skips,
+/// `Some(empty)` sends `ID NIL`, `Some(params)` sends `ID (k v ...)`.
+/// Required by a few providers (mail.qq.com, fastmail).
 pub struct ImapClientStd {
     pub stream: Box<dyn ImapStream>,
     pub fragmentizer: Fragmentizer,
@@ -273,11 +248,8 @@ pub struct ImapClientStd {
 }
 
 impl ImapClientStd {
-    /// Builds a client around `stream`. The caller is responsible for
-    /// opening the connection (TCP, TLS handshake if needed, STARTTLS
-    /// upgrade if needed). `auto_id` defaults to [`None`]; set it on
-    /// the returned client before invoking an auth_*/login method to
-    /// chain an `ID` round-trip after the SASL handshake.
+    /// Caller is responsible for opening the connection (TCP, TLS,
+    /// STARTTLS).
     pub fn new<S: Read + Write + Send + 'static>(stream: S) -> Self {
         Self {
             stream: Box::new(stream),
@@ -286,25 +258,13 @@ impl ImapClientStd {
         }
     }
 
-    /// Replaces the underlying stream; useful after a STARTTLS upgrade
-    /// or when the caller manages reconnection across hosts.
+    /// Useful after a STARTTLS upgrade or on reconnection.
     pub fn set_stream<S: Read + Write + Send + 'static>(&mut self, stream: S) {
         self.stream = Box::new(stream);
     }
 
-    /// Drives any standard-shape coroutine (`Yield = ImapYield`,
-    /// `Return = Result<Output, Error>`) against this client's stream
-    /// and fragmentizer until it terminates.
-    ///
-    /// Coroutines that need richer Yield variants
-    /// ([`ImapIdle`](crate::rfc2177::idle::ImapIdle) with
-    /// [`ImapIdleYield::Event`],
-    /// [`ImapMailboxWatch`] with [`ImapMailboxWatchYield::Event`])
-    /// are driven by their own per-method loops on this client; see
-    /// [`Self::watch_mailbox`].
-    ///
-    /// [`ImapIdleYield::Event`]: crate::rfc2177::idle::ImapIdleYield::Event
-    /// [`ImapMailboxWatchYield::Event`]: crate::watch::ImapMailboxWatchYield::Event
+    /// Drives a standard-shape coroutine to completion. Richer yields
+    /// (IDLE events, watch deltas) need their own per-method loops.
     pub fn run<C, T, E>(&mut self, mut coroutine: C) -> Result<T, ImapClientStdError>
     where
         C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
@@ -331,12 +291,8 @@ impl ImapClientStd {
 
     // ---- Session lifecycle ------------------------------------------------
 
-    /// Runs [`ImapGreetingGet`] with `ensure_capabilities` set to `true`:
-    /// consumes the initial server greeting and reports the capability
-    /// list. Call this once after [`new`] / [`connect`].
-    ///
-    /// [`new`]: ImapClientStd::new
-    /// [`connect`]: ImapClientStd::connect
+    /// Consumes the greeting and returns the advertised capabilities
+    /// (forcing a CAPABILITY round-trip if the greeting carried none).
     pub fn greeting(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
         Ok(self
             .run(ImapGreetingGet::new(ImapGreetingGetOptions {
@@ -345,10 +301,7 @@ impl ImapClientStd {
             .capability)
     }
 
-    /// Runs [`ImapLogin`] (`LOGIN`, RFC 3501 §6.2.3). The connection
-    /// must be TLS-protected. Honours [`Self::auto_id`]: when set,
-    /// chains an RFC 2971 `ID` round-trip after the tagged `OK`; the
-    /// field is consumed and reset to [`None`].
+    /// `LOGIN`. Channel must be TLS-protected. Consumes `auto_id`.
     pub fn login(
         &mut self,
         user: impl AsRef<str>,
@@ -358,28 +311,15 @@ impl ImapClientStd {
         self.run(ImapLogin::new(user, password, opts)?)
     }
 
-    /// Runs [`ImapStartTls`] (`STARTTLS`, RFC 3501 §6.2.1). The IMAP-layer
-    /// handshake is complete on return; the caller must now upgrade the
-    /// underlying socket to TLS (consume the client via [`into_stream`],
-    /// call `upgrade_tls`, then rebuild a client) and refresh capabilities
-    /// over the encrypted channel via [`capability`]. The returned bytes
-    /// are anything the coroutine pre-read past the tagged response
-    /// (normally empty per RFC 3501 §6.2.1; any pre-handshake bytes would
-    /// be a classic STARTTLS-injection signal).
-    ///
-    /// [`into_stream`]: ImapClientStd::into_stream
-    /// [`capability`]: ImapClientStd::capability
+    /// `STARTTLS`. Caller still has to upgrade the socket and refresh
+    /// capabilities. Returns any bytes pre-read past the tagged
+    /// response (a non-empty return is a STARTTLS-injection signal:
+    /// refuse the upgrade).
     pub fn starttls(&mut self) -> Result<Vec<u8>, ImapClientStdError> {
         self.run(ImapStartTls::new())
     }
 
-    /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC
-    /// 4505). `opts.initial_request` selects between the non-IR and
-    /// SASL-IR (RFC 4959) flows. `message` is the optional trace
-    /// identifier; pass `None` to omit it. Honours [`Self::auto_id`]
-    /// (see [`login`] for details).
-    ///
-    /// [`login`]: ImapClientStd::login
+    /// SASL `AUTHENTICATE ANONYMOUS`. Consumes `auto_id`.
     pub fn auth_anonymous(
         &mut self,
         message: Option<impl AsRef<str>>,
@@ -388,14 +328,8 @@ impl ImapClientStd {
         self.run(ImapAuthAnonymous::new(message, opts))
     }
 
-    /// Runs [`ImapAuthLogin`] (SASL `AUTHENTICATE LOGIN`, legacy
-    /// two-prompt mechanism). `opts.initial_request` selects between
-    /// the non-IR and SASL-IR (RFC 4959) flows. Prefer [`auth_plain`]
-    /// or [`auth_scram_sha256`] when the server supports them. Honours
-    /// [`Self::auto_id`].
-    ///
-    /// [`auth_plain`]: ImapClientStd::auth_plain
-    /// [`auth_scram_sha256`]: ImapClientStd::auth_scram_sha256
+    /// SASL `AUTHENTICATE LOGIN` (legacy). Prefer auth_plain or
+    /// auth_scram_sha256 when supported. Consumes `auto_id`.
     pub fn auth_login(
         &mut self,
         user: impl AsRef<str>,
@@ -405,9 +339,7 @@ impl ImapClientStd {
         self.run(ImapAuthLogin::new(user, password, opts))
     }
 
-    /// Runs [`ImapAuthPlain`] (SASL `AUTHENTICATE PLAIN`, RFC 4616).
-    /// `opts.initial_request` selects between the non-IR and SASL-IR
-    /// (RFC 4959) flows. Honours [`Self::auto_id`].
+    /// SASL `AUTHENTICATE PLAIN`. Consumes `auto_id`.
     pub fn auth_plain(
         &mut self,
         authzid: Option<impl AsRef<str>>,
@@ -418,11 +350,8 @@ impl ImapClientStd {
         self.run(ImapAuthPlain::new(authzid, authcid, password, opts))
     }
 
-    /// Runs [`ImapAuthOauthbearer`] (SASL `AUTHENTICATE OAUTHBEARER`,
-    /// RFC 7628). `opts.initial_request` selects between the non-IR
-    /// and SASL-IR (RFC 4959) flows. The `token` is an OAuth 2.0
-    /// bearer access token: the connection must be TLS-protected
-    /// before calling this method. Honours [`Self::auto_id`].
+    /// SASL `AUTHENTICATE OAUTHBEARER`. Channel must be
+    /// TLS-protected. Consumes `auto_id`.
     pub fn auth_oauthbearer(
         &mut self,
         user: impl AsRef<str>,
@@ -434,14 +363,8 @@ impl ImapClientStd {
         self.run(ImapAuthOauthbearer::new(user, host, port, token, opts))
     }
 
-    /// Runs [`ImapAuthXoauth2`] (SASL `AUTHENTICATE XOAUTH2`, Google's
-    /// pre-standard OAuth 2.0 mechanism). `opts.initial_request`
-    /// selects between the non-IR and SASL-IR (RFC 4959) flows. The
-    /// `token` is an OAuth 2.0 bearer access token: the connection
-    /// must be TLS-protected. Prefer [`auth_oauthbearer`] on servers
-    /// that support both. Honours [`Self::auto_id`].
-    ///
-    /// [`auth_oauthbearer`]: ImapClientStd::auth_oauthbearer
+    /// SASL `AUTHENTICATE XOAUTH2` (Google's pre-standard mechanism).
+    /// Prefer auth_oauthbearer when supported. Consumes `auto_id`.
     pub fn auth_xoauth2(
         &mut self,
         user: impl AsRef<str>,
@@ -451,9 +374,7 @@ impl ImapClientStd {
         self.run(ImapAuthXoauth2::new(user, token, opts))
     }
 
-    /// Runs [`ImapAuthScramSha256`] (SASL `AUTHENTICATE SCRAM-SHA-256`,
-    /// RFC 7677). `opts.initial_request` selects between the non-IR
-    /// and SASL-IR (RFC 4959) flows. Honours [`Self::auto_id`].
+    /// SASL `AUTHENTICATE SCRAM-SHA-256`. Consumes `auto_id`.
     #[cfg(feature = "scram")]
     pub fn auth_scram_sha256(
         &mut self,
@@ -464,25 +385,21 @@ impl ImapClientStd {
         self.run(ImapAuthScramSha256::new(user, password, opts))
     }
 
-    /// Runs [`ImapLogout`] (`LOGOUT`).
     pub fn logout(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapLogout::new())
     }
 
     // ---- State / introspection -------------------------------------------
 
-    /// Runs [`ImapCapabilityGet`] (`CAPABILITY`).
     pub fn capability(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
         self.run(ImapCapabilityGet::new())
     }
 
-    /// Runs [`ImapNoop`] (`NOOP`).
     pub fn noop(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapNoop::new())
     }
 
-    /// Runs [`ImapServerId`] (`ID`, RFC 2971). Pass [`None`] to send the
-    /// empty-list `ID NIL` form.
+    /// `ID`. `None` sends `ID NIL`.
     pub fn id(
         &mut self,
         parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
@@ -490,7 +407,6 @@ impl ImapClientStd {
         self.run(ImapServerId::new(ImapServerIdOptions { parameters }))
     }
 
-    /// Runs [`ImapExtensionEnable`] (`ENABLE`, RFC 5161).
     pub fn enable(
         &mut self,
         capabilities: Vec1<CapabilityEnable<'static>>,
@@ -500,7 +416,6 @@ impl ImapClientStd {
 
     // ---- Mailbox structure -----------------------------------------------
 
-    /// Runs [`ImapMailboxList`] (`LIST <reference> <pattern>`).
     pub fn list(
         &mut self,
         reference: Mailbox<'static>,
@@ -509,7 +424,6 @@ impl ImapClientStd {
         self.run(ImapMailboxList::new(reference, pattern))
     }
 
-    /// Runs [`ImapMailboxLsub`] (`LSUB <reference> <pattern>`).
     pub fn lsub(
         &mut self,
         reference: Mailbox<'static>,
@@ -518,7 +432,6 @@ impl ImapClientStd {
         self.run(ImapMailboxLsub::new(reference, pattern))
     }
 
-    /// Runs [`ImapMailboxStatus`] (`STATUS <mailbox> <items>`).
     pub fn status(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -527,17 +440,14 @@ impl ImapClientStd {
         self.run(ImapMailboxStatus::new(mailbox, item_names))
     }
 
-    /// Runs [`ImapMailboxCreate`] (`CREATE <mailbox>`).
     pub fn create(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxCreate::new(mailbox))
     }
 
-    /// Runs [`ImapMailboxDelete`] (`DELETE <mailbox>`).
     pub fn delete(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxDelete::new(mailbox))
     }
 
-    /// Runs [`ImapMailboxRename`] (`RENAME <from> <to>`).
     pub fn rename(
         &mut self,
         from: Mailbox<'static>,
@@ -546,19 +456,16 @@ impl ImapClientStd {
         self.run(ImapMailboxRename::new(from, to))
     }
 
-    /// Runs [`ImapMailboxSubscribe`] (`SUBSCRIBE <mailbox>`).
     pub fn subscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxSubscribe::new(mailbox))
     }
 
-    /// Runs [`ImapMailboxUnsubscribe`] (`UNSUBSCRIBE <mailbox>`).
     pub fn unsubscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxUnsubscribe::new(mailbox))
     }
 
     // ---- Mailbox selection -----------------------------------------------
 
-    /// Runs [`ImapMailboxSelect`] (`SELECT <mailbox>`).
     pub fn select(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
         self.run(ImapMailboxSelect::new(
             mailbox,
@@ -566,7 +473,6 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMailboxExamine`] (`EXAMINE <mailbox>`).
     pub fn examine(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
         self.run(ImapMailboxExamine::new(
             mailbox,
@@ -574,12 +480,9 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs `SELECT <mailbox> (QRESYNC (<uidvalidity> <highestmodseq>))`
-    /// (RFC 7162). The caller must have observed `QRESYNC` in the
-    /// `capability` slice; otherwise this errors with
-    /// [`ImapClientStdError::QresyncNotSupported`]. Errors with
-    /// [`ImapClientStdError::InvalidModSeq`] when `highest_mod_seq` is
-    /// 0.
+    /// `SELECT <mailbox> (QRESYNC ...)`. Errors with
+    /// `QresyncNotSupported` when `capability` lacks QRESYNC, with
+    /// `InvalidModSeq` when `highest_mod_seq` is 0.
     pub fn select_qresync(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -608,42 +511,26 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMailboxClose`] (`CLOSE`).
     pub fn close(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxClose::new())
     }
 
-    /// Runs [`ImapMailboxUnselect`] (`UNSELECT`, RFC 3691).
     pub fn unselect(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxUnselect::new())
     }
 
-    /// Runs [`ImapMailboxCheck`] (`CHECK`).
     pub fn check(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxCheck::new())
     }
 
-    /// Runs [`ImapMailboxExpunge`] (`EXPUNGE`). Returns the sequence
-    /// numbers of expunged messages.
+    /// `EXPUNGE`; returns the expunged sequence numbers.
     pub fn expunge(&mut self) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
         self.run(ImapMailboxExpunge::new())
     }
 
-    /// Consumes the client and starts a long-running mailbox watcher.
-    ///
-    /// Spawns a thread that owns the IMAP connection and advances the
-    /// [`ImapMailboxWatch`] coroutine, forwarding each delta as one
-    /// [`ImapMailboxWatchEvent`] on the returned stream's mpsc channel.
-    /// Untagged-response wake-ups are resolved via SELECT (QRESYNC).  Dropping
-    /// the stream (or calling [`ImapMailboxWatchStream::close`]) flips the
-    /// shutdown atomic; the worker winds the running IDLE down cleanly and
-    /// exits.
-    ///
-    /// `capability` is the most recently observed capability list; pass
-    /// the slice returned by `greeting()` / `login()` / `auth_*()` or
-    /// `capability()`. Errors with [`ImapClientStdError::MailboxWatch`]
-    /// + `ImapMailboxWatchError::QresyncUnsupported` when QRESYNC is
-    /// absent.
+    /// Consumes the client into a background watcher. Drop the
+    /// returned stream (or call its `close`) to wind down. Errors when
+    /// `capability` lacks QRESYNC.
     pub fn watch_mailbox(
         self,
         mailbox: Mailbox<'static>,
@@ -708,7 +595,6 @@ impl ImapClientStd {
 
     // ---- Messages --------------------------------------------------------
 
-    /// Runs [`ImapMessageFetch`] (`FETCH` or `UID FETCH`).
     pub fn fetch(
         &mut self,
         sequence_set: SequenceSet,
@@ -725,7 +611,6 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageSearch`] (`SEARCH` or `UID SEARCH`).
     pub fn search(
         &mut self,
         criteria: Vec1<SearchKey<'static>>,
@@ -737,8 +622,7 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageStore`] (`STORE` or `UID STORE`). Returns the
-    /// updated message data items the server reported back.
+    /// `STORE` (echo variant); returns the server-reported FETCH echoes.
     pub fn store(
         &mut self,
         sequence_set: SequenceSet,
@@ -754,7 +638,6 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageCopy`] (`COPY` or `UID COPY`).
     pub fn copy(
         &mut self,
         sequence_set: SequenceSet,
@@ -768,7 +651,6 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageMove`] (`MOVE` or `UID MOVE`, RFC 6851).
     pub fn r#move(
         &mut self,
         sequence_set: SequenceSet,
@@ -782,9 +664,7 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageAppend`] (`APPEND <mailbox> [flags] [date]
-    /// <message>`). Returns the optional `EXISTS` count and the
-    /// `[APPENDUID uidvalidity uid]` response code (RFC 4315).
+    /// `APPEND`; returns the optional EXISTS count and APPENDUID pair.
     pub fn append(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -801,7 +681,6 @@ impl ImapClientStd {
 
     // ---- RFC 5256: SORT / THREAD ------------------------------------------
 
-    /// Runs [`ImapMailboxSort`] (`SORT` or `UID SORT`, RFC 5256).
     pub fn sort(
         &mut self,
         sort_criteria: Vec1<SortCriterion>,
@@ -815,7 +694,6 @@ impl ImapClientStd {
         ))
     }
 
-    /// Runs [`ImapMessageThread`] (`THREAD` or `UID THREAD`, RFC 5256).
     pub fn thread(
         &mut self,
         algorithm: ThreadingAlgorithm<'static>,
@@ -838,10 +716,7 @@ impl fmt::Debug for ImapClientStd {
     }
 }
 
-/// Long-lived [`ImapMailboxWatchEvent`] stream backed by a background
-/// worker thread that owns the IMAP connection. Drop or
-/// [`Self::close`] to wind it down; the worker observes the shutdown
-/// atomic, sends `IDLE DONE`, and exits.
+/// Background-worker watch stream; drop or [`Self::close`] to wind down.
 pub struct ImapMailboxWatchStream {
     rx: Receiver<Result<ImapMailboxWatchEvent, ImapClientStdError>>,
     handle: Option<JoinHandle<()>>,
@@ -864,8 +739,7 @@ impl ImapMailboxWatchStream {
         self.rx.recv_timeout(timeout)
     }
 
-    /// Signals the worker to stop and joins it. Returns within the
-    /// IDLE refresh window (typically a few seconds).
+    /// Signals shutdown and joins the worker.
     pub fn close(mut self) -> Result<(), ImapClientStdError> {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
@@ -901,33 +775,10 @@ impl Drop for ImapMailboxWatchStream {
     feature = "native-tls"
 ))]
 impl ImapClientStd {
-    /// Connects to `url`, optionally performs the STARTTLS upgrade, reads
-    /// the greeting + capability list, then runs the chosen SASL
-    /// mechanism.
-    ///
-    /// - `imap://`  goes through plain TCP (port defaults to 143).
-    /// - `imaps://` goes through implicit TLS (port defaults to 993).
-    /// - `tls` carries the rustls/native-tls options *and* the ALPN list
-    ///   (see [`default_alpn`] for the IMAP-conformant `["imap"]`).
-    ///   Set `tls.rustls.alpn` to an empty vec to skip ALPN.
-    /// - `starttls = true` (only valid on `imap://`) performs the IMAP
-    ///   `STARTTLS` upgrade and refreshes capabilities over TLS before
-    ///   authenticating.
-    /// - `sasl` is the optional SASL mechanism. Accepts anything that
-    ///   converts into a [`Sasl`], so callers can pass the per-mechanism
-    ///   struct directly (e.g. `Some(SaslLogin { .. })`) without wrapping
-    ///   it in a [`Sasl`] variant. Supported mechanisms: [`SaslLogin`]
-    ///   (mapped to the IMAP `LOGIN` command, RFC 3501 §6.2.3),
-    ///   [`SaslPlain`] (RFC 4616), [`SaslAnonymous`] (RFC 4505),
-    ///   [`SaslOauthbearer`] (RFC 7628), [`SaslXoauth2`] (Google), and
-    ///   [`SaslScramSha256`] (RFC 7677, behind the `scram` cargo
-    ///   feature). Pass [`None`] to skip authentication.
-    /// - `auto_id` is forwarded to the auth coroutine and triggers an
-    ///   RFC 2971 `ID` exchange after authentication (see
-    ///   [`Self::auto_id`]).
-    ///
-    /// Returns a fully authenticated client paired with the latest
-    /// observed capability list, ready to issue further commands.
+    /// End-to-end connect: TCP/TLS, optional STARTTLS, greeting,
+    /// optional SASL. `imap://` is plain TCP (143), `imaps://` is
+    /// implicit TLS (993). `starttls = true` is only valid on
+    /// `imap://`. Pass `Sasl::None` to skip auth.
     pub fn connect(
         url: &Url,
         tls: &Tls,
@@ -959,11 +810,8 @@ impl ImapClientStd {
             return Err(ImapClientStdError::StartTlsOverTls);
         }
 
-        // STARTTLS needs the concrete StreamStd to call upgrade_tls
-        // after the IMAP-layer handshake; once boxed there is no way
-        // back to the concrete type. Run the STARTTLS coroutine inline
-        // against the raw stream + a temporary fragmentizer, swap in
-        // the upgraded stream, then build the boxed client.
+        // NOTE: STARTTLS needs the concrete StreamStd for upgrade_tls,
+        // so run it inline before boxing the stream.
         let stream = if starttls {
             let mut stream = stream;
             let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
@@ -973,11 +821,8 @@ impl ImapClientStd {
             stream
         };
 
-        // Sensible default read timeout: makes [`watch_mailbox`] poll
-        // its shutdown flag every 5 s instead of blocking forever on
-        // the silent IDLE socket. Per-read (not per-operation) so big
-        // FETCH responses are unaffected as long as TCP packets keep
-        // arriving.
+        // NOTE: 5s per-read timeout lets watch_mailbox poll shutdown
+        // during a silent IDLE; long FETCHes are unaffected.
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
         let mut client = Self::new(stream);
@@ -1067,12 +912,8 @@ impl ImapClientStd {
     }
 }
 
-/// Drives [`ImapStartTls`] inline against a concrete `StreamStd` +
-/// `Fragmentizer`. Used by [`ImapClientStd::connect`] when the caller
-/// asks for STARTTLS: the IMAP-layer handshake has to complete on the
-/// plain socket before [`StreamStd::upgrade_tls`] can swap the stream,
-/// and the boxed [`ImapClientStd::stream`] hides the concrete type
-/// that `upgrade_tls` needs.
+/// Inline STARTTLS driver: keeps the concrete `StreamStd` so that
+/// `upgrade_tls` can swap the underlying socket afterwards.
 #[cfg(any(
     feature = "rustls-aws",
     feature = "rustls-ring",
@@ -1101,16 +942,9 @@ fn run_starttls(
     }
 }
 
-/// Marker for everything the client can run against; auto-implemented
-/// for any blocking `Read + Write + Send + 'static` impl. The `Send`
-/// supertrait flows the auto-trait through the `Box<dyn ImapStream>`
-/// type erasure so `ImapClientStd` can travel between threads in
-/// worker pools. [`as_any_mut`] lets specialized callers (e.g.
-/// byte-level proxies that need [`StreamStd::set_read_timeout`])
-/// downcast the boxed stream back to its concrete type.
-///
-/// [`as_any_mut`]: ImapStream::as_any_mut
-/// [`StreamStd::set_read_timeout`]: pimalaya_stream::std::stream::StreamStd::set_read_timeout
+/// Auto-implemented for `Read + Write + Send + 'static`. `as_any_mut`
+/// supports downcasting back to the concrete stream when needed
+/// (e.g. for `set_read_timeout`).
 pub trait ImapStream: Read + Write + Send + Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }

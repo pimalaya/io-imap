@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP NOOP command (RFC 3501 §6.1.2).
-//!
-//! Drives a no-op round-trip, typically used as a keep-alive or to poll the
-//! server for unilateral mailbox state updates.
+//! IMAP NOOP coroutine, useful as keep-alive or update poll.
 
 use core::fmt;
 
@@ -21,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during NOOP progression.
+/// Failure causes during the IMAP NOOP flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapNoopError {
     #[error("IMAP NOOP failed: NO {0}")]
@@ -44,7 +41,6 @@ pub struct ImapNoop {
 }
 
 impl ImapNoop {
-    /// Creates a new NOOP coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -109,7 +105,6 @@ impl ImapCoroutine for ImapNoop {
 }
 
 enum State {
-    /// Send NOOP and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -129,7 +124,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut noop = ImapNoop::new();
@@ -146,7 +140,6 @@ mod tests {
         expect_complete_ok(&mut noop, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut noop = ImapNoop::new();
@@ -165,7 +158,6 @@ mod tests {
         assert_eq!(text, "NOOP syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut noop = ImapNoop::new();

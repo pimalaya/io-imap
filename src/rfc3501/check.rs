@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP CHECK command (RFC 3501 §6.4.1).
-//!
-//! Asks the server to perform a mailbox checkpoint (typically a
-//! flush-to-disk). No state is returned; success is signalled by the tagged OK
-//! alone.
+//! IMAP CHECK coroutine requesting a mailbox checkpoint.
 
 use core::fmt;
 
@@ -22,7 +18,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during CHECK progression.
+/// Failure causes during the IMAP CHECK flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxCheckError {
     #[error("IMAP CHECK failed: NO {0}")]
@@ -45,7 +41,6 @@ pub struct ImapMailboxCheck {
 }
 
 impl ImapMailboxCheck {
-    /// Creates a new CHECK coroutine.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -110,7 +105,6 @@ impl ImapCoroutine for ImapMailboxCheck {
 }
 
 enum State {
-    /// Send CHECK and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -130,7 +124,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path: tagged OK closes the command.
     #[test]
     fn success_returns_ok() {
         let mut check = ImapMailboxCheck::new();
@@ -147,7 +140,6 @@ mod tests {
         expect_complete_ok(&mut check, &mut frag, reply.as_bytes());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut check = ImapMailboxCheck::new();
@@ -166,7 +158,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let mut check = ImapMailboxCheck::new();
@@ -185,7 +176,6 @@ mod tests {
         assert_eq!(text, "CHECK syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut check = ImapMailboxCheck::new();

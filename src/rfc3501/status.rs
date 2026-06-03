@@ -1,7 +1,4 @@
-//! I/O-free coroutine to send an IMAP STATUS command (RFC 3501 §6.3.10).
-//!
-//! Asks the server for the listed [`StatusDataItemName`] values without
-//! selecting the mailbox.
+//! IMAP STATUS coroutine returning the requested status items.
 
 use core::fmt;
 
@@ -23,7 +20,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during STATUS progression.
+/// Failure causes during the IMAP STATUS flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxStatusError {
     #[error("IMAP STATUS failed: NO {0}")]
@@ -46,7 +43,6 @@ pub struct ImapMailboxStatus {
 }
 
 impl ImapMailboxStatus {
-    /// Creates a new STATUS coroutine.
     pub fn new(
         mut mailbox: Mailbox<'static>,
         item_names: impl Into<Cow<'static, [StatusDataItemName]>>,
@@ -124,7 +120,6 @@ impl ImapCoroutine for ImapMailboxStatus {
 }
 
 enum State {
-    /// Send STATUS and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -148,7 +143,6 @@ mod tests {
         vec![StatusDataItemName::Messages, StatusDataItemName::Recent]
     }
 
-    /// Happy path: server returns `* STATUS ...` then tagged OK.
     #[test]
     fn success_returns_items() {
         let mut status =
@@ -168,7 +162,6 @@ mod tests {
         assert_eq!(2, out.len());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut status =
@@ -188,7 +181,6 @@ mod tests {
         assert_eq!(text, "mailbox does not exist");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut status =

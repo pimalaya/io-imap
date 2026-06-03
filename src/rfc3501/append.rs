@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP APPEND command (RFC 3501 §6.3.11).
-//!
-//! Reports the optional `EXISTS` count emitted by the server before the tagged
-//! response, plus the `[APPENDUID uidvalidity uid]` response code defined by
-//! UIDPLUS (RFC 4315) when the server announces it.
+//! IMAP APPEND coroutine returning EXISTS count and APPENDUID pair.
 
 use core::fmt;
 
@@ -26,11 +22,10 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Output of the IMAP `APPEND` command: `EXISTS` count and `[APPENDUID
-/// uidvalidity uid]` response code (RFC 4315) if the server returned either.
+/// `(EXISTS count, APPENDUID (uid_validity, uid))`.
 pub type ImapAppendOutput = (Option<u32>, Option<(u32, u32)>);
 
-/// Errors that can occur during APPEND progression.
+/// Failure causes during the IMAP APPEND flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageAppendError {
     #[error("IMAP APPEND failed: NO {0}")]
@@ -50,11 +45,7 @@ pub enum ImapMessageAppendError {
 /// Options for [`ImapMessageAppend::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageAppendOptions {
-    /// Per-message flags attached on append. Default: empty (server applies no
-    /// flags).
     pub flags: Vec<Flag<'static>>,
-    /// Internal date stamp recorded by the server. Default: `None` (server uses
-    /// its current time).
     pub date: Option<DateTime>,
 }
 
@@ -64,7 +55,6 @@ pub struct ImapMessageAppend {
 }
 
 impl ImapMessageAppend {
-    /// Creates a new APPEND coroutine.
     pub fn new(
         mut mailbox: Mailbox<'static>,
         message: LiteralOrLiteral8<'static>,
@@ -150,8 +140,6 @@ impl ImapCoroutine for ImapMessageAppend {
 }
 
 enum State {
-    /// Send APPEND (including the literal data) and await the tagged
-    /// response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -173,9 +161,6 @@ mod tests {
 
     use super::*;
 
-    /// Happy path with non-sync literal: server returns tagged OK plus
-    /// `[APPENDUID …]`. The coroutine surfaces both the EXISTS count
-    /// and the APPENDUID pair.
     #[test]
     fn success_with_appenduid_returns_pair() {
         let message =
@@ -201,8 +186,6 @@ mod tests {
         assert_eq!(Some((1700000000, 7)), appenduid);
     }
 
-    /// Server omits APPENDUID (UIDPLUS not advertised): the coroutine
-    /// still succeeds with `appenduid = None`.
     #[test]
     fn success_without_appenduid_returns_none_uid() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -224,7 +207,6 @@ mod tests {
         assert!(appenduid.is_none());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -248,7 +230,6 @@ mod tests {
         assert_eq!(text, "mailbox is read-only");
     }
 
-    /// Tagged BAD: surface text verbatim.
     #[test]
     fn tagged_bad_returns_bad_error() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
@@ -272,7 +253,6 @@ mod tests {
         assert_eq!(text, "APPEND syntax error");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));

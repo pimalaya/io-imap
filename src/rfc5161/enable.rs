@@ -1,8 +1,4 @@
-//! I/O-free coroutine to send an IMAP ENABLE command (RFC 5161).
-//!
-//! Opts the connection into one or more `CAPABILITY-ENABLE` extensions.
-//! Returns the server's `ENABLED` response list (or `None` when the server
-//! omits it).
+//! IMAP ENABLE coroutine returning the server's ENABLED list.
 
 use core::fmt;
 
@@ -23,7 +19,7 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during ENABLE progression.
+/// Failure causes during the IMAP ENABLE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapExtensionEnableError {
     #[error("IMAP ENABLE failed: NO {0}")]
@@ -46,7 +42,6 @@ pub struct ImapExtensionEnable {
 }
 
 impl ImapExtensionEnable {
-    /// Creates a new ENABLE coroutine.
     pub fn new(capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -112,7 +107,6 @@ impl ImapCoroutine for ImapExtensionEnable {
 }
 
 enum State {
-    /// Send ENABLE and await the tagged response.
     Send(SendImapCommand<CommandCodec>),
 }
 
@@ -136,7 +130,6 @@ mod tests {
         Vec1::try_from(vec![CapabilityEnable::CondStore]).expect("one cap")
     }
 
-    /// Happy path: server returns `* ENABLED ...` then tagged OK.
     #[test]
     fn success_returns_enabled_list() {
         let mut enable = ImapExtensionEnable::new(caps());
@@ -155,7 +148,6 @@ mod tests {
         assert_eq!(1, enabled.len());
     }
 
-    /// Server skips the ENABLED line: still succeed with `None`.
     #[test]
     fn success_without_enabled_returns_none() {
         let mut enable = ImapExtensionEnable::new(caps());
@@ -171,7 +163,6 @@ mod tests {
         assert!(enabled.is_none());
     }
 
-    /// Tagged NO: surface text verbatim.
     #[test]
     fn tagged_no_returns_no_error() {
         let mut enable = ImapExtensionEnable::new(caps());
@@ -190,7 +181,6 @@ mod tests {
         assert_eq!(text, "CONDSTORE not supported");
     }
 
-    /// BYE before tagged response: surface text verbatim.
     #[test]
     fn bye_returns_bye_error() {
         let mut enable = ImapExtensionEnable::new(caps());

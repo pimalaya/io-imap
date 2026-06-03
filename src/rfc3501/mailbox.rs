@@ -1,16 +1,8 @@
-//! RFC 3501 §5.1.3 modified UTF-7 for IMAP mailbox names.
+//! Modified UTF-7 codec for IMAP mailbox names (RFC 3501 §5.1.3).
 //!
-//! Inside io-imap, [`Mailbox`] values carry the *decoded* unicode
-//! name; the modified UTF-7 wire form is produced on send and consumed
-//! on receive by these helpers. Callers therefore pass and read
-//! unicode strings transparently, the way `select("Brouillons")` would
-//! normally read.
-//!
-//! The encoding is not idempotent (`encode("&-")` ≠ `encode(encode("&-"))`),
-//! so the helpers are `pub(crate)` and only called at the wire
-//! boundary: input coroutines re-encode their mailbox argument right
-//! before building the command body, and response coroutines decode
-//! the mailbox names they collect before returning them.
+//! Callers always pass and receive unicode; encode/decode runs at the
+//! wire boundary. The encoding is not idempotent, so helpers are
+//! `pub(crate)` and applied exactly once.
 
 use alloc::{string::String, vec::Vec};
 
@@ -21,10 +13,8 @@ use base64::{
 use imap_codec::imap_types::mailbox::Mailbox;
 use log::trace;
 
-/// Rewrites `mbox` to its modified UTF-7 wire form, in place. No-op
-/// for [`Mailbox::Inbox`] (a wire-special constant) and for `Other`
-/// values that already round-trip through the encoder unchanged
-/// (pure ASCII without `&`).
+/// Rewrites `mbox` to its modified UTF-7 wire form; no-op on Inbox
+/// and on pure ASCII names without `&`.
 pub(crate) fn encode_inplace(mbox: &mut Mailbox<'static>) {
     let Mailbox::Other(other) = mbox else { return };
 
@@ -46,9 +36,7 @@ pub(crate) fn encode_inplace(mbox: &mut Mailbox<'static>) {
     }
 }
 
-/// Inverse of [`encode_inplace`]. Reads `mbox` as a modified-UTF-7
-/// wire token and rewrites it to the decoded unicode form. No-op for
-/// [`Mailbox::Inbox`].
+/// Inverse of [`encode_inplace`].
 pub(crate) fn decode_inplace(mbox: &mut Mailbox<'static>) {
     let Mailbox::Other(other) = mbox else { return };
 
@@ -70,13 +58,6 @@ pub(crate) fn decode_inplace(mbox: &mut Mailbox<'static>) {
     }
 }
 
-/// RFC 3501 §5.1.3 modified UTF-7 encoder.
-///
-/// Printable ASCII (`U+0020`..`U+007E`) is passed through verbatim,
-/// with the lone exception of `&` which is doubled as `&-`. Any other
-/// codepoint starts a shifted run, terminated by `-`, whose payload
-/// is the UTF-16BE encoding of the run base64'd with `/` replaced by
-/// `,` and padding stripped.
 fn encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut shifted: Vec<u8> = Vec::new();
@@ -109,9 +90,7 @@ fn flush_shifted(shifted: &mut Vec<u8>, out: &mut String) {
     }
 
     let mut b64 = STANDARD_NO_PAD.encode(&shifted);
-    // SAFETY: STANDARD_NO_PAD only emits ASCII bytes from the base64
-    // alphabet, so substituting one ASCII byte for another preserves
-    // UTF-8 validity.
+    // SAFETY: base64 alphabet is ASCII, byte substitution preserves UTF-8.
     for byte in unsafe { b64.as_bytes_mut() } {
         if *byte == b'/' {
             *byte = b',';
@@ -124,12 +103,8 @@ fn flush_shifted(shifted: &mut Vec<u8>, out: &mut String) {
     shifted.clear();
 }
 
-/// RFC 3501 §5.1.3 modified UTF-7 decoder.
-///
-/// Malformed sequences (invalid base64, odd UTF-16 byte count, lone
-/// surrogates) yield the replacement character via
-/// [`String::from_utf16_lossy`] rather than failing the whole decode;
-/// any such recovery is logged at trace level by the caller.
+/// Lossy on malformed input (invalid base64, odd byte count, lone
+/// surrogates): surfaces the replacement character rather than erroring.
 fn decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -141,15 +116,10 @@ fn decode(input: &str) -> String {
             while i < bytes.len() && bytes[i] != b'&' {
                 i += 1;
             }
-            // `&` is single-byte ASCII, so both ends are char
-            // boundaries even when the slice contains non-ASCII bytes
-            // (which shouldn't happen for legal wire input but we
-            // tolerate them).
             out.push_str(&input[start..i]);
             continue;
         }
 
-        // shift-in
         let payload_start = i + 1;
         let mut j = payload_start;
         while j < bytes.len() && bytes[j] != b'-' {
@@ -157,7 +127,6 @@ fn decode(input: &str) -> String {
         }
 
         if j == payload_start {
-            // "&-": literal '&'
             out.push('&');
         } else {
             let payload = &input[payload_start..j];
@@ -166,9 +135,8 @@ fn decode(input: &str) -> String {
                 standard.push(if c == ',' { '/' } else { c });
             }
 
-            // Modified base64 strips padding; the standard engine
-            // accepts the unpadded form when the length is congruent
-            // to a complete group, otherwise fall back to no-pad.
+            // NOTE: modified base64 strips padding; standard engine
+            // handles complete groups, no-pad covers the rest.
             let decoded_bytes = STANDARD
                 .decode(standard.as_bytes())
                 .or_else(|_| STANDARD_NO_PAD.decode(standard.as_bytes()));
@@ -181,10 +149,8 @@ fn decode(input: &str) -> String {
                         .collect();
                     out.push_str(&String::from_utf16_lossy(&units));
                 }
+                // Malformed shift: re-emit the source verbatim.
                 _ => {
-                    // Malformed shift; surface the original sequence
-                    // verbatim so the caller can at least see what
-                    // came off the wire.
                     out.push('&');
                     out.push_str(payload);
                     if j < bytes.len() {
@@ -208,7 +174,7 @@ mod tests {
 
     use super::*;
 
-    // RFC 3501 §5.1.3 reference vector.
+    // NOTE: RFC 3501 §5.1.3 reference vector.
     const RUSSIAN_PLAIN: &str = "Отправленные";
     const RUSSIAN_WIRE: &str = "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-";
 
