@@ -161,7 +161,7 @@ Enable the `client` feature. `ImapClientStd::new(stream)` wraps any blocking `Re
 
 ```toml,ignore
 [dependencies]
-io-imap = { version = "0.0.1", default-features = false, features = ["client"] }
+io-imap = { version = "0.1.0", default-features = false, features = ["client"] }
 ```
 
 ```rust,no_run
@@ -207,7 +207,7 @@ Enable one of the TLS feature flags: `rustls-ring` (default), `rustls-aws`, or `
 
 ```toml,ignore
 [dependencies]
-io-imap = { version = "0.0.1", default-features = false, features = ["rustls-ring"] }
+io-imap = { version = "0.1.0", default-features = false, features = ["rustls-ring"] }
 ```
 
 ```rust,no_run

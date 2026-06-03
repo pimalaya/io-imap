@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-03
+
 ### Added
 
 - Added the `ImapCoroutine` mirroring `core::ops::Coroutine`.
@@ -91,4 +93,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/root..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.1.0..HEAD
+[0.1.0]: https://github.com/pimalaya/io-imap/compare/root..v0.1.0
