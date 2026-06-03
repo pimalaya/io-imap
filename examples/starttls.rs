@@ -30,18 +30,17 @@ fn main() {
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Complete(Ok(())) => break,
+            ImapCoroutineState::Complete(Ok(remaining)) => {
+                _remaining = remaining;
+                break;
+            }
             ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).unwrap();
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes).unwrap();
-                arg = None;
-            }
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(bytes)) => {
-                _remaining = bytes;
                 arg = None;
             }
         }

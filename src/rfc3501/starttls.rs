@@ -1,12 +1,11 @@
 //! I/O-free coroutine to perform STARTTLS negotiation (RFC 3501 §6.2.1).
 //!
 //! The coroutine discards the server greeting, sends a STARTTLS command, and
-//! discards the tagged response, then yields
-//! [`ImapStartTlsYield::WantsStartTls`] carrying any bytes received past the
-//! tagged response so the caller can perform the TLS handshake on the
-//! underlying socket. RFC 3501 §6.2.1 forbids the server from sending anything
-//! past the tagged response; non-empty bytes here are a classic
-//! STARTTLS-injection signal that the caller should refuse.
+//! discards the tagged response, then completes with the bytes received past
+//! that tagged response. RFC 3501 §6.2.1 forbids the server from sending
+//! anything past the tagged response; a non-empty return value is a classic
+//! STARTTLS-injection signal that the caller should refuse before upgrading
+//! the underlying socket to TLS.
 
 use core::{fmt, mem};
 
@@ -34,42 +33,12 @@ pub enum ImapStartTlsError {
     Eof,
 }
 
-/// Per-coroutine Yield: socket I/O step requests on one axis, TLS-upgrade
-/// hand-off on the other. The driver dispatches on the variant: I/O variants
-/// pump the IMAP socket; [`Self::WantsStartTls`] hands the remaining pre-read
-/// bytes back to the caller so it can perform the TLS handshake on the
-/// underlying socket.
-#[derive(Debug)]
-pub enum ImapStartTlsYield {
-    /// Socket: read more bytes and feed them back on the next resume.
-    WantsRead,
-    /// Socket: write these bytes; the next resume typically takes `None`.
-    WantsWrite(Vec<u8>),
-    /// IMAP-layer STARTTLS dance is complete; the driver should now perform the
-    /// TLS handshake on the underlying socket. The vec carries any bytes
-    /// received past the tagged STARTTLS response (RFC 3501 §6.2.1 forbids any;
-    /// non-empty here is a classic STARTTLS-injection signal). After the
-    /// upgrade the coroutine has no more work; one extra resume completes with
-    /// `Ok(())`.
-    WantsStartTls(Vec<u8>),
-}
-
-impl From<ImapYield> for ImapStartTlsYield {
-    fn from(y: ImapYield) -> Self {
-        match y {
-            ImapYield::WantsRead => ImapStartTlsYield::WantsRead,
-            ImapYield::WantsWrite(bytes) => ImapStartTlsYield::WantsWrite(bytes),
-        }
-    }
-}
-
 /// I/O-free STARTTLS coroutine.
 pub struct ImapStartTls {
     tag_bytes: Vec<u8>,
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
-    wants_start_tls: Option<Vec<u8>>,
     buf: Vec<u8>,
 }
 
@@ -83,7 +52,6 @@ impl ImapStartTls {
             state: State::DiscardGreeting,
             wants_read: false,
             wants_write: None,
-            wants_start_tls: None,
             buf: Vec::new(),
         }
     }
@@ -96,8 +64,8 @@ impl Default for ImapStartTls {
 }
 
 impl ImapCoroutine for ImapStartTls {
-    type Yield = ImapStartTlsYield;
-    type Return = Result<(), ImapStartTlsError>;
+    type Yield = ImapYield;
+    type Return = Result<Vec<u8>, ImapStartTlsError>;
 
     fn resume(
         &mut self,
@@ -108,16 +76,11 @@ impl ImapCoroutine for ImapStartTls {
             trace!("starttls: {}", self.state);
 
             if let Some(bytes) = self.wants_write.take() {
-                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes));
-            }
-
-            if let Some(remaining) = self.wants_start_tls.take() {
-                self.state = State::Done;
-                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(remaining));
+                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
 
             if mem::take(&mut self.wants_read) {
-                return ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead);
+                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
             }
 
             match self.state {
@@ -193,15 +156,12 @@ impl ImapCoroutine for ImapStartTls {
                         );
 
                         let remaining = self.buf.split_off(end);
-                        self.wants_start_tls = Some(remaining);
+                        return ImapCoroutineState::Complete(Ok(remaining));
                     }
                     None => {
                         self.wants_read = true;
                     }
                 },
-                State::Done => {
-                    return ImapCoroutineState::Complete(Ok(()));
-                }
             }
         }
     }
@@ -212,12 +172,9 @@ enum State {
     DiscardGreeting,
     /// Push the STARTTLS command onto the write queue.
     WriteStartTls,
-    /// Discard the tagged STARTTLS response and capture any trailing
-    /// bytes for the WantsStartTls hand-off.
+    /// Discard the tagged STARTTLS response and return any trailing
+    /// bytes to the caller.
     DiscardStartTls,
-    /// Terminal state reached after the WantsStartTls yield; the next
-    /// resume completes with `Ok(())`.
-    Done,
 }
 
 impl fmt::Display for State {
@@ -226,7 +183,6 @@ impl fmt::Display for State {
             Self::DiscardGreeting => f.write_str("discard greeting"),
             Self::WriteStartTls => f.write_str("write starttls"),
             Self::DiscardStartTls => f.write_str("discard starttls response"),
-            Self::Done => f.write_str("done"),
         }
     }
 }

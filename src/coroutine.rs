@@ -5,19 +5,16 @@
 //! terminal output, and a two-variant [`ImapCoroutineState`]
 //! (`Yielded` / `Complete`).
 //!
-//! Each coroutine declares its own `Yield` enum mixing socket I/O step
-//! requests with any extra intermediate variants (e.g.
-//! [`ImapStartTlsYield::WantsStartTls`], [`ImapIdleYield::Event`],
-//! [`ImapMailboxWatchYield::Event`]). Most request/response coroutines
-//! pick the standard [`ImapYield`] directly; only coroutines that need
-//! extra variants declare their own.
+//! Most request/response coroutines pick the standard [`ImapYield`]
+//! directly; only coroutines that need to surface extra intermediate
+//! variants (e.g. [`ImapIdleYield::Event`],
+//! [`ImapMailboxWatchYield::Event`]) declare their own.
 //!
 //! [`ImapClientStd::run`] drives any standard-Yield coroutine to
 //! completion against a blocking stream; coroutines that need extra
 //! Yield variants get their own per-method client loops.
 //!
 //! [`ImapClientStd::run`]: crate::client::ImapClientStd::run
-//! [`ImapStartTlsYield::WantsStartTls`]: crate::rfc3501::starttls::ImapStartTlsYield::WantsStartTls
 //! [`ImapIdleYield::Event`]: crate::rfc2177::idle::ImapIdleYield::Event
 //! [`ImapMailboxWatchYield::Event`]: crate::watch::ImapMailboxWatchYield::Event
 

@@ -297,14 +297,12 @@ impl ImapClientStd {
     /// and fragmentizer until it terminates.
     ///
     /// Coroutines that need richer Yield variants
-    /// ([`ImapStartTls`] with [`ImapStartTlsYield::WantsStartTls`],
-    /// [`ImapIdle`](crate::rfc2177::idle::ImapIdle) with
+    /// ([`ImapIdle`](crate::rfc2177::idle::ImapIdle) with
     /// [`ImapIdleYield::Event`],
     /// [`ImapMailboxWatch`] with [`ImapMailboxWatchYield::Event`])
     /// are driven by their own per-method loops on this client; see
-    /// [`Self::starttls`] and [`Self::watch_mailbox`].
+    /// [`Self::watch_mailbox`].
     ///
-    /// [`ImapStartTlsYield::WantsStartTls`]: crate::rfc3501::starttls::ImapStartTlsYield::WantsStartTls
     /// [`ImapIdleYield::Event`]: crate::rfc2177::idle::ImapIdleYield::Event
     /// [`ImapMailboxWatchYield::Event`]: crate::watch::ImapMailboxWatchYield::Event
     pub fn run<C, T, E>(&mut self, mut coroutine: C) -> Result<T, ImapClientStdError>
@@ -372,31 +370,7 @@ impl ImapClientStd {
     /// [`into_stream`]: ImapClientStd::into_stream
     /// [`capability`]: ImapClientStd::capability
     pub fn starttls(&mut self) -> Result<Vec<u8>, ImapClientStdError> {
-        let mut coroutine = ImapStartTls::new();
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut arg: Option<&[u8]> = None;
-        let mut remaining: Option<Vec<u8>> = None;
-
-        loop {
-            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
-                ImapCoroutineState::Complete(Ok(())) => {
-                    return Ok(remaining.unwrap_or_default());
-                }
-                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
-                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
-                    let n = self.stream.read(&mut buf)?;
-                    arg = Some(&buf[..n]);
-                }
-                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
-                    self.stream.write_all(&bytes)?;
-                    arg = None;
-                }
-                ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(bytes)) => {
-                    remaining = Some(bytes);
-                    arg = None;
-                }
-            }
-        }
+        self.run(ImapStartTls::new())
     }
 
     /// Runs [`ImapAuthAnonymous`] (SASL `AUTHENTICATE ANONYMOUS`, RFC
@@ -1102,16 +1076,15 @@ fn run_starttls(
 
     loop {
         match coroutine.resume(fragmentizer, arg.take()) {
-            ImapCoroutineState::Complete(Ok(())) => return Ok(()),
+            ImapCoroutineState::Complete(Ok(_)) => return Ok(()),
             ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsRead) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf)?;
                 arg = Some(&buf[..n]);
             }
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsWrite(bytes)) => {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes)?;
             }
-            ImapCoroutineState::Yielded(ImapStartTlsYield::WantsStartTls(_)) => {}
         }
     }
 }
