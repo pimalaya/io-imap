@@ -775,7 +775,11 @@ impl ImapClientStd {
         mailbox: Mailbox<'static>,
         uid: bool,
     ) -> Result<ImapCopyUid, ImapClientStdError> {
-        self.run(ImapMessageMove::new(sequence_set, mailbox, uid))
+        self.run(ImapMessageMove::new(
+            sequence_set,
+            mailbox,
+            ImapMessageMoveOptions { uid },
+        ))
     }
 
     /// Runs [`ImapMessageAppend`] (`APPEND <mailbox> [flags] [date]
@@ -804,7 +808,11 @@ impl ImapClientStd {
         search_criteria: Vec1<SearchKey<'static>>,
         uid: bool,
     ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        self.run(ImapMailboxSort::new(sort_criteria, search_criteria, uid))
+        self.run(ImapMailboxSort::new(
+            sort_criteria,
+            search_criteria,
+            ImapMailboxSortOptions { uid },
+        ))
     }
 
     /// Runs [`ImapMessageThread`] (`THREAD` or `UID THREAD`, RFC 5256).
@@ -814,7 +822,11 @@ impl ImapClientStd {
         search_criteria: Vec1<SearchKey<'static>>,
         uid: bool,
     ) -> Result<Vec<Thread>, ImapClientStdError> {
-        self.run(ImapMessageThread::new(algorithm, search_criteria, uid))
+        self.run(ImapMessageThread::new(
+            algorithm,
+            search_criteria,
+            ImapMessageThreadOptions { uid },
+        ))
     }
 }
 

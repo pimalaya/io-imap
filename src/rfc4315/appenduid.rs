@@ -1,6 +1,11 @@
-//! I/O-free coroutine to send an IMAP APPEND command and extract the APPENDUID.
+//! I/O-free coroutine to send an IMAP APPEND command and surface only the
+//! `[APPENDUID uidvalidity uid]` response code (UIDPLUS, RFC 4315).
+//!
+//! Lighter than [`crate::rfc3501::append::ImapMessageAppend`]: drops the EXISTS
+//! count, keeps the NonZeroU32 typing on the pair. Use this variant when only
+//! the appended UID matters.
 
-use core::num::NonZeroU32;
+use core::{fmt, num::NonZeroU32};
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -17,53 +22,67 @@ use imap_codec::{
         response::{Code, StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::{coroutine::*, rfc3501::mailbox::encode_inplace, send::*};
+use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during APPEND progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAppendUidError {
-    #[error("IMAP APPEND NO error: {0}")]
+    #[error("IMAP APPEND failed: NO {0}")]
     No(String),
-    #[error("IMAP APPEND BAD error: {0}")]
+    #[error("IMAP APPEND failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP APPEND BYE error: {0}")]
+    #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP APPEND tagged response returned by the server")]
+    #[error("IMAP APPEND failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP APPEND command error")]
+    #[error("IMAP APPEND failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP APPEND command and extract the APPENDUID response code.
+/// Options for [`ImapAppendUid::new`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImapAppendUidOptions {
+    /// Per-message flags attached on append. Default: empty.
+    pub flags: Vec<Flag<'static>>,
+    /// Internal date stamp recorded by the server. Default: `None`
+    /// (server uses its current time).
+    pub date: Option<DateTime>,
+}
+
+/// I/O-free APPEND coroutine returning the APPENDUID pair.
 pub struct ImapAppendUid {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapAppendUid {
-    /// Creates a new coroutine.
+    /// Creates a new APPEND coroutine.
     pub fn new(
         mut mailbox: Mailbox<'static>,
-        flags: Vec<Flag<'static>>,
-        date: Option<DateTime>,
         message: LiteralOrLiteral8<'static>,
+        opts: ImapAppendUidOptions,
     ) -> Self {
         encode_inplace(&mut mailbox);
-        let body = CommandBody::Append {
-            mailbox,
-            flags,
-            date,
-            message,
+
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Append {
+                mailbox,
+                flags: opts.flags,
+                date: opts.date,
+                message,
+            },
         };
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), body).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
     }
 }
 
@@ -76,44 +95,207 @@ impl ImapCoroutine for ImapAppendUid {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-            }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
-        };
+        loop {
+            trace!("append uid: {}", self.state);
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapAppendUidError::Bye(
-                bye.text.to_string(),
-            )));
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapAppendUidError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapAppendUidError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    return match body.kind {
+                        StatusKind::Ok => {
+                            let pair =
+                                if let Some(Code::AppendUid { uid_validity, uid }) = body.code {
+                                    Some((uid_validity, uid))
+                                } else {
+                                    None
+                                };
+                            ImapCoroutineState::Complete(Ok(pair))
+                        }
+                        StatusKind::No => {
+                            let err = ImapAppendUidError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapAppendUidError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
+            }
         }
+    }
+}
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapAppendUidError::MissingTagged));
-        };
+enum State {
+    /// Send APPEND (including the literal data) and await the tagged
+    /// response.
+    Send(SendImapCommand<CommandCodec>),
+}
 
-        match body.kind {
-            StatusKind::Ok => {
-                let uid_pair = if let Some(Code::AppendUid { uid, uid_validity }) = body.code {
-                    Some((uid, uid_validity))
-                } else {
-                    None
-                };
-                ImapCoroutineState::Complete(Ok(uid_pair))
-            }
-            StatusKind::No => {
-                ImapCoroutineState::Complete(Err(ImapAppendUidError::No(body.text.to_string())))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Complete(Err(ImapAppendUidError::Bad(body.text.to_string())))
-            }
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send append"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, vec::Vec};
+
+    use imap_codec::imap_types::core::Literal;
+
+    use super::*;
+
+    /// Happy path: server returns APPENDUID; the coroutine surfaces
+    /// the pair.
+    #[test]
+    fn success_with_appenduid_returns_pair() {
+        let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
+        let mut append = ImapAppendUid::new(
+            "INBOX".try_into().expect("valid mailbox"),
+            message,
+            ImapAppendUidOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut append, &mut frag);
+
+        let reply = format!("{tag} OK [APPENDUID 1700000000 7] APPEND completed\r\n");
+        let pair = expect_complete_ok(&mut append, &mut frag, reply.as_bytes())
+            .expect("APPENDUID returned");
+        assert_eq!(1700000000, pair.0.get());
+        assert_eq!(7, pair.1.get());
+    }
+
+    /// Server omits APPENDUID: still succeed with `None`.
+    #[test]
+    fn success_without_appenduid_returns_none() {
+        let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
+        let mut append = ImapAppendUid::new(
+            "INBOX".try_into().expect("valid mailbox"),
+            message,
+            ImapAppendUidOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut append, &mut frag);
+
+        let reply = format!("{tag} OK APPEND completed\r\n");
+        let pair = expect_complete_ok(&mut append, &mut frag, reply.as_bytes());
+        assert!(pair.is_none());
+    }
+
+    /// Tagged NO: surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
+        let mut append = ImapAppendUid::new(
+            "INBOX".try_into().expect("valid mailbox"),
+            message,
+            ImapAppendUidOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut append, &mut frag);
+
+        let reply = format!("{tag} NO mailbox is read-only\r\n");
+        let err = expect_complete_err(&mut append, &mut frag, reply.as_bytes());
+        let ImapAppendUidError::No(text) = err else {
+            panic!("expected ImapAppendUidError::No, got {err:?}");
+        };
+        assert_eq!(text, "mailbox is read-only");
+    }
+
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let message = LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(b"x"));
+        let mut append = ImapAppendUid::new(
+            "INBOX".try_into().expect("valid mailbox"),
+            message,
+            ImapAppendUidOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let _ = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_read(&mut append, &mut frag);
+
+        let err = expect_complete_err(&mut append, &mut frag, b"* BYE going down\r\n");
+        let ImapAppendUidError::Bye(text) = err else {
+            panic!("expected ImapAppendUidError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "going down");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapAppendUid,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapAppendUid, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapAppendUid,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> Option<(NonZeroU32, NonZeroU32)> {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapAppendUid,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapAppendUidError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }

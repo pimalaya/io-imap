@@ -1,4 +1,10 @@
-//! I/O-free coroutine to send an IMAP ENABLE command.
+//! I/O-free coroutine to send an IMAP ENABLE command (RFC 5161).
+//!
+//! Opts the connection into one or more `CAPABILITY-ENABLE` extensions.
+//! Returns the server's `ENABLED` response list (or `None` when the server
+//! omits it).
+
+use core::fmt;
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -12,43 +18,46 @@ use imap_codec::{
         response::{Data, StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::send::*;
+use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during ENABLE progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapExtensionEnableError {
-    #[error("IMAP ENABLE NO error: {0}")]
+    #[error("IMAP ENABLE failed: NO {0}")]
     No(String),
-    #[error("IMAP ENABLE BAD error: {0}")]
+    #[error("IMAP ENABLE failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP ENABLE BYE error: {0}")]
+    #[error("IMAP ENABLE failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP ENABLE tagged response returned by the server")]
+    #[error("IMAP ENABLE failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP ENABLE command error")]
+    #[error("IMAP ENABLE failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP ENABLE command.
+/// I/O-free IMAP ENABLE coroutine.
 pub struct ImapExtensionEnable {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapExtensionEnable {
-    /// Creates a new coroutine.
+    /// Creates a new ENABLE coroutine.
     pub fn new(capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
-        let body = CommandBody::Enable { capabilities };
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), body).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Enable { capabilities },
+        };
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
     }
 }
 
@@ -61,46 +70,187 @@ impl ImapCoroutine for ImapExtensionEnable {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+        loop {
+            trace!("enable: {}", self.state);
+
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapExtensionEnableError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapExtensionEnableError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    let mut enabled = None;
+                    for data in out.data {
+                        if let Data::Enabled { capabilities } = data {
+                            enabled = Some(capabilities);
+                        }
+                    }
+
+                    return match body.kind {
+                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
+                        StatusKind::No => {
+                            let err = ImapExtensionEnableError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapExtensionEnableError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
             }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok {
-                data, tagged, bye, ..
-            } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
+        }
+    }
+}
+
+enum State {
+    /// Send ENABLE and await the tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send enable"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, vec, vec::Vec};
+
+    use super::*;
+
+    fn caps() -> Vec1<CapabilityEnable<'static>> {
+        Vec1::try_from(vec![CapabilityEnable::CondStore]).expect("one cap")
+    }
+
+    /// Happy path: server returns `* ENABLED ...` then tagged OK.
+    #[test]
+    fn success_returns_enabled_list() {
+        let mut enable = ImapExtensionEnable::new(caps());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.contains("ENABLE CONDSTORE"));
+
+        expect_wants_read(&mut enable, &mut frag);
+
+        let reply = format!("* ENABLED CONDSTORE\r\n{tag} OK ENABLE completed\r\n");
+        let enabled = expect_complete_ok(&mut enable, &mut frag, reply.as_bytes())
+            .expect("server returned ENABLED");
+        assert_eq!(1, enabled.len());
+    }
+
+    /// Server skips the ENABLED line: still succeed with `None`.
+    #[test]
+    fn success_without_enabled_returns_none() {
+        let mut enable = ImapExtensionEnable::new(caps());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut enable, &mut frag);
+
+        let reply = format!("{tag} OK ENABLE completed\r\n");
+        let enabled = expect_complete_ok(&mut enable, &mut frag, reply.as_bytes());
+        assert!(enabled.is_none());
+    }
+
+    /// Tagged NO: surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut enable = ImapExtensionEnable::new(caps());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut enable, &mut frag);
+
+        let reply = format!("{tag} NO CONDSTORE not supported\r\n");
+        let err = expect_complete_err(&mut enable, &mut frag, reply.as_bytes());
+        let ImapExtensionEnableError::No(text) = err else {
+            panic!("expected ImapExtensionEnableError::No, got {err:?}");
         };
+        assert_eq!(text, "CONDSTORE not supported");
+    }
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapExtensionEnableError::Bye(
-                bye.text.to_string(),
-            )));
-        }
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut enable = ImapExtensionEnable::new(caps());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapExtensionEnableError::MissingTagged));
+        let _ = expect_wants_write(&mut enable, &mut frag, None);
+        expect_wants_read(&mut enable, &mut frag);
+
+        let err = expect_complete_err(&mut enable, &mut frag, b"* BYE going down\r\n");
+        let ImapExtensionEnableError::Bye(text) = err else {
+            panic!("expected ImapExtensionEnableError::Bye, got {err:?}");
         };
+        assert_eq!(text, "going down");
+    }
 
-        let mut enabled = None;
-        for data in data {
-            if let Data::Enabled { capabilities } = data {
-                enabled = Some(capabilities);
-            }
-        }
+    // --- utils
 
-        match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
-            StatusKind::No => ImapCoroutineState::Complete(Err(ImapExtensionEnableError::No(
-                body.text.to_string(),
-            ))),
-            StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapExtensionEnableError::Bad(
-                body.text.to_string(),
-            ))),
+    fn expect_wants_write(
+        cor: &mut ImapExtensionEnable,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
         }
+    }
+
+    fn expect_wants_read(cor: &mut ImapExtensionEnable, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapExtensionEnable,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> Option<Vec<CapabilityEnable<'static>>> {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapExtensionEnable,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapExtensionEnableError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
