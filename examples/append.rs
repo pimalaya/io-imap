@@ -72,7 +72,10 @@ fn main() {
         }
     }
 
-    let mut coroutine = ImapMailboxSelect::new("INBOX".try_into().unwrap());
+    let mut coroutine = ImapMailboxSelect::new(
+        "INBOX".try_into().unwrap(),
+        ImapMailboxSelectOptions::default(),
+    );
     let mut arg: Option<&[u8]> = None;
 
     let data = loop {

@@ -1,14 +1,13 @@
-//! I/O-free coroutine watching a single IMAP mailbox for changes
-//! using IDLE (RFC 2177) for the wake signal and SELECT (QRESYNC)
-//! (RFC 7162) for the deltas.
+//! I/O-free coroutine watching a single IMAP mailbox for changes using IDLE
+//! (RFC 2177) for the wake signal and SELECT (QRESYNC) (RFC 7162) for the
+//! deltas.
 //!
-//! Why both: IDLE alone delivers untagged `EXISTS` / `EXPUNGE` /
-//! `FETCH` responses, but they use sequence numbers that shift as
-//! messages disappear and they only give a count (not UIDs) on
-//! arrival. QRESYNC alone misses the wake signal: it tells you what
-//! changed since the last checkpoint but nothing about *when* it
-//! changed. Composed, the pair gives a reliable UID-keyed change
-//! stream:
+//! Why both: IDLE alone delivers untagged `EXISTS` / `EXPUNGE` / `FETCH`
+//! responses, but they use sequence numbers that shift as messages disappear
+//! and they only give a count (not UIDs) on arrival. QRESYNC alone misses the
+//! wake signal: it tells you what changed since the last checkpoint but nothing
+//! about *when* it changed. Composed, the pair gives a reliable UID-keyed
+//! change stream:
 //!
 //! ```text
 //! SELECT (initial, CONDSTORE)
@@ -23,11 +22,10 @@
 //! emit events ──► IDLE ──► …
 //! ```
 //!
-//! Mailbox stays SELECTed for the lifetime of the coroutine; the
-//! connection is dedicated. Shutdown is cooperative: flip the
-//! [`AtomicBool`] handed to [`ImapMailboxWatch::new`] and the
-//! coroutine winds the running IDLE down at its next loop iteration,
-//! completing with `Ok(())`.
+//! Mailbox stays SELECTed for the lifetime of the coroutine; the connection is
+//! dedicated. Shutdown is cooperative: flip the [`AtomicBool`] handed to
+//! [`ImapMailboxWatch::new`] and the coroutine winds the running IDLE down at
+//! its next loop iteration, completing with `Ok(())`.
 
 use core::{
     mem,
@@ -64,19 +62,18 @@ use crate::{
     rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchOptions},
-        select::{ImapMailboxSelect, ImapMailboxSelectError, SelectData},
+        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectOptions, SelectData},
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
 };
 
 /// Watch event emitted by [`ImapMailboxWatch::resume`].
 ///
-/// `EnvelopeAdded` carries the raw FETCH item list so callers stay in
-/// charge of how they parse it (full envelope, flags-only, …).
-/// `FlagsAdded` / `FlagsRemoved` are pre-diffed against the
-/// coroutine's internal shadow; each `flags` vector contains only the
-/// wire-level flags that actually changed in this iteration. Order
-/// inside the vector follows the server's response order.
+/// `EnvelopeAdded` carries the raw FETCH item list so callers stay in charge of
+/// how they parse it (full envelope, flags-only, …).  `FlagsAdded` /
+/// `FlagsRemoved` are pre-diffed against the coroutine's internal shadow; each
+/// `flags` vector contains only the wire-level flags that actually changed in
+/// this iteration. Order inside the vector follows the server's response order.
 #[derive(Clone, Debug)]
 pub enum ImapMailboxWatchEvent {
     EnvelopeAdded {
@@ -117,31 +114,27 @@ pub enum ImapMailboxWatchError {
     Enable(#[from] ImapExtensionEnableError),
 }
 
-/// Per-coroutine Yield: socket I/O step requests on one axis, domain
-/// events on the other. The driver dispatches on the variant: I/O
-/// variants pump the IMAP socket; [`Self::Event`] is delivered to the
-/// caller (callback / channel / async stream).
+/// Per-coroutine Yield: socket I/O step requests on one axis, domain events on
+/// the other. The driver dispatches on the variant: I/O variants pump the IMAP
+/// socket; [`Self::Event`] is delivered to the caller (callback / channel /
+/// async stream).
 #[derive(Debug)]
 pub enum ImapMailboxWatchYield {
-    /// Socket: read more bytes and feed them back on the next
-    /// resume.
+    /// Socket: read more bytes and feed them back on the next resume.
     WantsRead,
-    /// Socket: write these bytes; the next resume typically takes
-    /// `None`.
+    /// Socket: write these bytes; the next resume typically takes `None`.
     WantsWrite(Vec<u8>),
-    /// Domain: one pre-diffed delta computed from the inner QRESYNC
-    /// pull.
+    /// Domain: one pre-diffed delta computed from the inner QRESYNC pull.
     Event(ImapMailboxWatchEvent),
 }
 
 enum State {
-    /// ENABLE CONDSTORE QRESYNC — RFC 7162 §3.1 requires this once
-    /// per session before any `SELECT (QRESYNC …)` parameter is
-    /// allowed. Some servers (Dovecot included) silently accept the
-    /// missing ENABLE and fall through to plain SELECT semantics;
-    /// others (Cyrus, the test server that surfaced this) hard-reject
-    /// the SELECT with `BAD QRESYNC not enabled`. Sending ENABLE
-    /// unconditionally is correct against both.
+    /// ENABLE CONDSTORE QRESYNC — RFC 7162 §3.1 requires this once per session
+    /// before any `SELECT (QRESYNC …)` parameter is allowed. Some servers
+    /// (Dovecot included) silently accept the missing ENABLE and fall through
+    /// to plain SELECT semantics; others (Cyrus, the test server that surfaced
+    /// this) hard-reject the SELECT with `BAD QRESYNC not enabled`. Sending
+    /// ENABLE unconditionally is correct against both.
     EnableQresync(ImapExtensionEnable),
     /// SELECT (CONDSTORE) — capture UIDVALIDITY + HIGHESTMODSEQ.
     SelectInitial(ImapMailboxSelect),
@@ -151,12 +144,12 @@ enum State {
     BeginIdle,
     /// IDLE in progress.
     Idle(ImapIdle),
-    /// SELECT (QRESYNC ...) — pull the delta since the last
-    /// HIGHESTMODSEQ checkpoint.
+    /// SELECT (QRESYNC ...) — pull the delta since the last HIGHESTMODSEQ
+    /// checkpoint.
     SelectQresync(ImapMailboxSelect),
     /// Drain `pending` one event at a time, yielding each as
-    /// [`ImapMailboxWatchYield::Event`]. When empty, transition back
-    /// to `BeginIdle`.
+    /// [`ImapMailboxWatchYield::Event`]. When empty, transition back to
+    /// `BeginIdle`.
     EmitDeltas,
     /// Terminal state.
     Terminal,
@@ -165,39 +158,37 @@ enum State {
 /// I/O-free IDLE+QRESYNC mailbox watcher.
 pub struct ImapMailboxWatch {
     state: State,
-    /// External shutdown signal, shared with the caller. Flipping it
-    /// asks the coroutine to wind down at its next loop iteration.
+    /// External shutdown signal, shared with the caller. Flipping it asks the
+    /// coroutine to wind down at its next loop iteration.
     shutdown: Arc<AtomicBool>,
-    /// Inner signal handed to each fresh [`ImapIdle`]. Always cleared
-    /// before a new IDLE starts; set by the watcher itself on
-    /// untagged-response arrival (to trigger a QRESYNC pull) and on
-    /// shutdown propagation.
+    /// Inner signal handed to each fresh [`ImapIdle`]. Always cleared before a
+    /// new IDLE starts; set by the watcher itself on untagged-response arrival
+    /// (to trigger a QRESYNC pull) and on shutdown propagation.
     idle_done: Arc<AtomicBool>,
     /// Whether the current IDLE has seen at least one untagged
-    /// response. Decides whether to pull a QRESYNC delta or just
-    /// re-enter IDLE after the current one ends.
+    /// response. Decides whether to pull a QRESYNC delta or just re-enter IDLE
+    /// after the current one ends.
     idle_saw_data: bool,
     mailbox: Mailbox<'static>,
     uid_validity: Option<NonZeroU32>,
     highest_mod_seq: u64,
-    /// UID → flags snapshot maintained across QRESYNC iterations,
-    /// used to diff incoming FETCH responses into `FlagsAdded` /
-    /// `FlagsRemoved` deltas and to spot first-time-seen UIDs.
+    /// UID → flags snapshot maintained across QRESYNC iterations, used to diff
+    /// incoming FETCH responses into `FlagsAdded` / `FlagsRemoved` deltas and
+    /// to spot first-time-seen UIDs.
     shadow: BTreeMap<NonZeroU32, Vec<Flag<'static>>>,
     /// Events ready to be drained as `Event(...)` yields.
     pending: VecDeque<ImapMailboxWatchEvent>,
 }
 
 impl ImapMailboxWatch {
-    /// Creates a new coroutine targeting `mailbox`. `shutdown` is
-    /// shared with the caller; when flipped, the running IDLE winds
-    /// down cleanly and the next [`ImapMailboxWatch::resume`]
-    /// completes with `Ok(())`.
+    /// Creates a new coroutine targeting `mailbox`. `shutdown` is shared with
+    /// the caller; when flipped, the running IDLE winds down cleanly and the
+    /// next [`ImapMailboxWatch::resume`] completes with `Ok(())`.
     ///
     /// Errors with [`ImapMailboxWatchError::QresyncUnsupported`] when
-    /// `capability` does not advertise `QRESYNC`. Run `CAPABILITY` (or
-    /// `LOGIN` / `AUTHENTICATE` with `ensure_capabilities`) before
-    /// calling this constructor.
+    /// `capability` does not advertise `QRESYNC`. Run `CAPABILITY` (or `LOGIN`
+    /// / `AUTHENTICATE` with `ensure_capabilities`) before calling this
+    /// constructor.
     pub fn new(
         capability: &[Capability<'static>],
         mailbox: Mailbox<'static>,
@@ -317,8 +308,10 @@ impl ImapCoroutine for ImapMailboxWatch {
                     ImapCoroutineState::Complete(Ok(enabled)) => {
                         trace!("watch: ENABLE OK ({enabled:?})");
                         let parameters = vec![SelectParameter::CondStore];
-                        let select =
-                            ImapMailboxSelect::with_parameters(self.mailbox.clone(), parameters);
+                        let select = ImapMailboxSelect::new(
+                            self.mailbox.clone(),
+                            ImapMailboxSelectOptions { parameters },
+                        );
                         self.state = State::SelectInitial(select);
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
@@ -454,9 +447,9 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 known_uids: None,
                                 seq_match_data: None,
                             }];
-                            let select = ImapMailboxSelect::with_parameters(
+                            let select = ImapMailboxSelect::new(
                                 self.mailbox.clone(),
-                                parameters,
+                                ImapMailboxSelectOptions { parameters },
                             );
                             self.state = State::SelectQresync(select);
                         } else {

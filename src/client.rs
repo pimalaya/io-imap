@@ -586,7 +586,10 @@ impl ImapClientStd {
 
     /// Runs [`ImapMailboxSelect`] (`SELECT <mailbox>`).
     pub fn select(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        self.run(ImapMailboxSelect::new(mailbox))
+        self.run(ImapMailboxSelect::new(
+            mailbox,
+            ImapMailboxSelectOptions::default(),
+        ))
     }
 
     /// Runs [`ImapMailboxExamine`] (`EXAMINE <mailbox>`).
@@ -625,7 +628,10 @@ impl ImapClientStd {
             seq_match_data: None,
         }];
 
-        self.run(ImapMailboxSelect::with_parameters(mailbox, parameters))
+        self.run(ImapMailboxSelect::new(
+            mailbox,
+            ImapMailboxSelectOptions { parameters },
+        ))
     }
 
     /// Runs [`ImapMailboxClose`] (`CLOSE`).
@@ -751,7 +757,10 @@ impl ImapClientStd {
         criteria: Vec1<SearchKey<'static>>,
         uid: bool,
     ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        self.run(ImapMessageSearch::new(criteria, uid))
+        self.run(ImapMessageSearch::new(
+            criteria,
+            ImapMessageSearchOptions { uid },
+        ))
     }
 
     /// Runs [`ImapMessageStore`] (`STORE` or `UID STORE`). Returns the
@@ -763,7 +772,12 @@ impl ImapClientStd {
         flags: Vec<Flag<'static>>,
         uid: bool,
     ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        self.run(ImapMessageStore::new(sequence_set, kind, flags, uid))
+        self.run(ImapMessageStore::new(
+            sequence_set,
+            kind,
+            flags,
+            ImapMessageStoreOptions { uid },
+        ))
     }
 
     /// Runs [`ImapMessageCopy`] (`COPY` or `UID COPY`).

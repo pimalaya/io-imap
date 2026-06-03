@@ -92,7 +92,10 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     // ── SELECT INBOX ──────────────────────────────────────────────────────────
 
-    let mut coroutine = ImapMailboxSelect::new("INBOX".try_into().unwrap());
+    let mut coroutine = ImapMailboxSelect::new(
+        "INBOX".try_into().unwrap(),
+        ImapMailboxSelectOptions::default(),
+    );
     let mut arg: Option<&[u8]> = None;
 
     loop {

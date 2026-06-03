@@ -1,4 +1,10 @@
-//! I/O-free coroutine to send an IMAP LOGOUT command.
+//! I/O-free coroutine to send an IMAP LOGOUT command (RFC 3501 §6.1.3).
+//!
+//! Asks the server to terminate the session. Success is signalled by an
+//! untagged BYE followed by the tagged OK; the absence of either is reported as
+//! a distinct error.
+
+use core::fmt;
 
 use alloc::string::{String, ToString};
 
@@ -11,42 +17,52 @@ use imap_codec::{
         response::{StatusKind, Tagged},
     },
 };
+use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
-use crate::send::*;
+use crate::{coroutine::*, imap_try, send::*};
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during LOGOUT progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapLogoutError {
-    #[error("IMAP LOGOUT NO error: {0}")]
+    #[error("IMAP LOGOUT failed: NO {0}")]
     No(String),
-    #[error("IMAP LOGOUT BAD error: {0}")]
+    #[error("IMAP LOGOUT failed: BAD {0}")]
     Bad(String),
 
-    #[error("No IMAP LOGOUT tagged response returned by the server")]
+    #[error("IMAP LOGOUT failed: server did not return a tagged response")]
     MissingTagged,
-    #[error("No IMAP LOGOUT BYE response returned by the server")]
+    #[error("IMAP LOGOUT failed: server did not send the expected BYE")]
     MissingBye,
 
-    #[error("Send IMAP LOGOUT command error")]
+    #[error("IMAP LOGOUT failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP LOGOUT command.
+/// I/O-free IMAP LOGOUT coroutine.
 pub struct ImapLogout {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapLogout {
-    /// Creates a new coroutine.
+    /// Creates a new LOGOUT coroutine.
     pub fn new() -> Self {
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), CommandBody::Logout).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Logout,
+        };
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
+    }
+}
+
+impl Default for ImapLogout {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -59,41 +75,152 @@ impl ImapCoroutine for ImapLogout {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
-            }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok { tagged, bye, .. } => (tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
-        };
+        loop {
+            trace!("logout: {}", self.state);
 
-        if bye.is_none() {
-            return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingBye));
-        }
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingTagged));
-        };
+                    if out.bye.is_none() {
+                        return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingBye));
+                    }
 
-        match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-            StatusKind::No => {
-                ImapCoroutineState::Complete(Err(ImapLogoutError::No(body.text.to_string())))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Complete(Err(ImapLogoutError::Bad(body.text.to_string())))
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingTagged));
+                    };
+
+                    return match body.kind {
+                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                        StatusKind::No => {
+                            let err = ImapLogoutError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapLogoutError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
             }
         }
     }
 }
 
-impl Default for ImapLogout {
-    fn default() -> Self {
-        Self::new()
+enum State {
+    /// Send LOGOUT and await the BYE + tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send logout"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, vec::Vec};
+
+    use super::*;
+
+    /// Happy path: server returns BYE then tagged OK.
+    #[test]
+    fn success_returns_ok() {
+        let mut logout = ImapLogout::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        assert!(line.trim_end().ends_with("LOGOUT"));
+
+        expect_wants_read(&mut logout, &mut frag);
+
+        let reply = format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n");
+        expect_complete_ok(&mut logout, &mut frag, reply.as_bytes());
+    }
+
+    /// Server skips the BYE: surface MissingBye.
+    #[test]
+    fn missing_bye_returns_missing_bye_error() {
+        let mut logout = ImapLogout::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut logout, &mut frag);
+
+        let reply = format!("{tag} OK LOGOUT completed\r\n");
+        let err = expect_complete_err(&mut logout, &mut frag, reply.as_bytes());
+        assert!(matches!(err, ImapLogoutError::MissingBye));
+    }
+
+    /// Tagged BAD: surface text verbatim.
+    #[test]
+    fn tagged_bad_returns_bad_error() {
+        let mut logout = ImapLogout::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut logout, &mut frag);
+
+        let reply = format!("* BYE bye\r\n{tag} BAD LOGOUT not allowed\r\n");
+        let err = expect_complete_err(&mut logout, &mut frag, reply.as_bytes());
+        let ImapLogoutError::Bad(text) = err else {
+            panic!("expected ImapLogoutError::Bad, got {err:?}");
+        };
+        assert_eq!(text, "LOGOUT not allowed");
+    }
+
+    // --- utils
+
+    fn expect_wants_write(
+        cor: &mut ImapLogout,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_read(cor: &mut ImapLogout, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_complete_ok(cor: &mut ImapLogout, frag: &mut Fragmentizer, reply: &[u8]) {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(())) => {}
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapLogout,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapLogoutError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }

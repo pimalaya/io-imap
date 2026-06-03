@@ -1,4 +1,9 @@
-//! I/O-free coroutine to send an IMAP LIST command.
+//! I/O-free coroutine to send an IMAP LIST command (RFC 3501 §6.3.8).
+//!
+//! Returns one row per matched mailbox: `(mailbox, hierarchy delimiter,
+//! attributes)`.
+
+use core::fmt;
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -16,58 +21,61 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::coroutine::*;
 use crate::{
+    coroutine::*,
+    imap_try,
     rfc3501::mailbox::{decode_inplace, encode_inplace},
     send::*,
 };
 
-/// Output of the IMAP `LIST` (and `LSUB`) command: one row per matched
-/// mailbox `(mailbox, hierarchy delimiter, attributes)`.
+/// Output of the IMAP `LIST` (and `LSUB`) command: one row per
+/// matched mailbox `(mailbox, hierarchy delimiter, attributes)`.
 pub type ImapMailboxListing = Vec<(
     Mailbox<'static>,
     Option<QuotedChar>,
     Vec<FlagNameAttribute<'static>>,
 )>;
 
-/// Errors that can occur during the coroutine progression.
+/// Errors that can occur during LIST progression.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxListError {
-    #[error("IMAP LIST NO error: {0}")]
+    #[error("IMAP LIST failed: NO {0}")]
     No(String),
-    #[error("IMAP LIST BAD error: {0}")]
+    #[error("IMAP LIST failed: BAD {0}")]
     Bad(String),
-    #[error("IMAP LIST BYE error: {0}")]
+    #[error("IMAP LIST failed: BYE {0}")]
     Bye(String),
 
-    #[error("No IMAP LIST tagged response returned by the server")]
+    #[error("IMAP LIST failed: server did not return a tagged response")]
     MissingTagged,
 
-    #[error("Send IMAP LIST command error")]
+    #[error("IMAP LIST failed: {0}")]
     Send(#[from] SendImapCommandError),
 }
 
-/// I/O-free coroutine to send an IMAP LIST command.
+/// I/O-free IMAP LIST coroutine.
 pub struct ImapMailboxList {
-    send: SendImapCommand<CommandCodec>,
+    state: State,
 }
 
 impl ImapMailboxList {
-    /// Creates a new coroutine.
+    /// Creates a new LIST coroutine.
     pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
-        trace!("list IMAP mailboxes: {reference:?} {mailbox_wildcard:?}");
         encode_inplace(&mut reference);
 
-        let body = CommandBody::List {
-            reference,
-            mailbox_wildcard,
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::List {
+                reference,
+                mailbox_wildcard,
+            },
         };
-        let mut tag = TagGenerator::new();
-        // SAFETY: tag is always valid
-        let command = Command::new(tag.generate(), body).unwrap();
-        Self {
-            send: SendImapCommand::new(CommandCodec::new(), command),
-        }
+
+        trace!("send IMAP command {command:?}");
+
+        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+
+        Self { state }
     }
 }
 
@@ -80,54 +88,183 @@ impl ImapCoroutine for ImapMailboxList {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        let (data, tagged, bye) = match self.send.resume(fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsRead);
+        loop {
+            trace!("list: {}", self.state);
+
+            match &mut self.state {
+                State::Send(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapMailboxListError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapMailboxListError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    let mut mailboxes = Vec::new();
+                    for data in out.data {
+                        if let Data::List {
+                            items,
+                            delimiter,
+                            mailbox,
+                        } = data
+                        {
+                            let mut mailbox = mailbox;
+                            decode_inplace(&mut mailbox);
+                            mailboxes.push((mailbox, delimiter, items));
+                        }
+                    }
+
+                    return match body.kind {
+                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
+                        StatusKind::No => {
+                            let err = ImapMailboxListError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapMailboxListError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
+                }
             }
-            SendImapCommandResult::WantsWrite(bytes) => {
-                return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
-            }
-            SendImapCommandResult::Ok {
-                data, tagged, bye, ..
-            } => (data, tagged, bye),
-            SendImapCommandResult::Err(err) => {
-                return ImapCoroutineState::Complete(Err(err.into()));
-            }
+        }
+    }
+}
+
+enum State {
+    /// Send LIST and await the tagged response.
+    Send(SendImapCommand<CommandCodec>),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => f.write_str("send list"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, vec::Vec};
+
+    use super::*;
+
+    /// Happy path: server returns `* LIST ...` rows then tagged OK.
+    #[test]
+    fn success_returns_rows() {
+        let reference: Mailbox = "".try_into().expect("valid reference");
+        let pattern: ListMailbox = "*".try_into().expect("valid pattern");
+        let mut list = ImapMailboxList::new(reference, pattern);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut list, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut list, &mut frag);
+
+        let reply = format!(
+            "* LIST (\\HasNoChildren) \"/\" INBOX\r\n\
+             * LIST (\\HasNoChildren) \"/\" Archive\r\n\
+             {tag} OK LIST completed\r\n",
+        );
+        let rows = expect_complete_ok(&mut list, &mut frag, reply.as_bytes());
+        assert_eq!(2, rows.len());
+    }
+
+    /// Tagged NO: surface text verbatim.
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut list = ImapMailboxList::new(
+            "".try_into().expect("valid reference"),
+            "*".try_into().expect("valid pattern"),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut list, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut list, &mut frag);
+
+        let reply = format!("{tag} NO not allowed\r\n");
+        let err = expect_complete_err(&mut list, &mut frag, reply.as_bytes());
+        let ImapMailboxListError::No(text) = err else {
+            panic!("expected ImapMailboxListError::No, got {err:?}");
         };
+        assert_eq!(text, "not allowed");
+    }
 
-        if let Some(bye) = bye {
-            return ImapCoroutineState::Complete(Err(ImapMailboxListError::Bye(
-                bye.text.to_string(),
-            )));
-        }
+    /// BYE before tagged response: surface text verbatim.
+    #[test]
+    fn bye_returns_bye_error() {
+        let mut list = ImapMailboxList::new(
+            "".try_into().expect("valid reference"),
+            "*".try_into().expect("valid pattern"),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let Some(Tagged { body, .. }) = tagged else {
-            return ImapCoroutineState::Complete(Err(ImapMailboxListError::MissingTagged));
+        let _ = expect_wants_write(&mut list, &mut frag, None);
+        expect_wants_read(&mut list, &mut frag);
+
+        let err = expect_complete_err(&mut list, &mut frag, b"* BYE going down\r\n");
+        let ImapMailboxListError::Bye(text) = err else {
+            panic!("expected ImapMailboxListError::Bye, got {err:?}");
         };
+        assert_eq!(text, "going down");
+    }
 
-        let mut mailboxes = Vec::new();
+    // --- utils
 
-        for data in data {
-            if let Data::List {
-                items,
-                delimiter,
-                mailbox,
-            } = data
-            {
-                let mut mailbox = mailbox;
-                decode_inplace(&mut mailbox);
-                mailboxes.push((mailbox, delimiter, items));
-            }
+    fn expect_wants_write(
+        cor: &mut ImapMailboxList,
+        frag: &mut Fragmentizer,
+        arg: Option<&[u8]>,
+    ) -> Vec<u8> {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
+            state => panic!("expected WantsWrite, got {state:?}"),
         }
+    }
 
-        match body.kind {
-            StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
-            StatusKind::No => {
-                ImapCoroutineState::Complete(Err(ImapMailboxListError::No(body.text.to_string())))
-            }
-            StatusKind::Bad => {
-                ImapCoroutineState::Complete(Err(ImapMailboxListError::Bad(body.text.to_string())))
-            }
+    fn expect_wants_read(cor: &mut ImapMailboxList, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
         }
+    }
+
+    fn expect_complete_ok(
+        cor: &mut ImapMailboxList,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMailboxListing {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Ok(value)) => value,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn expect_complete_err(
+        cor: &mut ImapMailboxList,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMailboxListError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
     }
 }
