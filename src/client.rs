@@ -731,7 +731,14 @@ impl ImapClientStd {
         items: MacroOrMessageDataItemNames<'static>,
         uid: bool,
     ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        self.run(ImapMessageFetch::new(sequence_set, items, uid))
+        self.run(ImapMessageFetch::new(
+            sequence_set,
+            items,
+            ImapMessageFetchOptions {
+                uid,
+                ..Default::default()
+            },
+        ))
     }
 
     /// Runs [`ImapMessageSearch`] (`SEARCH` or `UID SEARCH`).

@@ -63,7 +63,7 @@ use crate::{
     coroutine::*,
     rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
-        fetch::{ImapMessageFetch, ImapMessageFetchError},
+        fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchOptions},
         select::{ImapMailboxSelect, ImapMailboxSelectError, SelectData},
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
@@ -369,7 +369,11 @@ impl ImapCoroutine for ImapMailboxWatch {
                             MessageDataItemName::Uid,
                             MessageDataItemName::Flags,
                         ]);
-                        let fetch = ImapMessageFetch::new(sequence_set, item_names, false);
+                        let fetch = ImapMessageFetch::new(
+                            sequence_set,
+                            item_names,
+                            ImapMessageFetchOptions::default(),
+                        );
                         self.state = State::FetchBaseline(fetch);
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
