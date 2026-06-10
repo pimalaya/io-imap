@@ -18,7 +18,7 @@ use imap_codec::{
         utils::escape_byte_string,
     },
 };
-use log::trace;
+use log::{trace, warn};
 use thiserror::Error;
 
 use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
@@ -185,17 +185,38 @@ impl<T: Encoder> SendImapCommand<T> {
                             }
                             Err(decode_err) => {
                                 let bytes = fragmentizer.message_bytes();
-                                let bytes = Secret::new(bytes.into());
                                 let err = match decode_err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
-                                        SendImapCommandError::DecodingFailure(bytes)
+                                        // Some servers emit untagged lines that are
+                                        // invalid per RFC 3501 and cannot be fixed
+                                        // server-side, e.g. Gmail persisting keyword
+                                        // flags containing `]` in the SELECT FLAGS
+                                        // response (pimalaya/himalaya#641). Dropping
+                                        // such a line only loses optional data, while
+                                        // failing aborts the whole command, so skip it
+                                        // with a warning. Tagged responses still fail:
+                                        // they carry the command outcome.
+                                        if bytes.starts_with(b"* ") {
+                                            warn!(
+                                                "skipping undecodable untagged response: {}",
+                                                escape_byte_string(bytes)
+                                            );
+                                            continue;
+                                        }
+                                        SendImapCommandError::DecodingFailure(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                     DecodeMessageError::MessageTooLong { .. } => {
-                                        SendImapCommandError::MessageTooLong(bytes)
+                                        SendImapCommandError::MessageTooLong(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                     DecodeMessageError::MessagePoisoned { .. } => {
-                                        SendImapCommandError::MessageIsPoisoned(bytes)
+                                        SendImapCommandError::MessageIsPoisoned(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                 };
                                 return SendImapCommandResult::Err(err);
