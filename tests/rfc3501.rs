@@ -259,3 +259,56 @@ fn list_decodes_mailbox_from_modified_utf7() {
         other => panic!("expected Mailbox::Other, got {other:?}"),
     }
 }
+
+/// SELECT should skip undecodable untagged lines instead of failing (pimalaya/himalaya#641).
+#[test]
+fn select_skips_undecodable_untagged_lines() {
+    use io_imap::rfc3501::select::*;
+
+    // SELECT response captured from imap.gmail.com in pimalaya/himalaya#641.
+    let response: &[u8] = b"* FLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen $Forwarded $Junk $NotJunk JunkRecorded OIB-Seen-INBOX OIB-Seen-OIB/Real Estate OIB-Seen-OIB/Social Networking OIB-Seen-[Gmail]/All Mail OIB-Seen-[Gmail]/Trash)\r\n\
+* OK [PERMANENTFLAGS ()] Flags permitted.\r\n\
+* 4 EXISTS\r\n\
+* 0 RECENT\r\n\
+* OK [UIDVALIDITY 654409861] UIDs valid.\r\n\
+* OK [UIDNEXT 5] Predicted next UID.\r\n\
+A001 OK [READ-WRITE] INBOX selected. (Success)\r\n";
+
+    let mut fragmentizer = new_fragmentizer();
+    let mut coroutine = ImapMailboxSelect::new(
+        "INBOX".try_into().unwrap(),
+        ImapMailboxSelectOptions::default(),
+    );
+    let mut arg: Option<&[u8]> = None;
+    let mut fed = false;
+
+    let result = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                if fed {
+                    arg = Some(b"");
+                } else {
+                    arg = Some(response);
+                    fed = true;
+                }
+            }
+            any => break any,
+        }
+    };
+
+    match result {
+        ImapCoroutineState::Complete(Ok(data)) => {
+            // The undecodable FLAGS line is dropped, the rest is still parsed.
+            assert_eq!(data.flags, None);
+            assert_eq!(data.exists, Some(4));
+            assert_eq!(data.recent, Some(0));
+            assert_eq!(data.uid_validity.map(|n| n.get()), Some(654409861));
+            assert_eq!(data.uid_next.map(|n| n.get()), Some(5));
+        }
+        other => panic!(
+            "SELECT must survive undecodable untagged lines, got {:?}",
+            std::any::type_name_of_val(&other)
+        ),
+    }
+}

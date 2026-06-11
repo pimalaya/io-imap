@@ -18,7 +18,7 @@ use imap_codec::{
         utils::escape_byte_string,
     },
 };
-use log::trace;
+use log::{trace, warn};
 use thiserror::Error;
 
 use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
@@ -185,17 +185,30 @@ impl<T: Encoder> SendImapCommand<T> {
                             }
                             Err(decode_err) => {
                                 let bytes = fragmentizer.message_bytes();
-                                let bytes = Secret::new(bytes.into());
                                 let err = match decode_err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
-                                        SendImapCommandError::DecodingFailure(bytes)
+                                        // Don't fail the whole command when an untagged response cannot be decoded: skip it with a warning (pimalaya/himalaya#641).
+                                        if bytes.starts_with(b"* ") {
+                                            warn!(
+                                                "skipping undecodable untagged response: {}",
+                                                escape_byte_string(bytes)
+                                            );
+                                            continue;
+                                        }
+                                        SendImapCommandError::DecodingFailure(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                     DecodeMessageError::MessageTooLong { .. } => {
-                                        SendImapCommandError::MessageTooLong(bytes)
+                                        SendImapCommandError::MessageTooLong(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                     DecodeMessageError::MessagePoisoned { .. } => {
-                                        SendImapCommandError::MessageIsPoisoned(bytes)
+                                        SendImapCommandError::MessageIsPoisoned(Secret::new(
+                                            bytes.into(),
+                                        ))
                                     }
                                 };
                                 return SendImapCommandResult::Err(err);
