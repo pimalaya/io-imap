@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added IMAP SORT with a client-side fallback via `ImapMessageSortWithFallback` and `ImapClientStd::sort_with_fallback`.
+
+  Composite coroutine gated on a `fallback: bool` flag (fed by the consumer from a SORT capability check, or by choice). With `fallback == false` it drives a plain server SORT; with `fallback == true` it SEARCHes the candidates, FETCHes the sort keys (chunked at 255), and sorts locally, returning the same `Vec<NonZeroU32>` either way. The local sort ports himalaya 1.2.0's semantics: Arrival/Date/Size/Subject are honoured; From/To/Cc/Display defer to the Date tie-break (imap-types `Address` has no `Ord`).
+
 - Added streaming IMAP FETCH body via `ImapMessageFetchStream` and `ImapClientStd::fetch_body_stream`.
 
   Fetches one message body (single sequence number or UID, `BODY.PEEK[]` only) and streams it straight into a caller `Write` sink instead of buffering it whole. The body literal bypasses the `Fragmentizer`: the coroutine feeds it the framing lines one at a time, hands the announced octets to the driver via `ImapMessageFetchStreamYield::BodyChunk` / `WantsStream`, then resumes line parsing for the tagged response. A socket short of the declared length surfaces `ImapMessageFetchStreamError::ShortBody`; a missing id completes with an empty sink.
@@ -26,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Receive-only constructor that parses a response whose request bytes were written out of band; reused by the streamed APPEND literal.
 
 ### Changed
+
+- Renamed `ImapMailboxSort` to `ImapMessageSort` (and `ImapMailboxSortOptions`/`ImapMailboxSortError` to `ImapMessageSort*`) for consistency with the sibling `ImapMessageThread`. The `ImapClientStd::sort` method name is unchanged; the error variant is now `ImapClientStdError::MessageSort`.
 
 - Changed the buffered `ImapMessageAppend` API.
 

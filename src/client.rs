@@ -170,7 +170,7 @@ pub enum ImapClientStdError {
     #[error(transparent)]
     MailboxExpunge(#[from] ImapMailboxExpungeError),
     #[error(transparent)]
-    MailboxSort(#[from] ImapMailboxSortError),
+    MessageSort(#[from] ImapMessageSortError),
 
     #[error(transparent)]
     MessageFetch(#[from] ImapMessageFetchError),
@@ -762,12 +762,25 @@ impl ImapClientStd {
         &mut self,
         sort_criteria: Vec1<SortCriterion>,
         search_criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
+        opts: ImapMessageSortOptions,
     ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        self.run(ImapMailboxSort::new(
+        self.run(ImapMessageSort::new(sort_criteria, search_criteria, opts))
+    }
+
+    /// `SORT` with a client-side fallback. With `opts.fallback == false` this
+    /// is a plain server SORT; with `opts.fallback == true` it SEARCHes,
+    /// FETCHes the sort keys, and sorts locally. Feed `fallback` from a SORT
+    /// capability check (the server SORT requires the extension).
+    pub fn sort_with_fallback(
+        &mut self,
+        sort_criteria: Vec1<SortCriterion>,
+        search_criteria: Vec1<SearchKey<'static>>,
+        opts: ImapMessageSortWithFallbackOptions,
+    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
+        self.run(ImapMessageSortWithFallback::new(
             sort_criteria,
             search_criteria,
-            ImapMailboxSortOptions { uid },
+            opts,
         ))
     }
 
