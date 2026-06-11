@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reworked the `ImapClientStd` methods to forward the coroutine options struct directly instead of unpacking individual flags. `id`, `select`, `examine`, `fetch`, `search`, `store`, `copy`, `move`, `thread`, `sort` and `sort_with_fallback` now take their respective `Imap*Options` as the last argument (e.g. `fetch(sequence_set, items, opts)`, `select(mailbox, opts)`) and pass it straight through. Each is now a one-line forward.
+
 - Renamed `ImapMailboxSort` to `ImapMessageSort` (and `ImapMailboxSortOptions`/`ImapMailboxSortError` to `ImapMessageSort*`) for consistency with the sibling `ImapMessageThread`. The `ImapClientStd::sort` method name is unchanged; the error variant is now `ImapClientStdError::MessageSort`.
 
 - Changed the buffered `ImapMessageAppend` API.

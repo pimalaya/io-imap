@@ -401,12 +401,12 @@ impl ImapClientStd {
         self.run(ImapNoop::new())
     }
 
-    /// `ID`. `None` sends `ID NIL`.
+    /// `ID`. An `opts.parameters` of `None` sends `ID NIL`.
     pub fn id(
         &mut self,
-        parameters: Option<Vec<(IString<'static>, NString<'static>)>>,
+        opts: ImapServerIdOptions,
     ) -> Result<Option<Vec<(IString<'static>, NString<'static>)>>, ImapClientStdError> {
-        self.run(ImapServerId::new(ImapServerIdOptions { parameters }))
+        self.run(ImapServerId::new(opts))
     }
 
     pub fn enable(
@@ -468,18 +468,20 @@ impl ImapClientStd {
 
     // ---- Mailbox selection -----------------------------------------------
 
-    pub fn select(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        self.run(ImapMailboxSelect::new(
-            mailbox,
-            ImapMailboxSelectOptions::default(),
-        ))
+    pub fn select(
+        &mut self,
+        mailbox: Mailbox<'static>,
+        opts: ImapMailboxSelectOptions,
+    ) -> Result<SelectData, ImapClientStdError> {
+        self.run(ImapMailboxSelect::new(mailbox, opts))
     }
 
-    pub fn examine(&mut self, mailbox: Mailbox<'static>) -> Result<SelectData, ImapClientStdError> {
-        self.run(ImapMailboxExamine::new(
-            mailbox,
-            ImapMailboxExamineOptions::default(),
-        ))
+    pub fn examine(
+        &mut self,
+        mailbox: Mailbox<'static>,
+        opts: ImapMailboxExamineOptions,
+    ) -> Result<SelectData, ImapClientStdError> {
+        self.run(ImapMailboxExamine::new(mailbox, opts))
     }
 
     /// `SELECT <mailbox> (QRESYNC ...)`. Errors with
@@ -507,10 +509,7 @@ impl ImapClientStd {
             seq_match_data: None,
         }];
 
-        self.run(ImapMailboxSelect::new(
-            mailbox,
-            ImapMailboxSelectOptions { parameters },
-        ))
+        self.select(mailbox, ImapMailboxSelectOptions { parameters })
     }
 
     pub fn close(&mut self) -> Result<(), ImapClientStdError> {
@@ -601,16 +600,9 @@ impl ImapClientStd {
         &mut self,
         sequence_set: SequenceSet,
         items: MacroOrMessageDataItemNames<'static>,
-        uid: bool,
+        opts: ImapMessageFetchOptions,
     ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        self.run(ImapMessageFetch::new(
-            sequence_set,
-            items,
-            ImapMessageFetchOptions {
-                uid,
-                ..Default::default()
-            },
-        ))
+        self.run(ImapMessageFetch::new(sequence_set, items, opts))
     }
 
     /// `FETCH <id> (BODY.PEEK[])` streaming the message body straight into
@@ -656,12 +648,9 @@ impl ImapClientStd {
     pub fn search(
         &mut self,
         criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
+        opts: ImapMessageSearchOptions,
     ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        self.run(ImapMessageSearch::new(
-            criteria,
-            ImapMessageSearchOptions { uid },
-        ))
+        self.run(ImapMessageSearch::new(criteria, opts))
     }
 
     /// `STORE` (echo variant); returns the server-reported FETCH echoes.
@@ -670,40 +659,27 @@ impl ImapClientStd {
         sequence_set: SequenceSet,
         kind: StoreType,
         flags: Vec<Flag<'static>>,
-        uid: bool,
+        opts: ImapMessageStoreOptions,
     ) -> Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapClientStdError> {
-        self.run(ImapMessageStore::new(
-            sequence_set,
-            kind,
-            flags,
-            ImapMessageStoreOptions { uid },
-        ))
+        self.run(ImapMessageStore::new(sequence_set, kind, flags, opts))
     }
 
     pub fn copy(
         &mut self,
         sequence_set: SequenceSet,
         mailbox: Mailbox<'static>,
-        uid: bool,
+        opts: ImapMessageCopyOptions,
     ) -> Result<ImapCopyUid, ImapClientStdError> {
-        self.run(ImapMessageCopy::new(
-            sequence_set,
-            mailbox,
-            ImapMessageCopyOptions { uid },
-        ))
+        self.run(ImapMessageCopy::new(sequence_set, mailbox, opts))
     }
 
     pub fn r#move(
         &mut self,
         sequence_set: SequenceSet,
         mailbox: Mailbox<'static>,
-        uid: bool,
+        opts: ImapMessageMoveOptions,
     ) -> Result<ImapCopyUid, ImapClientStdError> {
-        self.run(ImapMessageMove::new(
-            sequence_set,
-            mailbox,
-            ImapMessageMoveOptions { uid },
-        ))
+        self.run(ImapMessageMove::new(sequence_set, mailbox, opts))
     }
 
     /// `APPEND`; returns the optional EXISTS count and APPENDUID pair.
@@ -788,13 +764,9 @@ impl ImapClientStd {
         &mut self,
         algorithm: ThreadingAlgorithm<'static>,
         search_criteria: Vec1<SearchKey<'static>>,
-        uid: bool,
+        opts: ImapMessageThreadOptions,
     ) -> Result<Vec<Thread>, ImapClientStdError> {
-        self.run(ImapMessageThread::new(
-            algorithm,
-            search_criteria,
-            ImapMessageThreadOptions { uid },
-        ))
+        self.run(ImapMessageThread::new(algorithm, search_criteria, opts))
     }
 }
 
