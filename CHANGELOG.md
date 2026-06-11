@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added streaming IMAP APPEND via `ImapClientStd::append_stream` and `ImapMessageAppendYield::WantsStream`.
+- Added streaming IMAP FETCH body via `ImapMessageFetchStream` and `ImapClientStd::fetch_body_stream`.
 
-  The coroutine yields `WantsStream` at the literal boundary so the driver pumps the declared message octets straight from its own source to the socket; the body never lands in memory whole. `append_stream(mailbox, source, len, opts)` takes any `Read` source plus its exact octet count (IMAP declares it up front). A short source poisons the connection and surfaces `ImapMessageAppendError::ShortMessage`.
+  Fetches one message body (single sequence number or UID, `BODY.PEEK[]` only) and streams it straight into a caller `Write` sink instead of buffering it whole. The body literal bypasses the `Fragmentizer`: the coroutine feeds it the framing lines one at a time, hands the announced octets to the driver via `ImapMessageFetchStreamYield::BodyChunk` / `WantsStream`, then resumes line parsing for the tagged response. A socket short of the declared length surfaces `ImapMessageFetchStreamError::ShortBody`; a missing id completes with an empty sink.
+
+- Added streaming IMAP APPEND via `ImapMessageAppendStream` and `ImapClientStd::append_stream`.
+
+  Separate coroutine (own `ImapMessageAppendStreamYield`) that yields `WantsStream` at the literal boundary so the driver pumps the declared message octets straight from its own source to the socket; the body never lands in memory whole. `append_stream(mailbox, source, len, opts)` takes any `Read` source plus its exact octet count (IMAP declares it up front). A short source poisons the connection and surfaces `ImapMessageAppendStreamError::ShortMessage`.
 
 - Added the `non_sync` option on `ImapMessageAppendOptions`.
 
@@ -23,9 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Changed IMAP APPEND to keep the message body out of memory.
+- Changed the buffered `ImapMessageAppend` API.
 
-  `ImapMessageAppend::new` now takes the message octet count (`u32`) instead of a `LiteralOrLiteral8`, and returns the new `ImapMessageAppendYield` instead of the shared `ImapYield`. `ImapClientStd::append(mailbox, message, opts)` now takes the message as `&[u8]` (a buffered convenience that delegates to `append_stream`); both client methods take an `ImapMessageAppendOptions` carrying `flags` / `date` / `non_sync`.
+  `ImapMessageAppend::new(mailbox, message, opts)` now takes the message as `Vec<u8>` instead of a `LiteralOrLiteral8`; it still yields the shared `ImapYield` and is drivable by `ImapClientStd::run`. `ImapClientStd::append(mailbox, message, opts)` takes the message as `&[u8]`. Both APPEND coroutines share `ImapMessageAppendOptions` (now carrying `flags` / `date` / `non_sync`).
 
 ## [0.1.0] - 2026-06-03
 

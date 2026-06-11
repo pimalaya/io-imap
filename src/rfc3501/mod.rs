@@ -3,6 +3,7 @@
 //! <https://www.rfc-editor.org/rfc/rfc3501>
 
 pub mod append;
+pub mod append_stream;
 pub mod capability;
 pub mod check;
 pub mod close;
@@ -12,6 +13,7 @@ pub mod delete;
 pub mod examine;
 pub mod expunge;
 pub mod fetch;
+pub mod fetch_stream;
 pub mod greeting;
 pub mod list;
 pub mod login;

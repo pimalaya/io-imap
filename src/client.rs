@@ -85,10 +85,10 @@ use crate::{
     coroutine::*,
     rfc2971::id::*,
     rfc3501::{
-        append::*, capability::*, check::*, close::*, copy::*, create::*, delete::*, examine::*,
-        expunge::*, fetch::*, greeting::*, list::*, login::*, logout::*, lsub::*, noop::*,
-        rename::*, search::*, select::*, starttls::*, status::*, store::*, subscribe::*,
-        unsubscribe::*,
+        append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
+        delete::*, examine::*, expunge::*, fetch::*, fetch_stream::*, greeting::*, list::*,
+        login::*, logout::*, lsub::*, noop::*, rename::*, search::*, select::*, starttls::*,
+        status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc5161::enable::*,
@@ -175,6 +175,8 @@ pub enum ImapClientStdError {
     #[error(transparent)]
     MessageFetch(#[from] ImapMessageFetchError),
     #[error(transparent)]
+    MessageFetchStream(#[from] ImapMessageFetchStreamError),
+    #[error(transparent)]
     MessageSearch(#[from] ImapMessageSearchError),
     #[error(transparent)]
     MessageStore(#[from] ImapMessageStoreError),
@@ -184,6 +186,8 @@ pub enum ImapClientStdError {
     MessageMove(#[from] ImapMessageMoveError),
     #[error(transparent)]
     MessageAppend(#[from] ImapMessageAppendError),
+    #[error(transparent)]
+    MessageAppendStream(#[from] ImapMessageAppendStreamError),
     #[error(transparent)]
     MessageThread(#[from] ImapMessageThreadError),
 
@@ -609,6 +613,46 @@ impl ImapClientStd {
         ))
     }
 
+    /// `FETCH <id> (BODY.PEEK[])` streaming the message body straight into
+    /// `sink`; the body never lands in memory whole. Peek leaves `\Seen`
+    /// untouched. Returns once the tagged response is parsed; a missing id
+    /// completes with an empty sink.
+    pub fn fetch_body_stream(
+        &mut self,
+        id: NonZeroU32,
+        uid: bool,
+        mut sink: impl Write,
+    ) -> Result<(), ImapClientStdError> {
+        let mut coroutine = ImapMessageFetchStream::new(id, uid);
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        let mut arg: Option<&[u8]> = None;
+
+        loop {
+            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
+                ImapCoroutineState::Complete(Ok(())) => return Ok(()),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
+                    let n = self.stream.read(&mut buf)?;
+                    arg = Some(&buf[..n]);
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(bytes)) => {
+                    self.stream.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::BodyChunk(bytes)) => {
+                    sink.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
+                    let n = io::copy(&mut (&mut self.stream).take(len as u64), &mut sink)?;
+                    // An empty slice tells the coroutine the socket ran short
+                    // of the declared body length.
+                    arg = (n != len as u64).then_some(&[][..]);
+                }
+            }
+        }
+    }
+
     pub fn search(
         &mut self,
         criteria: Vec1<SearchKey<'static>>,
@@ -663,15 +707,15 @@ impl ImapClientStd {
     }
 
     /// `APPEND`; returns the optional EXISTS count and APPENDUID pair.
-    /// Buffered convenience: the whole `message` is held in memory. For large
-    /// messages prefer [`Self::append_stream`].
+    /// Buffered: the whole `message` is held in memory. For large messages
+    /// prefer [`Self::append_stream`].
     pub fn append(
         &mut self,
         mailbox: Mailbox<'static>,
         message: &[u8],
         opts: ImapMessageAppendOptions,
     ) -> Result<ImapMessageAppendOutput, ImapClientStdError> {
-        self.append_stream(mailbox, message, message.len(), opts)
+        self.run(ImapMessageAppend::new(mailbox, message.to_vec(), opts))
     }
 
     /// `APPEND` streaming `len` octets from `source` straight to the socket;
@@ -686,7 +730,7 @@ impl ImapClientStd {
         len: usize,
         opts: ImapMessageAppendOptions,
     ) -> Result<ImapMessageAppendOutput, ImapClientStdError> {
-        let mut coroutine = ImapMessageAppend::new(mailbox, len as u32, opts);
+        let mut coroutine = ImapMessageAppendStream::new(mailbox, len as u32, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
 
@@ -694,15 +738,15 @@ impl ImapClientStd {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
-                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsRead) => {
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
                     let n = self.stream.read(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
-                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsWrite(bytes)) => {
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
                     arg = None;
                 }
-                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsStream) => {
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
                     let n = io::copy(&mut source.by_ref().take(len as u64), &mut self.stream)?;
                     // An empty slice tells the coroutine the source ran
                     // short of the declared count.
