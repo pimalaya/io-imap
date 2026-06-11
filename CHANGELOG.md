@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added streaming IMAP APPEND via `ImapClientStd::append_stream` and `ImapMessageAppendYield::WantsStream`.
+
+  The coroutine yields `WantsStream` at the literal boundary so the driver pumps the declared message octets straight from its own source to the socket; the body never lands in memory whole. `append_stream(mailbox, source, len, opts)` takes any `Read` source plus its exact octet count (IMAP declares it up front). A short source poisons the connection and surfaces `ImapMessageAppendError::ShortMessage`.
+
+- Added the `non_sync` option on `ImapMessageAppendOptions`.
+
+  Sends a non-synchronising literal (`{N+}`) and streams the body without waiting for the server continuation (requires LITERAL+ / LITERAL-). Defaults to a synchronising `{N}` literal so the server can still reject before the body is sent.
+
+- Added `SendImapCommand::receive`.
+
+  Receive-only constructor that parses a response whose request bytes were written out of band; reused by the streamed APPEND literal.
+
+### Changed
+
+- Changed IMAP APPEND to keep the message body out of memory.
+
+  `ImapMessageAppend::new` now takes the message octet count (`u32`) instead of a `LiteralOrLiteral8`, and returns the new `ImapMessageAppendYield` instead of the shared `ImapYield`. `ImapClientStd::append(mailbox, message, opts)` now takes the message as `&[u8]` (a buffered convenience that delegates to `append_stream`); both client methods take an `ImapMessageAppendOptions` carrying `flags` / `date` / `non_sync`.
+
 ## [0.1.0] - 2026-06-03
 
 ### Added

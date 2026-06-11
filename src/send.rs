@@ -96,6 +96,27 @@ impl<T: Encoder> SendImapCommand<T> {
         }
     }
 
+    /// Receive-only: skips serialisation and parses the response of a request
+    /// whose bytes were written out of band (e.g. a streamed APPEND
+    /// literal). `message` is echoed back unchanged in the Ok variant.
+    pub fn receive(message: T::Message<'static>) -> Self {
+        Self {
+            message: Some(message),
+            codec: ResponseCodec::new(),
+            state: State::Read,
+            wants_read: false,
+            wants_write: None,
+            fragments: VecDeque::new(),
+            data: Vec::new(),
+            untagged: Vec::new(),
+            tagged: None,
+            bye: None,
+            cr: None,
+            limbo_literal: None,
+            done: false,
+        }
+    }
+
     /// Pass `None` initially or after `WantsWrite`, `Some(bytes)`
     /// after `WantsRead`, `Some(&[])` on EOF.
     pub fn resume(
@@ -188,29 +209,29 @@ impl<T: Encoder> SendImapCommand<T> {
                                 let err = match decode_err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
-                                        // Don't fail the whole command when an untagged response cannot be decoded: skip it with a warning (pimalaya/himalaya#641).
+                                        // Don't fail the whole command when an
+                                        // untagged response cannot be decoded:
+                                        // skip it with a warning
+                                        // (pimalaya/himalaya#641).
                                         if bytes.starts_with(b"* ") {
-                                            warn!(
-                                                "skipping undecodable untagged response: {}",
-                                                escape_byte_string(bytes)
-                                            );
+                                            let b = escape_byte_string(bytes);
+                                            warn!("skipping undecodable untagged response: {b}");
                                             continue;
                                         }
-                                        SendImapCommandError::DecodingFailure(Secret::new(
-                                            bytes.into(),
-                                        ))
+
+                                        let err = Secret::new(bytes.into());
+                                        SendImapCommandError::DecodingFailure(err)
                                     }
                                     DecodeMessageError::MessageTooLong { .. } => {
-                                        SendImapCommandError::MessageTooLong(Secret::new(
-                                            bytes.into(),
-                                        ))
+                                        let err = Secret::new(bytes.into());
+                                        SendImapCommandError::MessageTooLong(err)
                                     }
                                     DecodeMessageError::MessagePoisoned { .. } => {
-                                        SendImapCommandError::MessageIsPoisoned(Secret::new(
-                                            bytes.into(),
-                                        ))
+                                        let err = Secret::new(bytes.into());
+                                        SendImapCommandError::MessageIsPoisoned(err)
                                     }
                                 };
+
                                 return SendImapCommandResult::Err(err);
                             }
                         }

@@ -76,7 +76,7 @@ I/O IMAP can be consumed at three layers, depending on how much of the I/O stack
 
 Every coroutine implements the `ImapCoroutine` trait (`crate::coroutine`). `resume(&mut Fragmentizer, Option<&[u8]>)` returns `ImapCoroutineState<Yield, Return>`:
 
-- `Yielded(y)`: intermediate progress. The standard `ImapYield` is `WantsRead` (caller reads more bytes and feeds them back; pass `Some(&[])` on EOF) or `WantsWrite(Vec<u8>)` (caller writes these bytes; next resume usually takes `None`). Coroutines that surface domain events (`ImapIdle`, `ImapMailboxWatch`) declare their own `Yield` enum with an extra `Event(...)` variant.
+- `Yielded(y)`: intermediate progress. The standard `ImapYield` is `WantsRead` (caller reads more bytes and feeds them back; pass `Some(&[])` on EOF) or `WantsWrite(Vec<u8>)` (caller writes these bytes; next resume usually takes `None`). Coroutines that need extra variants declare their own `Yield` enum: `ImapIdle` and `ImapMailboxWatch` add `Event(...)`, `ImapMessageAppend` adds `WantsStream` (caller pumps the declared message octets straight to the socket; resume with `None` once done, `Some(&[])` if the source ran short).
 - `Complete(result)`: terminal payload, `Result<Output, Error>`.
 
 The three snippets below all connect to a server (`HOST` / `PORT` env vars; `URL` for the full client), read the greeting, and print the CAPABILITY list. They are the verbatim sources of `cargo run --example <name>`.

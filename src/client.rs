@@ -40,9 +40,7 @@ use imap_codec::{
     imap_types::{
         command::SelectParameter,
         core::{IString, NString, Vec1},
-        datetime::DateTime,
         extensions::{
-            binary::LiteralOrLiteral8,
             enable::CapabilityEnable,
             sort::SortCriterion,
             thread::{Thread, ThreadingAlgorithm},
@@ -665,18 +663,53 @@ impl ImapClientStd {
     }
 
     /// `APPEND`; returns the optional EXISTS count and APPENDUID pair.
+    /// Buffered convenience: the whole `message` is held in memory. For large
+    /// messages prefer [`Self::append_stream`].
     pub fn append(
         &mut self,
         mailbox: Mailbox<'static>,
-        flags: Vec<Flag<'static>>,
-        date: Option<DateTime>,
-        message: LiteralOrLiteral8<'static>,
-    ) -> Result<ImapAppendOutput, ImapClientStdError> {
-        self.run(ImapMessageAppend::new(
-            mailbox,
-            message,
-            ImapMessageAppendOptions { flags, date },
-        ))
+        message: &[u8],
+        opts: ImapMessageAppendOptions,
+    ) -> Result<ImapMessageAppendOutput, ImapClientStdError> {
+        self.append_stream(mailbox, message, message.len(), opts)
+    }
+
+    /// `APPEND` streaming `len` octets from `source` straight to the socket;
+    /// the body never lands in memory whole. `len` must match the source
+    /// exactly: IMAP declares the octet count up front, so a shorter source
+    /// poisons the connection. Synchronising by default so the server can
+    /// reject before the body is sent; set `opts.non_sync` to skip the wait.
+    pub fn append_stream(
+        &mut self,
+        mailbox: Mailbox<'static>,
+        mut source: impl Read,
+        len: usize,
+        opts: ImapMessageAppendOptions,
+    ) -> Result<ImapMessageAppendOutput, ImapClientStdError> {
+        let mut coroutine = ImapMessageAppend::new(mailbox, len as u32, opts);
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        let mut arg: Option<&[u8]> = None;
+
+        loop {
+            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
+                ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsRead) => {
+                    let n = self.stream.read(&mut buf)?;
+                    arg = Some(&buf[..n]);
+                }
+                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsWrite(bytes)) => {
+                    self.stream.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageAppendYield::WantsStream) => {
+                    let n = io::copy(&mut source.by_ref().take(len as u64), &mut self.stream)?;
+                    // An empty slice tells the coroutine the source ran
+                    // short of the declared count.
+                    arg = (n != len as u64).then_some(&[][..]);
+                }
+            }
+        }
     }
 
     // ---- RFC 5256: SORT / THREAD ------------------------------------------
