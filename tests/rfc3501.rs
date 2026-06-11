@@ -260,22 +260,12 @@ fn list_decodes_mailbox_from_modified_utf7() {
     }
 }
 
-/// Regression test for pimalaya/himalaya#641: Gmail persists keyword
-/// flags created by third-party apps (OtherInbox) that are invalid
-/// per RFC 3501 — `OIB-Seen-[Gmail]/All Mail` contains `]`, which is
-/// a `resp-specials` and therefore not an ATOM-CHAR. The untagged
-/// `* FLAGS` line of the SELECT response then fails to decode, and
-/// the whole SELECT used to abort with a decoding failure. Such
-/// lines must be skipped (with a warning) instead: every field of
-/// [`SelectData`] is optional, so a missing FLAGS line is harmless,
-/// while the poisoned flags cannot even be removed server-side via
-/// IMAP STORE.
+/// SELECT should skip undecodable untagged lines instead of failing (pimalaya/himalaya#641).
 #[test]
 fn select_skips_undecodable_untagged_lines() {
     use io_imap::rfc3501::select::*;
 
-    // Trimmed-down version of the SELECT response captured from
-    // imap.gmail.com in pimalaya/himalaya#641.
+    // SELECT response captured from imap.gmail.com in pimalaya/himalaya#641.
     let response: &[u8] = b"* FLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen $Forwarded $Junk $NotJunk JunkRecorded OIB-Seen-INBOX OIB-Seen-OIB/Real Estate OIB-Seen-OIB/Social Networking OIB-Seen-[Gmail]/All Mail OIB-Seen-[Gmail]/Trash)\r\n\
 * OK [PERMANENTFLAGS ()] Flags permitted.\r\n\
 * 4 EXISTS\r\n\
@@ -309,8 +299,7 @@ A001 OK [READ-WRITE] INBOX selected. (Success)\r\n";
 
     match result {
         ImapCoroutineState::Complete(Ok(data)) => {
-            // The undecodable `* FLAGS` line is dropped; the rest of
-            // the SELECT response must still be fully parsed.
+            // The undecodable FLAGS line is dropped, the rest is still parsed.
             assert_eq!(data.flags, None);
             assert_eq!(data.exists, Some(4));
             assert_eq!(data.recent, Some(0));

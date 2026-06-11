@@ -188,15 +188,7 @@ impl<T: Encoder> SendImapCommand<T> {
                                 let err = match decode_err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
-                                        // Some servers emit untagged lines that are
-                                        // invalid per RFC 3501 and cannot be fixed
-                                        // server-side, e.g. Gmail persisting keyword
-                                        // flags containing `]` in the SELECT FLAGS
-                                        // response (pimalaya/himalaya#641). Dropping
-                                        // such a line only loses optional data, while
-                                        // failing aborts the whole command, so skip it
-                                        // with a warning. Tagged responses still fail:
-                                        // they carry the command outcome.
+                                        // Don't fail the whole command when an untagged response cannot be decoded: skip it with a warning (pimalaya/himalaya#641).
                                         if bytes.starts_with(b"* ") {
                                             warn!(
                                                 "skipping undecodable untagged response: {}",
