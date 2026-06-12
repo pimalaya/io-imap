@@ -387,16 +387,19 @@ impl ImapClientStd {
         self.run(ImapAuthScramSha256::new(user, password, opts))
     }
 
+    /// `LOGOUT`; ends the session.
     pub fn logout(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapLogout::new())
     }
 
     // ---- State / introspection -------------------------------------------
 
+    /// `CAPABILITY`; returns the advertised capabilities.
     pub fn capability(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
         self.run(ImapCapabilityGet::new())
     }
 
+    /// `NOOP`; round-trips to keep the connection alive or poll for updates.
     pub fn noop(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapNoop::new())
     }
@@ -409,6 +412,7 @@ impl ImapClientStd {
         self.run(ImapServerId::new(opts))
     }
 
+    /// `ENABLE`; returns the capabilities the server confirmed enabling.
     pub fn enable(
         &mut self,
         capabilities: Vec1<CapabilityEnable<'static>>,
@@ -418,6 +422,7 @@ impl ImapClientStd {
 
     // ---- Mailbox structure -----------------------------------------------
 
+    /// `LIST`; returns the mailboxes matching `reference` and `pattern`.
     pub fn list(
         &mut self,
         reference: Mailbox<'static>,
@@ -426,6 +431,8 @@ impl ImapClientStd {
         self.run(ImapMailboxList::new(reference, pattern))
     }
 
+    /// `LSUB`; returns the subscribed mailboxes matching `reference` and
+    /// `pattern`.
     pub fn lsub(
         &mut self,
         reference: Mailbox<'static>,
@@ -434,6 +441,7 @@ impl ImapClientStd {
         self.run(ImapMailboxLsub::new(reference, pattern))
     }
 
+    /// `STATUS`; returns the requested status items for `mailbox`.
     pub fn status(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -442,14 +450,17 @@ impl ImapClientStd {
         self.run(ImapMailboxStatus::new(mailbox, item_names))
     }
 
+    /// `CREATE`; creates `mailbox`.
     pub fn create(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxCreate::new(mailbox))
     }
 
+    /// `DELETE`; deletes `mailbox`.
     pub fn delete(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxDelete::new(mailbox))
     }
 
+    /// `RENAME`; renames mailbox `from` to `to`.
     pub fn rename(
         &mut self,
         from: Mailbox<'static>,
@@ -458,16 +469,19 @@ impl ImapClientStd {
         self.run(ImapMailboxRename::new(from, to))
     }
 
+    /// `SUBSCRIBE`; subscribes to `mailbox`.
     pub fn subscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxSubscribe::new(mailbox))
     }
 
+    /// `UNSUBSCRIBE`; unsubscribes from `mailbox`.
     pub fn unsubscribe(&mut self, mailbox: Mailbox<'static>) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxUnsubscribe::new(mailbox))
     }
 
     // ---- Mailbox selection -----------------------------------------------
 
+    /// `SELECT`; opens `mailbox` for read-write and returns its state.
     pub fn select(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -476,6 +490,7 @@ impl ImapClientStd {
         self.run(ImapMailboxSelect::new(mailbox, opts))
     }
 
+    /// `EXAMINE`; opens `mailbox` read-only and returns its state.
     pub fn examine(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -512,14 +527,17 @@ impl ImapClientStd {
         self.select(mailbox, ImapMailboxSelectOptions { parameters })
     }
 
+    /// `CLOSE`; expunges deleted messages and unselects the mailbox.
     pub fn close(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxClose::new())
     }
 
+    /// `UNSELECT`; unselects the mailbox without expunging.
     pub fn unselect(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxUnselect::new())
     }
 
+    /// `CHECK`; requests a mailbox checkpoint.
     pub fn check(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapMailboxCheck::new())
     }
@@ -596,6 +614,7 @@ impl ImapClientStd {
 
     // ---- Messages --------------------------------------------------------
 
+    /// `FETCH`; returns the requested items keyed by message id.
     pub fn fetch(
         &mut self,
         sequence_set: SequenceSet,
@@ -647,6 +666,7 @@ impl ImapClientStd {
         }
     }
 
+    /// `SEARCH`; returns the ids matching `criteria`.
     pub fn search(
         &mut self,
         criteria: Vec1<SearchKey<'static>>,
@@ -666,6 +686,8 @@ impl ImapClientStd {
         self.run(ImapMessageStore::new(sequence_set, kind, flags, opts))
     }
 
+    /// `COPY`; copies messages to `mailbox` and returns the optional COPYUID
+    /// pair.
     pub fn copy(
         &mut self,
         sequence_set: SequenceSet,
@@ -675,6 +697,8 @@ impl ImapClientStd {
         self.run(ImapMessageCopy::new(sequence_set, mailbox, opts))
     }
 
+    /// `MOVE`; moves messages to `mailbox` and returns the optional COPYUID
+    /// pair.
     pub fn r#move(
         &mut self,
         sequence_set: SequenceSet,
@@ -751,6 +775,7 @@ impl ImapClientStd {
         self.run(ImapMessageSort::new(sort_criteria, search_criteria, opts))
     }
 
+    /// `THREAD`; returns the message threads matching `search_criteria`.
     pub fn thread(
         &mut self,
         algorithm: ThreadingAlgorithm<'static>,
