@@ -1,7 +1,7 @@
-//! IMAP SORT coroutines: the pure RFC 5256 command ([`ImapMessageSort`]) and
-//! a capability-aware variant ([`ImapMessageSortWithFallback`]) that falls
-//! back to SEARCH + FETCH + a local sort when the server does not advertise
-//! the SORT extension.
+//! IMAP SORT coroutine ([`ImapMessageSort`]): runs the RFC 5256 SORT command,
+//! or, when the server lacks the SORT extension (or the caller opts out via
+//! `fallback`), falls back to SEARCH + FETCH + a local sort. Both paths return
+//! the same `Vec<NonZeroU32>`.
 //!
 //! # Example
 //!
@@ -112,109 +112,6 @@ pub enum ImapMessageSortError {
 /// Options for [`ImapMessageSort::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageSortOptions {
-    /// When `true`, send `UID SORT`; returned ids are UIDs.
-    pub uid: bool,
-}
-
-/// I/O-free IMAP SORT coroutine.
-pub struct ImapMessageSort {
-    state: State,
-}
-
-impl ImapMessageSort {
-    pub fn new(
-        sort_criteria: Vec1<SortCriterion>,
-        search_criteria: Vec1<SearchKey<'static>>,
-        opts: ImapMessageSortOptions,
-    ) -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Sort {
-                sort_criteria,
-                charset: Charset::try_from("UTF-8").expect("UTF-8 is a valid charset"),
-                search_criteria,
-                uid: opts.uid,
-            },
-        };
-
-        trace!("send IMAP command {command:?}");
-
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
-
-        Self { state }
-    }
-}
-
-impl ImapCoroutine for ImapMessageSort {
-    type Yield = ImapYield;
-    type Return = Result<Vec<NonZeroU32>, ImapMessageSortError>;
-
-    fn resume(
-        &mut self,
-        fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
-    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("sort: {}", self.state);
-
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageSortError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageSortError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut ids = None;
-                    for data in out.data {
-                        if let Data::Sort(sort_ids, _) = data {
-                            ids = Some(sort_ids);
-                        }
-                    }
-
-                    return match body.kind {
-                        StatusKind::Ok => match ids {
-                            Some(ids) => ImapCoroutineState::Complete(Ok(ids)),
-                            None => {
-                                ImapCoroutineState::Complete(Err(ImapMessageSortError::MissingData))
-                            }
-                        },
-                        StatusKind::No => {
-                            let err = ImapMessageSortError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageSortError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
-                }
-            }
-        }
-    }
-}
-
-enum State {
-    Send(SendImapCommand<CommandCodec>),
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Send(_) => f.write_str("send sort"),
-        }
-    }
-}
-
-/// Options for [`ImapMessageSortWithFallback::new`].
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImapMessageSortWithFallbackOptions {
     /// When `true`, sort UIDs; returned ids are UIDs.
     pub uid: bool,
     /// When `true`, skip the SORT command and sort client-side via SEARCH +
@@ -225,11 +122,11 @@ pub struct ImapMessageSortWithFallbackOptions {
 
 /// I/O-free IMAP SORT coroutine with a SEARCH + FETCH client-side fallback.
 ///
-/// With `fallback == false` it drives a plain [`ImapMessageSort`]. With
-/// `fallback == true` it SEARCHes the candidates, FETCHes the sort keys, and
-/// sorts locally, returning the same `Vec<NonZeroU32>` either way.
-pub struct ImapMessageSortWithFallback {
-    state: FallbackState,
+/// With `fallback == false` it sends a plain server `SORT`. With `fallback ==
+/// true` it SEARCHes the candidates, FETCHes the sort keys, and sorts locally,
+/// returning the same `Vec<NonZeroU32>` either way.
+pub struct ImapMessageSort {
+    state: State,
     uid: bool,
     sort_criteria: Vec1<SortCriterion>,
     items: Vec<MessageDataItemName<'static>>,
@@ -237,25 +134,33 @@ pub struct ImapMessageSortWithFallback {
     fetched: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>,
 }
 
-impl ImapMessageSortWithFallback {
+impl ImapMessageSort {
     pub fn new(
         sort_criteria: Vec1<SortCriterion>,
         search_criteria: Vec1<SearchKey<'static>>,
-        opts: ImapMessageSortWithFallbackOptions,
+        opts: ImapMessageSortOptions,
     ) -> Self {
         let items = fetch_items(&sort_criteria, opts.uid);
 
         let state = if opts.fallback {
+            trace!("using IMAP SORT fallback");
             let search =
                 ImapMessageSearch::new(search_criteria, ImapMessageSearchOptions { uid: opts.uid });
-            FallbackState::Search(search)
+            State::Search(search)
         } else {
-            let sort = ImapMessageSort::new(
-                sort_criteria.clone(),
-                search_criteria,
-                ImapMessageSortOptions { uid: opts.uid },
-            );
-            FallbackState::Sort(sort)
+            let command = Command {
+                tag: TagGenerator::new().generate(),
+                body: CommandBody::Sort {
+                    sort_criteria: sort_criteria.clone(),
+                    charset: Charset::try_from("UTF-8").unwrap(),
+                    search_criteria,
+                    uid: opts.uid,
+                },
+            };
+
+            trace!("prepare IMAP command to be sent: {command:?}");
+
+            State::Sort(SendImapCommand::new(CommandCodec::new(), command))
         };
 
         Self {
@@ -330,7 +235,7 @@ impl ImapMessageSortWithFallback {
     }
 }
 
-impl ImapCoroutine for ImapMessageSortWithFallback {
+impl ImapCoroutine for ImapMessageSort {
     type Yield = ImapYield;
     type Return = Result<Vec<NonZeroU32>, ImapMessageSortError>;
 
@@ -340,28 +245,62 @@ impl ImapCoroutine for ImapMessageSortWithFallback {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("sort with fallback: {}", self.state);
+            trace!("{}", self.state);
 
             match &mut self.state {
-                FallbackState::Sort(sort) => {
-                    let ids = imap_try!(sort, fragmentizer, arg);
-                    return ImapCoroutineState::Complete(Ok(ids));
+                State::Sort(send) => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapMessageSortError::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    let Some(Tagged { body, .. }) = out.tagged else {
+                        let err = ImapMessageSortError::MissingTagged;
+                        return ImapCoroutineState::Complete(Err(err));
+                    };
+
+                    let mut ids = None;
+
+                    for data in out.data {
+                        if let Data::Sort(sort_ids, _) = data {
+                            ids = Some(sort_ids);
+                        }
+                    }
+
+                    return match body.kind {
+                        StatusKind::Ok => match ids {
+                            Some(ids) => ImapCoroutineState::Complete(Ok(ids)),
+                            None => {
+                                ImapCoroutineState::Complete(Err(ImapMessageSortError::MissingData))
+                            }
+                        },
+                        StatusKind::No => {
+                            let err = ImapMessageSortError::No(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                        StatusKind::Bad => {
+                            let err = ImapMessageSortError::Bad(body.text.to_string());
+                            ImapCoroutineState::Complete(Err(err))
+                        }
+                    };
                 }
-                FallbackState::Search(search) => {
+                State::Search(search) => {
                     self.remaining = imap_try!(search, fragmentizer, arg);
 
                     match self.next_fetch() {
-                        Ok(Some(fetch)) => self.state = FallbackState::Fetch(fetch),
+                        Ok(Some(fetch)) => self.state = State::Fetch(fetch),
                         Ok(None) => return ImapCoroutineState::Complete(Ok(Vec::new())),
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
                 }
-                FallbackState::Fetch(fetch) => {
+                State::Fetch(fetch) => {
                     let map = imap_try!(fetch, fragmentizer, arg);
                     self.fetched.extend(map);
 
                     match self.next_fetch() {
-                        Ok(Some(fetch)) => self.state = FallbackState::Fetch(fetch),
+                        Ok(Some(fetch)) => self.state = State::Fetch(fetch),
                         Ok(None) => return ImapCoroutineState::Complete(Ok(self.local_sort())),
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
@@ -371,10 +310,25 @@ impl ImapCoroutine for ImapMessageSortWithFallback {
     }
 }
 
-/// The FETCH items needed to sort by `sort_criteria` locally. Display keys
-/// have no comparable data and are skipped; UID is added in UID mode to
-/// recover the sorted ids; an Envelope is always present so the Date
-/// tie-break works.
+enum State {
+    Sort(SendImapCommand<CommandCodec>),
+    Search(ImapMessageSearch),
+    Fetch(ImapMessageFetch),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sort(_) => f.write_str("send sort command"),
+            Self::Search(_) => f.write_str("search for candidates"),
+            Self::Fetch(_) => f.write_str("fetch sort keys"),
+        }
+    }
+}
+
+/// The FETCH items needed to sort by `sort_criteria` locally. Display keys have
+/// no comparable data and are skipped; UID is added in UID mode to recover the
+/// sorted ids; an Envelope is always present so the Date tie-break works.
 fn fetch_items(
     sort_criteria: &Vec1<SortCriterion>,
     uid: bool,
@@ -409,9 +363,9 @@ fn fetch_items(
     items
 }
 
-/// Compares two fetched messages by a single sort key. From/To/Cc/Display
-/// fall through to `Equal`: imap-types `Address` has no `Ord`, so (matching
-/// himalaya 1.2.0) those keys are a no-op and defer to the Date tie-break.
+/// Compares two fetched messages by a single sort key. From/To/Cc/Display fall
+/// through to `Equal`: imap-types `Address` has no `Ord`, so (matching himalaya
+/// 1.2.0) those keys are a no-op and defer to the Date tie-break.
 fn cmp_fetch_items(
     key: &SortKey,
     a: &Vec1<MessageDataItem<'static>>,
@@ -472,22 +426,6 @@ fn cmp_fetch_items(
     }
 }
 
-enum FallbackState {
-    Sort(ImapMessageSort),
-    Search(ImapMessageSearch),
-    Fetch(ImapMessageFetch),
-}
-
-impl fmt::Display for FallbackState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sort(_) => f.write_str("delegate to sort"),
-            Self::Search(_) => f.write_str("search candidates"),
-            Self::Fetch(_) => f.write_str("fetch sort keys"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use core::str;
@@ -514,7 +452,7 @@ mod tests {
             .expect("first whitespace-separated token")
     }
 
-    // --- pure SORT ---
+    // --- server SORT ---
 
     #[test]
     fn sort_success_returns_ids() {
@@ -522,87 +460,6 @@ mod tests {
             arrival(),
             search_criteria(),
             ImapMessageSortOptions::default(),
-        );
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
-
-        let bytes = sort_wants_write(&mut sort, &mut frag, None);
-        let line = str::from_utf8(&bytes).expect("utf8 command");
-        let tag = first_word(line).to_owned();
-        assert!(line.contains("SORT "));
-
-        sort_wants_read(&mut sort, &mut frag);
-
-        let reply = format!("* SORT 3 1 2\r\n{tag} OK SORT completed\r\n");
-        let ids = sort_complete_ok(&mut sort, &mut frag, reply.as_bytes());
-        assert_eq!(3, ids.len());
-    }
-
-    #[test]
-    fn sort_uid_variant_sends_uid_sort() {
-        let mut sort = ImapMessageSort::new(
-            arrival(),
-            search_criteria(),
-            ImapMessageSortOptions { uid: true },
-        );
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
-
-        let bytes = sort_wants_write(&mut sort, &mut frag, None);
-        let line = str::from_utf8(&bytes).expect("utf8 command");
-        assert!(line.contains("UID SORT "));
-    }
-
-    #[test]
-    fn sort_missing_data_returns_missing_data_error() {
-        let mut sort = ImapMessageSort::new(
-            arrival(),
-            search_criteria(),
-            ImapMessageSortOptions::default(),
-        );
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
-
-        let bytes = sort_wants_write(&mut sort, &mut frag, None);
-        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
-
-        sort_wants_read(&mut sort, &mut frag);
-
-        let reply = format!("{tag} OK SORT completed\r\n");
-        let err = sort_complete_err(&mut sort, &mut frag, reply.as_bytes());
-        assert!(matches!(err, ImapMessageSortError::MissingData));
-    }
-
-    #[test]
-    fn sort_tagged_no_returns_no_error() {
-        let mut sort = ImapMessageSort::new(
-            arrival(),
-            search_criteria(),
-            ImapMessageSortOptions::default(),
-        );
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
-
-        let bytes = sort_wants_write(&mut sort, &mut frag, None);
-        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
-
-        sort_wants_read(&mut sort, &mut frag);
-
-        let reply = format!("{tag} NO no mailbox selected\r\n");
-        let err = sort_complete_err(&mut sort, &mut frag, reply.as_bytes());
-        let ImapMessageSortError::No(text) = err else {
-            panic!("expected ImapMessageSortError::No, got {err:?}");
-        };
-        assert_eq!(text, "no mailbox selected");
-    }
-
-    // --- SORT with fallback ---
-
-    #[test]
-    fn fallback_disabled_delegates_to_sort() {
-        let mut sort = ImapMessageSortWithFallback::new(
-            arrival(),
-            search_criteria(),
-            ImapMessageSortWithFallbackOptions {
-                uid: false,
-                fallback: false,
-            },
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
@@ -624,11 +481,71 @@ mod tests {
     }
 
     #[test]
-    fn fallback_searches_then_fetches_then_sorts() {
-        let mut sort = ImapMessageSortWithFallback::new(
+    fn sort_uid_variant_sends_uid_sort() {
+        let mut sort = ImapMessageSort::new(
             arrival(),
             search_criteria(),
-            ImapMessageSortWithFallbackOptions {
+            ImapMessageSortOptions {
+                uid: true,
+                ..Default::default()
+            },
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = wants_write(&mut sort, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        assert!(line.contains("UID SORT "));
+    }
+
+    #[test]
+    fn sort_missing_data_returns_missing_data_error() {
+        let mut sort = ImapMessageSort::new(
+            arrival(),
+            search_criteria(),
+            ImapMessageSortOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = wants_write(&mut sort, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        wants_read(&mut sort, &mut frag, None);
+
+        let reply = format!("{tag} OK SORT completed\r\n");
+        let err = complete_err(&mut sort, &mut frag, reply.as_bytes());
+        assert!(matches!(err, ImapMessageSortError::MissingData));
+    }
+
+    #[test]
+    fn sort_tagged_no_returns_no_error() {
+        let mut sort = ImapMessageSort::new(
+            arrival(),
+            search_criteria(),
+            ImapMessageSortOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = wants_write(&mut sort, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        wants_read(&mut sort, &mut frag, None);
+
+        let reply = format!("{tag} NO no mailbox selected\r\n");
+        let err = complete_err(&mut sort, &mut frag, reply.as_bytes());
+        let ImapMessageSortError::No(text) = err else {
+            panic!("expected ImapMessageSortError::No, got {err:?}");
+        };
+        assert_eq!(text, "no mailbox selected");
+    }
+
+    // --- SEARCH + FETCH fallback ---
+
+    #[test]
+    fn fallback_searches_then_fetches_then_sorts() {
+        let mut sort = ImapMessageSort::new(
+            arrival(),
+            search_criteria(),
+            ImapMessageSortOptions {
                 uid: true,
                 fallback: true,
             },
@@ -672,10 +589,10 @@ mod tests {
             key: SortKey::Arrival,
         }])
         .expect("one criterion");
-        let mut sort = ImapMessageSortWithFallback::new(
+        let mut sort = ImapMessageSort::new(
             criteria,
             search_criteria(),
-            ImapMessageSortWithFallbackOptions {
+            ImapMessageSortOptions {
                 uid: true,
                 fallback: true,
             },
@@ -702,10 +619,10 @@ mod tests {
 
     #[test]
     fn fallback_empty_search_returns_empty_without_fetch() {
-        let mut sort = ImapMessageSortWithFallback::new(
+        let mut sort = ImapMessageSort::new(
             arrival(),
             search_criteria(),
-            ImapMessageSortWithFallbackOptions {
+            ImapMessageSortOptions {
                 uid: true,
                 fallback: true,
             },
@@ -727,48 +644,8 @@ mod tests {
         NonZeroU32::new(n).expect("non-zero")
     }
 
-    fn sort_wants_write(
-        cor: &mut ImapMessageSort,
-        frag: &mut Fragmentizer,
-        arg: Option<&[u8]>,
-    ) -> Vec<u8> {
-        match cor.resume(frag, arg) {
-            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
-            state => panic!("expected WantsWrite, got {state:?}"),
-        }
-    }
-
-    fn sort_wants_read(cor: &mut ImapMessageSort, frag: &mut Fragmentizer) {
-        match cor.resume(frag, None) {
-            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
-            state => panic!("expected WantsRead, got {state:?}"),
-        }
-    }
-
-    fn sort_complete_ok(
-        cor: &mut ImapMessageSort,
-        frag: &mut Fragmentizer,
-        reply: &[u8],
-    ) -> Vec<NonZeroU32> {
-        match cor.resume(frag, Some(reply)) {
-            ImapCoroutineState::Complete(Ok(value)) => value,
-            state => panic!("expected Complete(Ok), got {state:?}"),
-        }
-    }
-
-    fn sort_complete_err(
-        cor: &mut ImapMessageSort,
-        frag: &mut Fragmentizer,
-        reply: &[u8],
-    ) -> ImapMessageSortError {
-        match cor.resume(frag, Some(reply)) {
-            ImapCoroutineState::Complete(Err(err)) => err,
-            state => panic!("expected Complete(Err), got {state:?}"),
-        }
-    }
-
     fn wants_write(
-        cor: &mut ImapMessageSortWithFallback,
+        cor: &mut ImapMessageSort,
         frag: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> Vec<u8> {
@@ -778,11 +655,7 @@ mod tests {
         }
     }
 
-    fn wants_read(
-        cor: &mut ImapMessageSortWithFallback,
-        frag: &mut Fragmentizer,
-        arg: Option<&[u8]>,
-    ) {
+    fn wants_read(cor: &mut ImapMessageSort, frag: &mut Fragmentizer, arg: Option<&[u8]>) {
         match cor.resume(frag, arg) {
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
             state => panic!("expected WantsRead, got {state:?}"),
@@ -790,13 +663,24 @@ mod tests {
     }
 
     fn complete_ok(
-        cor: &mut ImapMessageSortWithFallback,
+        cor: &mut ImapMessageSort,
         frag: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> Vec<NonZeroU32> {
         match cor.resume(frag, arg) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    fn complete_err(
+        cor: &mut ImapMessageSort,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMessageSortError {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(err)) => err,
+            state => panic!("expected Complete(Err), got {state:?}"),
         }
     }
 }

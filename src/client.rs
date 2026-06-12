@@ -636,10 +636,12 @@ impl ImapClientStd {
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
-                    let n = io::copy(&mut (&mut self.stream).take(len as u64), &mut sink)?;
+                    let len = len as u64;
+                    let mut stream = (&mut self.stream).take(len);
+                    let n = io::copy(&mut stream, &mut sink)?;
                     // An empty slice tells the coroutine the socket ran short
                     // of the declared body length.
-                    arg = (n != len as u64).then_some(&[][..]);
+                    arg = (n != len).then_some(&[]);
                 }
             }
         }
@@ -723,10 +725,12 @@ impl ImapClientStd {
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
-                    let n = io::copy(&mut source.by_ref().take(len as u64), &mut self.stream)?;
-                    // An empty slice tells the coroutine the source ran
-                    // short of the declared count.
-                    arg = (n != len as u64).then_some(&[][..]);
+                    let len = len as u64;
+                    let mut sink = source.by_ref().take(len);
+                    let n = io::copy(&mut sink, &mut self.stream)?;
+                    // An empty slice tells the coroutine the source ran short
+                    // of the declared count.
+                    arg = (n != len).then_some(&[]);
                 }
             }
         }
@@ -734,6 +738,10 @@ impl ImapClientStd {
 
     // ---- RFC 5256: SORT / THREAD ------------------------------------------
 
+    /// `SORT` with a client-side fallback. With `opts.fallback == false` this
+    /// is a plain server SORT; with `opts.fallback == true` it SEARCHes,
+    /// FETCHes the sort keys, and sorts locally. Feed `fallback` from a SORT
+    /// capability check (the server SORT requires the extension).
     pub fn sort(
         &mut self,
         sort_criteria: Vec1<SortCriterion>,
@@ -741,23 +749,6 @@ impl ImapClientStd {
         opts: ImapMessageSortOptions,
     ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
         self.run(ImapMessageSort::new(sort_criteria, search_criteria, opts))
-    }
-
-    /// `SORT` with a client-side fallback. With `opts.fallback == false` this
-    /// is a plain server SORT; with `opts.fallback == true` it SEARCHes,
-    /// FETCHes the sort keys, and sorts locally. Feed `fallback` from a SORT
-    /// capability check (the server SORT requires the extension).
-    pub fn sort_with_fallback(
-        &mut self,
-        sort_criteria: Vec1<SortCriterion>,
-        search_criteria: Vec1<SearchKey<'static>>,
-        opts: ImapMessageSortWithFallbackOptions,
-    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
-        self.run(ImapMessageSortWithFallback::new(
-            sort_criteria,
-            search_criteria,
-            opts,
-        ))
     }
 
     pub fn thread(
