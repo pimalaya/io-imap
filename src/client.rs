@@ -87,8 +87,8 @@ use crate::{
     rfc3501::{
         append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
         delete::*, examine::*, expunge::*, fetch::*, fetch_stream::*, greeting::*, list::*,
-        login::*, logout::*, lsub::*, noop::*, rename::*, search::*, select::*, starttls::*,
-        status::*, store::*, subscribe::*, unsubscribe::*,
+        login::*, logout::*, lsub::*, noop::*, raw::*, rename::*, search::*, select::*,
+        starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc5161::enable::*,
@@ -134,6 +134,8 @@ pub enum ImapClientStdError {
     Capability(#[from] ImapCapabilityGetError),
     #[error(transparent)]
     Noop(#[from] ImapNoopError),
+    #[error(transparent)]
+    Raw(#[from] ImapRawError),
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
     #[error(transparent)]
@@ -402,6 +404,13 @@ impl ImapClientStd {
     /// `NOOP`; round-trips to keep the connection alive or poll for updates.
     pub fn noop(&mut self) -> Result<(), ImapClientStdError> {
         self.run(ImapNoop::new())
+    }
+
+    /// Sends an arbitrary raw command line (no tag, no trailing CRLF) and
+    /// returns the verbatim server response up to and including the tagged
+    /// completion line. Synchronizing literals are not supported.
+    pub fn raw(&mut self, command: impl AsRef<str>) -> Result<String, ImapClientStdError> {
+        self.run(ImapRaw::new(command))
     }
 
     /// `ID`. An `opts.parameters` of `None` sends `ID NIL`.

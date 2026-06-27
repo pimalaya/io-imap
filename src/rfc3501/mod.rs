@@ -21,6 +21,7 @@ pub mod logout;
 pub mod lsub;
 pub mod mailbox;
 pub mod noop;
+pub mod raw;
 pub mod rename;
 pub mod search;
 pub mod select;
