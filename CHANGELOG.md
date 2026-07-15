@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-15
+
 ### Added
 
 - Added a client-side fallback to IMAP SORT via the `fallback` flag on `ImapMessageSortOptions`.
@@ -133,5 +135,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.1.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.2.0..HEAD
+[0.2.0]: https://github.com/pimalaya/io-imap/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-imap/compare/root..v0.1.0
