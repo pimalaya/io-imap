@@ -1,6 +1,6 @@
 //! Tests for RFC 3501: Internet Message Access Protocol (IMAP4rev1).
 //!
-//! All tests drive IMAP coroutines against pre-crafted in-memory
+//! All tests run IMAP coroutines against pre-crafted in-memory
 //! response buffers fed directly as `&[u8]`. No network connection is
 //! made.
 
@@ -105,7 +105,7 @@ fn greeting_ok() {
 
 #[test]
 fn greeting_incomplete_rejected() {
-    // No CRLF: not a complete greeting; coroutine should reach EOF
+    // NOTE: no CRLF: not a complete greeting; coroutine should reach EOF
     // on the second read attempt and surface an error.
     let response = b"* OK Dovecot ready.";
 
@@ -169,7 +169,7 @@ fn noop_ok() {
 
 #[test]
 fn create_encodes_mailbox_to_modified_utf7() {
-    // Drive CREATE with a unicode mailbox name and confirm the bytes
+    // NOTE: run CREATE with a unicode mailbox name and confirm the bytes
     // that hit the wire carry the RFC 3501 §5.1.3 modified UTF-7
     // form, not the raw unicode.
     let mailbox: Mailbox<'static> = "Notes/Брошены".to_string().try_into().unwrap();
@@ -213,7 +213,7 @@ fn create_encodes_mailbox_to_modified_utf7() {
 
 #[test]
 fn list_decodes_mailbox_from_modified_utf7() {
-    // Feed a LIST response containing modified-UTF-7 mailbox names
+    // NOTE: feed a LIST response containing modified-UTF-7 mailbox names
     // and confirm the returned Mailbox values carry the decoded
     // unicode form.
     let reference: Mailbox<'static> = "".to_string().try_into().unwrap();
@@ -260,12 +260,14 @@ fn list_decodes_mailbox_from_modified_utf7() {
     }
 }
 
-/// SELECT should skip undecodable untagged lines instead of failing (pimalaya/himalaya#641).
+/// SELECT should skip undecodable untagged lines instead of failing
+/// (pimalaya/himalaya#641).
 #[test]
 fn select_skips_undecodable_untagged_lines() {
     use io_imap::rfc3501::select::*;
 
-    // SELECT response captured from imap.gmail.com in pimalaya/himalaya#641.
+    // NOTE: SELECT response captured from imap.gmail.com in
+    // pimalaya/himalaya#641.
     let response: &[u8] = b"* FLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen $Forwarded $Junk $NotJunk JunkRecorded OIB-Seen-INBOX OIB-Seen-OIB/Real Estate OIB-Seen-OIB/Social Networking OIB-Seen-[Gmail]/All Mail OIB-Seen-[Gmail]/Trash)\r\n\
 * OK [PERMANENTFLAGS ()] Flags permitted.\r\n\
 * 4 EXISTS\r\n\
@@ -299,7 +301,8 @@ A001 OK [READ-WRITE] INBOX selected. (Success)\r\n";
 
     match result {
         ImapCoroutineState::Complete(Ok(data)) => {
-            // The undecodable FLAGS line is dropped, the rest is still parsed.
+            // NOTE: the undecodable FLAGS line is dropped, the rest
+            // is still parsed.
             assert_eq!(data.flags, None);
             assert_eq!(data.exists, Some(4));
             assert_eq!(data.recent, Some(0));

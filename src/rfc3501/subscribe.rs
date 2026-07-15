@@ -14,7 +14,7 @@
 //!     rfc3501::subscribe::ImapMailboxSubscribe,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -61,18 +61,21 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 /// Failure causes during the IMAP SUBSCRIBE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxSubscribeError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP SUBSCRIBE failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP SUBSCRIBE failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP SUBSCRIBE failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP SUBSCRIBE failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP SUBSCRIBE failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP SUBSCRIBE coroutine.
@@ -81,6 +84,8 @@ pub struct ImapMailboxSubscribe {
 }
 
 impl ImapMailboxSubscribe {
+    /// Builds a SUBSCRIBE coroutine adding `mailbox` to the subscription
+    /// list.
     pub fn new(mut mailbox: Mailbox<'static>) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -91,7 +96,7 @@ impl ImapMailboxSubscribe {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -106,34 +111,30 @@ impl ImapCoroutine for ImapMailboxSubscribe {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("subscribe: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxSubscribeError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxSubscribeError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxSubscribeError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                    StatusKind::No => {
+                        let err = ImapMailboxSubscribeError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxSubscribeError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-                        StatusKind::No => {
-                            let err = ImapMailboxSubscribeError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxSubscribeError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxSubscribeError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -141,7 +142,7 @@ impl ImapCoroutine for ImapMailboxSubscribe {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -156,9 +157,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::subscribe::*;
 
     #[test]
     fn success_returns_ok() {
@@ -208,8 +209,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxSubscribe,

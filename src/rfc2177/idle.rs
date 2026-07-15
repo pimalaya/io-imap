@@ -16,14 +16,15 @@
 //!     rfc2177::idle::{ImapIdle, ImapIdleOptions, ImapIdleYield},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
 //! let shutdown = Arc::new(AtomicBool::new(false));
-//! let mut coroutine = ImapIdle::new(shutdown.clone(), ImapIdleOptions::default());
+//! let mut coroutine =
+//!     ImapIdle::new(shutdown.clone(), ImapIdleOptions::default());
 //! let mut arg = None;
 //!
 //! loop {
@@ -68,56 +69,72 @@ use imap_codec::{
         utils::escape_byte_string,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
 
-/// Refresh interval kept under the 29-minute RFC 2177 §3 cap.
+/// Default refresh interval: 29 s survives NAT middle-boxes and stays
+/// well under the 29-minute RFC 2177 §3 cap.
 #[cfg(feature = "client")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 
 /// Failure causes during the IMAP IDLE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapIdleError {
+    /// The server rejected the IDLE command with a NO response.
     #[error("IMAP IDLE failed: NO {0}")]
     No(String),
+    /// The server rejected the IDLE command with a BAD response.
     #[error("IMAP IDLE failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with a BYE response.
     #[error("IMAP IDLE failed: BYE {0}")]
     Bye(String),
-
+    /// The server sent a tagged OK before the continuation request.
     #[error("IMAP IDLE failed: server returned a tagged response before the continuation request")]
     UnexpectedTagged,
+    /// The server never sent the continuation request after IDLE.
     #[error("IMAP IDLE failed: server did not send the expected continuation request")]
     ExpectedContinuationRequest,
+    /// The server never answered DONE with a tagged response.
     #[error("IMAP IDLE failed: server did not return a tagged response to DONE")]
     MissingTagged,
+    /// The stream reached EOF while waiting for server responses.
     #[error("IMAP IDLE failed: reached unexpected EOF on stream")]
     Eof,
+    /// A server response could not be decoded.
     #[error("IMAP IDLE failed: decode response error")]
     DecodingFailure(Secret<Box<[u8]>>),
+    /// A server response was flagged as poisoned by the fragmentizer.
     #[error("IMAP IDLE failed: parse response error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
+    /// A server response exceeded the fragmentizer's maximum size.
     #[error("IMAP IDLE failed: parse response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
-
+    /// The underlying send sub-coroutine failed.
     #[error("IMAP IDLE failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Batch of unilateral untagged responses received during an IDLE.
 #[derive(Debug)]
 pub struct ImapIdleEvent {
+    /// Untagged status responses received while idling.
     pub untagged: Vec<StatusBody<'static>>,
+    /// Mailbox data updates received while idling, such as EXISTS,
+    /// EXPUNGE or FETCH.
     pub data: Vec<Data<'static>>,
 }
 
 /// Yield variants from the IDLE coroutine.
 #[derive(Debug)]
 pub enum ImapIdleYield {
+    /// The caller reads bytes from the stream and resumes with them.
     WantsRead,
+    /// The caller writes the given bytes to the stream and resumes.
     WantsWrite(Vec<u8>),
+    /// A mailbox change event to consume; the coroutine keeps running.
     Event(ImapIdleEvent),
 }
 
@@ -133,8 +150,8 @@ impl From<ImapYield> for ImapIdleYield {
 /// Options for [`ImapIdle::new`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapIdleOptions {
-    /// Refresh interval; defaults to [`IDLE_DEFAULT_TIMEOUT`]. Unused
-    /// without the `client` feature.
+    /// Refresh interval; defaults to 29 s so the connection survives
+    /// middle-boxes. Unused without the `client` feature.
     pub timeout: Option<Duration>,
 }
 
@@ -155,7 +172,11 @@ pub struct ImapIdle {
 }
 
 impl ImapIdle {
-    /// Flip `done` to `true` to wind down with a clean `DONE`.
+    /// Creates a coroutine that keeps an IDLE session open on the
+    /// selected mailbox and yields mailbox change events.
+    ///
+    /// Flip `done` to `true` to wind down with a clean DONE; `opts`
+    /// tunes the refresh interval.
     pub fn new(done: Arc<AtomicBool>, opts: ImapIdleOptions) -> Self {
         let mut tag = TagGenerator::new();
 
@@ -166,7 +187,7 @@ impl ImapIdle {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Idle(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Idle(ImapSend::new(CommandCodec::new(), command));
 
         Self {
             tag,
@@ -212,8 +233,6 @@ impl ImapCoroutine for ImapIdle {
         }
 
         loop {
-            trace!("idle: {}", self.state);
-
             if mem::take(&mut self.wants_read) {
                 return ImapCoroutineState::Yielded(ImapIdleYield::WantsRead);
             }
@@ -245,6 +264,7 @@ impl ImapCoroutine for ImapIdle {
                     }
 
                     self.state = State::Read;
+                    debug!("{}", self.state);
 
                     if !out.data.is_empty() || !out.untagged.is_empty() {
                         let event = ImapIdleEvent {
@@ -265,8 +285,9 @@ impl ImapCoroutine for ImapIdle {
                     if done || timed_out {
                         trace!("idle done: {done}");
                         trace!("idle timed out: {timed_out}");
-                        let send = SendImapCommand::new(IdleDoneCodec::new(), IdleDone);
+                        let send = ImapSend::new(IdleDoneCodec::new(), IdleDone);
                         self.state = State::Done(send);
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -368,8 +389,9 @@ impl ImapCoroutine for ImapIdle {
                                 tag: self.tag.generate(),
                                 body: CommandBody::Idle,
                             };
-                            let send = SendImapCommand::new(CommandCodec::new(), command);
+                            let send = ImapSend::new(CommandCodec::new(), command);
                             self.state = State::Idle(send);
+                            debug!("{}", self.state);
                             continue;
                         }
                         StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
@@ -387,9 +409,9 @@ impl ImapCoroutine for ImapIdle {
 }
 
 enum State {
-    Idle(SendImapCommand<CommandCodec>),
+    Idle(ImapSend<CommandCodec>),
     Read,
-    Done(SendImapCommand<IdleDoneCodec>),
+    Done(ImapSend<IdleDoneCodec>),
 }
 
 impl fmt::Display for State {
@@ -406,9 +428,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc2177::idle::*;
 
     #[test]
     fn shutdown_returns_ok() {
@@ -504,8 +526,6 @@ mod tests {
         };
         assert_eq!(text, "IDLE aborted");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapIdle,

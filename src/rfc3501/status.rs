@@ -15,14 +15,17 @@
 //!     types::status::StatusDataItemName,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
 //! let mailbox = "INBOX".try_into().unwrap();
-//! let item_names = vec![StatusDataItemName::Messages, StatusDataItemName::Recent];
+//! let item_names = vec![
+//!     StatusDataItemName::Messages,
+//!     StatusDataItemName::Recent,
+//! ];
 //! let mut coroutine = ImapMailboxStatus::new(mailbox, item_names);
 //! let mut arg = None;
 //!
@@ -66,18 +69,21 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 /// Failure causes during the IMAP STATUS flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxStatusError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP STATUS failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP STATUS failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP STATUS failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP STATUS failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP STATUS failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP STATUS coroutine.
@@ -86,6 +92,8 @@ pub struct ImapMailboxStatus {
 }
 
 impl ImapMailboxStatus {
+    /// Builds a STATUS coroutine requesting the `item_names` counters of
+    /// `mailbox`.
     pub fn new(
         mut mailbox: Mailbox<'static>,
         item_names: impl Into<Cow<'static, [StatusDataItemName]>>,
@@ -102,7 +110,7 @@ impl ImapMailboxStatus {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -117,45 +125,41 @@ impl ImapCoroutine for ImapMailboxStatus {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("status: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxStatusError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxStatusError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxStatusError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut items = Vec::new();
+                for data in out.data {
+                    if let Data::Status {
+                        mailbox: _,
+                        items: status_items,
+                    } = data
+                    {
+                        items.extend(status_items.into_owned());
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxStatusError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut items = Vec::new();
-                    for data in out.data {
-                        if let Data::Status {
-                            mailbox: _,
-                            items: status_items,
-                        } = data
-                        {
-                            items.extend(status_items.into_owned());
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(items)),
+                    StatusKind::No => {
+                        let err = ImapMailboxStatusError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(items)),
-                        StatusKind::No => {
-                            let err = ImapMailboxStatusError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxStatusError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxStatusError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -163,7 +167,7 @@ impl ImapCoroutine for ImapMailboxStatus {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -178,9 +182,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::status::*;
 
     fn items() -> Vec<StatusDataItemName> {
         vec![StatusDataItemName::Messages, StatusDataItemName::Recent]
@@ -239,8 +243,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxStatus,

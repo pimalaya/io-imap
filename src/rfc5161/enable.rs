@@ -15,13 +15,14 @@
 //!     types::extensions::enable::CapabilityEnable,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
-//! let capabilities = Vec1::try_from(vec![CapabilityEnable::CondStore]).unwrap();
+//! let capabilities =
+//!     Vec1::try_from(vec![CapabilityEnable::CondStore]).unwrap();
 //! let mut coroutine = ImapExtensionEnable::new(capabilities);
 //! let mut arg = None;
 //!
@@ -64,18 +65,21 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP ENABLE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapExtensionEnableError {
+    /// The server rejected the ENABLE command with a NO response.
     #[error("IMAP ENABLE failed: NO {0}")]
     No(String),
+    /// The server rejected the ENABLE command with a BAD response.
     #[error("IMAP ENABLE failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with a BYE response.
     #[error("IMAP ENABLE failed: BYE {0}")]
     Bye(String),
-
+    /// The server never answered with a tagged response.
     #[error("IMAP ENABLE failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send sub-coroutine failed.
     #[error("IMAP ENABLE failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP ENABLE coroutine.
@@ -84,6 +88,8 @@ pub struct ImapExtensionEnable {
 }
 
 impl ImapExtensionEnable {
+    /// Creates a coroutine that ENABLEs the given capabilities and
+    /// returns the server's ENABLED list.
     pub fn new(capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -92,7 +98,7 @@ impl ImapExtensionEnable {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -107,41 +113,37 @@ impl ImapCoroutine for ImapExtensionEnable {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("enable: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapExtensionEnableError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapExtensionEnableError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapExtensionEnableError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut enabled = None;
+                for data in out.data {
+                    if let Data::Enabled { capabilities } = data {
+                        enabled = Some(capabilities);
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapExtensionEnableError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut enabled = None;
-                    for data in out.data {
-                        if let Data::Enabled { capabilities } = data {
-                            enabled = Some(capabilities);
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
+                    StatusKind::No => {
+                        let err = ImapExtensionEnableError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
-                        StatusKind::No => {
-                            let err = ImapExtensionEnableError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapExtensionEnableError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapExtensionEnableError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -149,7 +151,7 @@ impl ImapCoroutine for ImapExtensionEnable {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -164,9 +166,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
-    use super::*;
+    use crate::rfc5161::enable::*;
 
     fn caps() -> Vec1<CapabilityEnable<'static>> {
         Vec1::try_from(vec![CapabilityEnable::CondStore]).expect("one cap")
@@ -237,8 +239,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapExtensionEnable,

@@ -15,7 +15,7 @@
 //!     types::search::SearchKey,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -65,18 +65,21 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP SEARCH flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageSearchError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP SEARCH failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP SEARCH failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP SEARCH failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP SEARCH failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP SEARCH failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options for [`ImapMessageSearch::new`].
@@ -92,6 +95,7 @@ pub struct ImapMessageSearch {
 }
 
 impl ImapMessageSearch {
+    /// Builds a SEARCH coroutine matching messages against `criteria`.
     pub fn new(criteria: Vec1<SearchKey<'static>>, opts: ImapMessageSearchOptions) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -104,7 +108,7 @@ impl ImapMessageSearch {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -119,41 +123,37 @@ impl ImapCoroutine for ImapMessageSearch {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("search: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageSearchError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageSearchError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageSearchError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut ids = Vec::new();
+                for data in out.data {
+                    if let Data::Search(search_ids, _) = data {
+                        ids = search_ids;
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageSearchError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut ids = Vec::new();
-                    for data in out.data {
-                        if let Data::Search(search_ids, _) = data {
-                            ids = search_ids;
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ids)),
+                    StatusKind::No => {
+                        let err = ImapMessageSearchError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(ids)),
-                        StatusKind::No => {
-                            let err = ImapMessageSearchError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageSearchError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMessageSearchError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -161,7 +161,7 @@ impl ImapCoroutine for ImapMessageSearch {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -176,9 +176,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::search::*;
 
     fn criteria() -> Vec1<SearchKey<'static>> {
         Vec1::try_from(vec![SearchKey::All]).expect("one criterion")
@@ -245,8 +245,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageSearch,

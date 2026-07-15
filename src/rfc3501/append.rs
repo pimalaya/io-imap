@@ -17,7 +17,7 @@
 //!     rfc3501::append::{ImapMessageAppend, ImapMessageAppendOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -74,29 +74,37 @@ pub type ImapMessageAppendOutput = (Option<u32>, Option<(u32, u32)>);
 /// Failure causes during the IMAP APPEND flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageAppendError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP APPEND failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP APPEND failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP APPEND failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP APPEND failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options shared by the buffered and streaming APPEND coroutines.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapMessageAppendOptions {
+    /// Flags set on the appended message. Defaults to none.
     pub flags: Vec<Flag<'static>>,
+    /// Internal date set on the appended message. Defaults to the
+    /// server reception time.
     pub date: Option<DateTime>,
     /// Send a non-synchronising literal (`{N+}`) instead of waiting for the
-    /// server continuation. Requires LITERAL+ / LITERAL-, and forfeits early
-    /// rejection, so it is best kept for small messages. Defaults to a
-    /// synchronising `{N}` literal.
+    /// server continuation.
+    ///
+    /// Requires LITERAL+ / LITERAL-, and forfeits early rejection, so it is
+    /// best kept for small messages. Defaults to a synchronising `{N}`
+    /// literal.
     pub non_sync: bool,
 }
 
@@ -106,6 +114,8 @@ pub struct ImapMessageAppend {
 }
 
 impl ImapMessageAppend {
+    /// Builds an APPEND coroutine appending the whole `message` to
+    /// `mailbox`.
     pub fn new(
         mut mailbox: Mailbox<'static>,
         message: Vec<u8>,
@@ -131,7 +141,7 @@ impl ImapMessageAppend {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -146,50 +156,46 @@ impl ImapCoroutine for ImapMessageAppend {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("append: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageAppendError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageAppendError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageAppendError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut exists = None;
+
+                for data in out.data {
+                    if let Data::Exists(seq) = data {
+                        exists = Some(seq);
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageAppendError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut exists = None;
-
-                    for data in out.data {
-                        if let Data::Exists(seq) = data {
-                            exists = Some(seq);
-                        }
+                match body.kind {
+                    StatusKind::Ok => {
+                        let appenduid =
+                            if let Some(Code::AppendUid { uid_validity, uid }) = body.code {
+                                Some((uid_validity.get(), uid.get()))
+                            } else {
+                                None
+                            };
+                        ImapCoroutineState::Complete(Ok((exists, appenduid)))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => {
-                            let appenduid =
-                                if let Some(Code::AppendUid { uid_validity, uid }) = body.code {
-                                    Some((uid_validity.get(), uid.get()))
-                                } else {
-                                    None
-                                };
-                            ImapCoroutineState::Complete(Ok((exists, appenduid)))
-                        }
-                        StatusKind::No => {
-                            let err = ImapMessageAppendError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageAppendError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::No => {
+                        let err = ImapMessageAppendError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
+                    StatusKind::Bad => {
+                        let err = ImapMessageAppendError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -197,7 +203,7 @@ impl ImapCoroutine for ImapMessageAppend {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -212,9 +218,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc3501::append::*;
 
     #[test]
     fn sync_success_with_appenduid_returns_pair() {
@@ -231,7 +237,8 @@ mod tests {
         assert!(line.contains("APPEND INBOX"));
         assert!(line.ends_with("{2}\r\n"));
 
-        // Synchronising literal: wait for `+`, then send the body inline.
+        // NOTE: synchronising literal: wait for `+`, then send the
+        // body inline.
         expect_wants_read(&mut append, &mut frag, None);
         let body = expect_wants_write(&mut append, &mut frag, Some(b"+ go\r\n"));
         assert_eq!(body, b"hi\r\n");
@@ -282,7 +289,7 @@ mod tests {
         let header = expect_wants_write(&mut append, &mut frag, None);
         let tag = first_word(str::from_utf8(&header).expect("utf8 header")).to_owned();
 
-        // The server rejects at the continuation point.
+        // NOTE: the server rejects at the continuation point.
         expect_wants_read(&mut append, &mut frag, None);
 
         let reply = format!("{tag} NO mailbox is read-only\r\n");
@@ -311,8 +318,6 @@ mod tests {
         };
         assert_eq!(text, "shutting down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageAppend,

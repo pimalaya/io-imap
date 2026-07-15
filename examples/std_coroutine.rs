@@ -1,4 +1,4 @@
-//! Blocking, rustls-only example: open a TCP+TLS connection by hand, drive
+//! Blocking, rustls-only example: open a TCP+TLS connection by hand, resume
 //! [`ImapGreetingGet`] manually, print the server's CAPABILITY list. No io-imap
 //! features required.
 //!

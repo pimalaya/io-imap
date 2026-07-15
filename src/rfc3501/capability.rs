@@ -14,7 +14,7 @@
 //!     rfc3501::capability::ImapCapabilityGet,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -61,20 +61,25 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP CAPABILITY flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapCapabilityGetError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP CAPABILITY failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP CAPABILITY failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP CAPABILITY failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP CAPABILITY failed: server did not return a tagged response")]
     MissingTagged,
+    /// The response carried no capability list, neither as untagged
+    /// data nor as a response code.
     #[error("IMAP CAPABILITY failed: server did not advertise any capability")]
     MissingCapability,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP CAPABILITY failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP CAPABILITY coroutine.
@@ -83,6 +88,8 @@ pub struct ImapCapabilityGet {
 }
 
 impl ImapCapabilityGet {
+    /// Builds a CAPABILITY coroutine requesting the advertised
+    /// capability list.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -91,7 +98,7 @@ impl ImapCapabilityGet {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -112,67 +119,63 @@ impl ImapCoroutine for ImapCapabilityGet {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("capability: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapCapabilityGetError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapCapabilityGetError::Bye(bye.text.to_string());
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapCapabilityGetError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let code = match body.kind {
+                    StatusKind::Ok => body.code,
+                    StatusKind::No => {
+                        let err = ImapCapabilityGetError::No(body.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
                     }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapCapabilityGetError::MissingTagged;
+                    StatusKind::Bad => {
+                        let err = ImapCapabilityGetError::Bad(body.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
-                    };
+                    }
+                };
 
-                    let code = match body.kind {
-                        StatusKind::Ok => body.code,
-                        StatusKind::No => {
-                            let err = ImapCapabilityGetError::No(body.text.to_string());
-                            return ImapCoroutineState::Complete(Err(err));
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapCapabilityGetError::Bad(body.text.to_string());
-                            return ImapCoroutineState::Complete(Err(err));
-                        }
-                    };
+                let mut new_capability = None;
 
-                    let mut new_capability = None;
+                if let Some(Code::Capability(capability)) = code {
+                    new_capability.replace(capability);
+                }
 
+                for data in out.data {
+                    if let Data::Capability(capability) = data {
+                        new_capability.replace(capability);
+                    }
+                }
+
+                for StatusBody { code, .. } in out.untagged {
                     if let Some(Code::Capability(capability)) = code {
                         new_capability.replace(capability);
                     }
-
-                    for data in out.data {
-                        if let Data::Capability(capability) = data {
-                            new_capability.replace(capability);
-                        }
-                    }
-
-                    for StatusBody { code, .. } in out.untagged {
-                        if let Some(Code::Capability(capability)) = code {
-                            new_capability.replace(capability);
-                        }
-                    }
-
-                    let Some(capability) = new_capability else {
-                        let err = ImapCapabilityGetError::MissingCapability;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    return ImapCoroutineState::Complete(Ok(capability.into_iter().collect()));
                 }
+
+                let Some(capability) = new_capability else {
+                    let err = ImapCapabilityGetError::MissingCapability;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                ImapCoroutineState::Complete(Ok(capability.into_iter().collect()))
             }
         }
     }
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -187,9 +190,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc3501::capability::*;
 
     #[test]
     fn data_capability_returns_capabilities() {
@@ -274,8 +277,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapCapabilityGet,

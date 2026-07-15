@@ -21,7 +21,7 @@
 //!     rfc3501::raw::ImapRaw,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -63,6 +63,7 @@ use crate::coroutine::*;
 /// Failure causes during the IMAP raw passthrough flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapRawError {
+    /// The stream reached EOF before the tagged completion line arrived.
     #[error("IMAP raw command failed: reached unexpected EOF on stream")]
     Eof,
 }
@@ -82,8 +83,10 @@ pub struct ImapRaw {
 }
 
 impl ImapRaw {
-    /// Builds the wire line `<tag> <command>\r\n` around a freshly generated
-    /// tag. A trailing CRLF on `command` is trimmed so callers cannot
+    /// Builds the wire line `<tag> <command>\r\n` around a freshly
+    /// generated tag.
+    ///
+    /// A trailing CRLF on `command` is trimmed so callers cannot
     /// accidentally emit an empty extra line.
     pub fn new(command: impl AsRef<str>) -> Self {
         let tag = TagGenerator::new().generate();
@@ -121,8 +124,6 @@ impl ImapCoroutine for ImapRaw {
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("raw: {}", self.state);
-
             if let Some(bytes) = self.wants_write.take() {
                 return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
@@ -160,9 +161,10 @@ impl ImapCoroutine for ImapRaw {
                         trace!("captured response message: {}", escape_byte_string(bytes));
                         self.response.extend_from_slice(bytes);
 
-                        // The only tagged response in a single-command exchange
-                        // is our completion line; an untagged response decodes
-                        // to no tag and is captured then skipped.
+                        // NOTE: the only tagged response in a single-command
+                        // exchange is our completion line; an untagged
+                        // response decodes to no tag and is captured then
+                        // skipped.
                         let is_completion = fragmentizer
                             .decode_tag()
                             .is_some_and(|tag| tag.as_ref().as_bytes() == self.tag_bytes);
@@ -172,8 +174,9 @@ impl ImapCoroutine for ImapRaw {
                         }
                     }
                     Some(FragmentInfo::Literal { .. }) => {
-                        // Literal bytes belong to the current message; they are
-                        // captured wholesale once its final line completes.
+                        // NOTE: literal bytes belong to the current message;
+                        // they are captured wholesale once its final line
+                        // completes.
                     }
                     None if self.done => {
                         let response = String::from_utf8_lossy(&self.response).into_owned();
@@ -209,7 +212,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use super::*;
+    use alloc::format;
+
+    use crate::rfc3501::raw::*;
 
     #[test]
     fn success_returns_full_raw_response() {
@@ -280,8 +285,6 @@ mod tests {
         let err = expect_complete_err(&mut raw, &mut frag, b"");
         assert!(matches!(err, ImapRawError::Eof));
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapRaw,

@@ -4,7 +4,7 @@
 //! The body is never held whole: [`ImapMessageAppendStream::new`] takes only
 //! the octet count (IMAP declares it up front in the literal), and the
 //! coroutine yields [`ImapMessageAppendStreamYield::WantsStream`] so the
-//! driver pumps the bytes straight from its own source to the socket. Use
+//! caller pumps the bytes straight from its own source to the socket. Use
 //! [`super::append::ImapMessageAppend`] when the whole message already fits
 //! in memory.
 //!
@@ -21,11 +21,13 @@
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     rfc3501::{
 //!         append::ImapMessageAppendOptions,
-//!         append_stream::{ImapMessageAppendStream, ImapMessageAppendStreamYield},
+//!         append_stream::{
+//!             ImapMessageAppendStream, ImapMessageAppendStreamYield,
+//!         },
 //!     },
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -35,19 +37,26 @@
 //! let mut body = message;
 //! let mailbox = "INBOX".try_into().unwrap();
 //! let opts = ImapMessageAppendOptions::default();
-//! let mut coroutine = ImapMessageAppendStream::new(mailbox, message.len() as u32, opts);
+//! let len = message.len() as u32;
+//! let mut coroutine = ImapMessageAppendStream::new(mailbox, len, opts);
 //! let mut arg = None;
 //!
 //! let (exists, appenduid) = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
-//!         ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageAppendStreamYield::WantsWrite(bytes),
+//!         ) => {
 //!             stream.write_all(&bytes).unwrap();
 //!         }
-//!         ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageAppendStreamYield::WantsRead,
+//!         ) => {
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageAppendStreamYield::WantsStream,
+//!         ) => {
 //!             io::copy(&mut body, &mut stream).unwrap();
 //!         }
 //!         ImapCoroutineState::Complete(Ok(out)) => break out,
@@ -74,7 +83,7 @@ use imap_codec::{
         response::{Code, Data, StatusKind, Tagged},
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
@@ -90,26 +99,33 @@ use crate::{
 /// Failure causes during the IMAP APPEND streaming flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageAppendStreamError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP APPEND failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP APPEND failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP APPEND failed: server did not return a tagged response")]
     MissingTagged,
+    /// The message source delivered fewer octets than the declared
+    /// literal length.
     #[error("IMAP APPEND failed: message source delivered fewer octets than declared")]
     ShortMessage,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP APPEND failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Yield variants from the streaming APPEND coroutine.
 #[derive(Debug)]
 pub enum ImapMessageAppendStreamYield {
+    /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
+    /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
     /// Stream exactly the declared message octets to the server, then resume
     /// with `None` on success or `Some(&[])` if the source ran short.
@@ -136,10 +152,16 @@ pub struct ImapMessageAppendStream {
 }
 
 impl ImapMessageAppendStream {
+    /// Builds a streaming APPEND coroutine appending a `len`-octet message
+    /// to `mailbox`.
+    ///
+    /// The body bytes never pass through the coroutine: it yields
+    /// [`ImapMessageAppendStreamYield::WantsStream`] and the caller pumps
+    /// exactly `len` octets from its own source to the socket.
     pub fn new(mut mailbox: Mailbox<'static>, len: u32, opts: ImapMessageAppendOptions) -> Self {
         encode_inplace(&mut mailbox);
 
-        // Build the request line through imap-codec with an empty
+        // NOTE: build the request line through imap-codec with an empty
         // literal, then splice in the real octet count: streaming keeps
         // the message body out of the encoder so it never lands in
         // memory whole.
@@ -157,7 +179,7 @@ impl ImapMessageAppendStream {
 
         let fragments: Vec<Fragment> = CommandCodec::new().encode(&command).collect();
 
-        // The message literal is the last literal fragment: the lines
+        // NOTE: the message literal is the last literal fragment: the lines
         // before it form the request header, the line after it the
         // command-closing CRLF that follows the streamed body. The empty
         // literal itself is dropped.
@@ -180,8 +202,9 @@ impl ImapMessageAppendStream {
             }
         }
 
-        // imap-codec emitted the empty literal header as `{0+}\r\n`; rewrite it
-        // with the real count, synchronising unless `non_sync` was requested.
+        // NOTE: imap-codec emitted the empty literal header as
+        // `{0+}\r\n`; rewrite it with the real count, synchronising
+        // unless `non_sync` was requested.
         const EMPTY_LITERAL: &[u8] = b"{0+}\r\n";
         debug_assert!(header.ends_with(EMPTY_LITERAL));
         header.truncate(header.len() - EMPTY_LITERAL.len());
@@ -213,20 +236,19 @@ impl ImapCoroutine for ImapMessageAppendStream {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("append stream: {}", self.state);
-
             match &mut self.state {
                 State::WriteHeader => {
                     let header = self.header.take().expect("header written once");
 
-                    // Synchronising literals wait for the server `+`
-                    // before the body; non-synchronising ones stream
+                    // NOTE: synchronising literals wait for the server
+                    // `+` before the body; non-synchronising ones stream
                     // straight away.
                     self.state = if self.non_sync {
                         State::Stream
                     } else {
-                        State::Continuation(SendImapCommand::receive(self.command.clone()))
+                        State::Continuation(ImapSend::receive(self.command.clone()))
                     };
+                    debug!("{}", self.state);
 
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         header,
@@ -240,8 +262,8 @@ impl ImapCoroutine for ImapMessageAppendStream {
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
-                    // A tagged response before the continuation means the
-                    // server refused the append up front.
+                    // NOTE: a tagged response before the continuation
+                    // means the server refused the append up front.
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
                             StatusKind::No => {
@@ -253,6 +275,7 @@ impl ImapCoroutine for ImapMessageAppendStream {
                     }
 
                     self.state = State::Stream;
+                    debug!("{}", self.state);
                 }
                 State::Stream => {
                     if self.stream_pending {
@@ -264,6 +287,7 @@ impl ImapCoroutine for ImapMessageAppendStream {
                         }
 
                         self.state = State::WriteCrlf;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -272,7 +296,8 @@ impl ImapCoroutine for ImapMessageAppendStream {
                 }
                 State::WriteCrlf => {
                     let crlf = self.crlf.take().expect("crlf written once");
-                    self.state = State::Recv(SendImapCommand::receive(self.command.clone()));
+                    self.state = State::Recv(ImapSend::receive(self.command.clone()));
+                    debug!("{}", self.state);
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         crlf,
                     ));
@@ -325,10 +350,10 @@ impl ImapCoroutine for ImapMessageAppendStream {
 
 enum State {
     WriteHeader,
-    Continuation(SendImapCommand<CommandCodec>),
+    Continuation(ImapSend<CommandCodec>),
     Stream,
     WriteCrlf,
-    Recv(SendImapCommand<CommandCodec>),
+    Recv(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -349,7 +374,7 @@ mod tests {
 
     use alloc::borrow::ToOwned;
 
-    use super::*;
+    use crate::rfc3501::append_stream::*;
 
     #[test]
     fn sync_success_with_appenduid_returns_pair() {
@@ -403,7 +428,7 @@ mod tests {
         let tag = first_word(line).to_owned();
         assert!(line.ends_with("{15+}\r\n"));
 
-        // No continuation read: the body streams straight away.
+        // NOTE: no continuation read: the body streams straight away.
         expect_wants_stream(&mut append, &mut frag, None);
         let crlf = expect_wants_write(&mut append, &mut frag, None);
         assert_eq!(crlf, b"\r\n");
@@ -449,7 +474,7 @@ mod tests {
         expect_wants_read(&mut append, &mut frag, None);
         expect_wants_stream(&mut append, &mut frag, Some(b"+ go\r\n"));
 
-        // Driver signals a short source with an empty slice.
+        // NOTE: an empty slice signals a short source.
         let err = expect_complete_err(&mut append, &mut frag, Some(&[]));
         assert!(matches!(err, ImapMessageAppendStreamError::ShortMessage));
     }
@@ -475,8 +500,6 @@ mod tests {
         };
         assert_eq!(text, "shutting down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageAppendStream,

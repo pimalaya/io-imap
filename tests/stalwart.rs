@@ -1,3 +1,6 @@
+//! End-to-end test against a local Stalwart IMAP server; ignored by
+//! default, spawned via tests/stalwart.sh.
+
 mod common;
 
 use crate::common::run_imap;

@@ -14,7 +14,7 @@
 //!     rfc3501::lsub::ImapMailboxLsub,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -72,18 +72,21 @@ use crate::{
 /// Failure causes during the IMAP LSUB flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxLsubError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP LSUB failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP LSUB failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP LSUB failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP LSUB failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP LSUB failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP LSUB coroutine.
@@ -92,6 +95,8 @@ pub struct ImapMailboxLsub {
 }
 
 impl ImapMailboxLsub {
+    /// Builds an LSUB coroutine listing subscribed mailboxes matching
+    /// `mailbox_wildcard` under `reference`.
     pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
         encode_inplace(&mut reference);
 
@@ -105,7 +110,7 @@ impl ImapMailboxLsub {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -120,48 +125,44 @@ impl ImapCoroutine for ImapMailboxLsub {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("lsub: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxLsubError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxLsubError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxLsubError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut mailboxes = Vec::new();
+                for data in out.data {
+                    if let Data::Lsub {
+                        items,
+                        delimiter,
+                        mailbox,
+                    } = data
+                    {
+                        let mut mailbox = mailbox;
+                        decode_inplace(&mut mailbox);
+                        mailboxes.push((mailbox, delimiter, items));
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxLsubError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut mailboxes = Vec::new();
-                    for data in out.data {
-                        if let Data::Lsub {
-                            items,
-                            delimiter,
-                            mailbox,
-                        } = data
-                        {
-                            let mut mailbox = mailbox;
-                            decode_inplace(&mut mailbox);
-                            mailboxes.push((mailbox, delimiter, items));
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
+                    StatusKind::No => {
+                        let err = ImapMailboxLsubError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
-                        StatusKind::No => {
-                            let err = ImapMailboxLsubError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxLsubError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxLsubError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -169,7 +170,7 @@ impl ImapCoroutine for ImapMailboxLsub {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -184,9 +185,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::lsub::*;
 
     #[test]
     fn success_returns_rows() {
@@ -244,8 +245,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxLsub,

@@ -28,7 +28,7 @@
 //!     watch::{ImapMailboxWatch, ImapMailboxWatchYield},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -37,7 +37,8 @@
 //! let capability = [Capability::QResync];
 //! let mailbox = "INBOX".try_into().unwrap();
 //! let shutdown = Arc::new(AtomicBool::new(false));
-//! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone()).unwrap();
+//! let mut coroutine =
+//!     ImapMailboxWatch::new(&capability, mailbox, shutdown.clone()).unwrap();
 //! let mut arg = None;
 //!
 //! loop {
@@ -85,7 +86,7 @@ use imap_codec::{
         sequence::SequenceSet,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
@@ -93,28 +94,44 @@ use crate::{
     rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchOptions},
-        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectOptions, SelectData},
+        select::{
+            ImapMailboxSelect, ImapMailboxSelectData, ImapMailboxSelectError,
+            ImapMailboxSelectOptions,
+        },
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
 };
 
+/// UID-keyed mailbox change emitted by the watcher.
+///
 /// `FlagsAdded`/`FlagsRemoved` are pre-diffed against the internal
 /// shadow; each `flags` vector lists only the changed flags.
 #[derive(Clone, Debug)]
 pub enum ImapMailboxWatchEvent {
+    /// A message appeared in the mailbox.
     EnvelopeAdded {
+        /// The UID of the new message.
         uid: NonZeroU32,
+        /// The FETCH items announcing the message.
         items: Vec<MessageDataItem<'static>>,
     },
+    /// Flags were set on an existing message.
     FlagsAdded {
+        /// The UID of the changed message.
         uid: NonZeroU32,
+        /// The flags that were added.
         flags: Vec<Flag<'static>>,
     },
+    /// Flags were cleared on an existing message.
     FlagsRemoved {
+        /// The UID of the changed message.
         uid: NonZeroU32,
+        /// The flags that were removed.
         flags: Vec<Flag<'static>>,
     },
+    /// A message left the mailbox (expunged or moved away).
     EnvelopeRemoved {
+        /// The UID of the removed message.
         uid: NonZeroU32,
     },
 }
@@ -122,20 +139,30 @@ pub enum ImapMailboxWatchEvent {
 /// Failure causes during the mailbox watch flow.
 #[derive(Debug, Error)]
 pub enum ImapMailboxWatchError {
+    /// The capability list given to `new` lacks QRESYNC.
     #[error("IMAP server does not advertise QRESYNC")]
     QresyncUnsupported,
+    /// The SELECT response carried no UIDVALIDITY, so deltas cannot be
+    /// keyed safely.
     #[error("IMAP server did not return UIDVALIDITY in SELECT response")]
     MissingUidValidity,
+    /// The SELECT response carried no HIGHESTMODSEQ, so there is no
+    /// resync point.
     #[error("IMAP server did not return HIGHESTMODSEQ in SELECT response")]
     MissingHighestModSeq,
+    /// The baseline `1:*` sequence set failed to parse.
     #[error("Invalid `1:*` sequence set: {0}")]
     InvalidSequenceSet(String),
+    /// The initial or QRESYNC SELECT failed.
     #[error("IMAP SELECT error")]
     Select(#[from] ImapMailboxSelectError),
+    /// The baseline FETCH failed.
     #[error("IMAP FETCH error")]
     Fetch(#[from] ImapMessageFetchError),
+    /// The IDLE wake-loop failed.
     #[error("IMAP IDLE error")]
     Idle(#[from] ImapIdleError),
+    /// The ENABLE QRESYNC round failed.
     #[error("IMAP ENABLE error")]
     Enable(#[from] ImapExtensionEnableError),
 }
@@ -143,8 +170,11 @@ pub enum ImapMailboxWatchError {
 /// Yield variants from the mailbox watcher.
 #[derive(Debug)]
 pub enum ImapMailboxWatchYield {
+    /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
+    /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
+    /// A mailbox change to consume; the watcher keeps running.
     Event(ImapMailboxWatchEvent),
 }
 
@@ -183,7 +213,7 @@ impl ImapMailboxWatch {
             return Err(ImapMailboxWatchError::QresyncUnsupported);
         }
 
-        // NOTE: RFC 7162 §3.1 — QRESYNC implies CONDSTORE, but pass
+        // NOTE: RFC 7162 §3.1: QRESYNC implies CONDSTORE, but pass
         // both since some servers only echo CONDSTORE in ENABLED.
         let condstore = CapabilityEnable::CondStore;
         // NOTE: QRESYNC is not in the typed enum, route via Atom.
@@ -207,7 +237,7 @@ impl ImapMailboxWatch {
         })
     }
 
-    fn compute_deltas(&mut self, data: &SelectData) {
+    fn compute_deltas(&mut self, data: &ImapMailboxSelectData) {
         for uid in &data.vanished_earlier {
             if self.shadow.remove(uid).is_some() {
                 self.pending
@@ -289,7 +319,8 @@ impl ImapCoroutine for ImapMailboxWatch {
                         ));
                     }
                     ImapCoroutineState::Complete(Ok(enabled)) => {
-                        trace!("watch: ENABLE OK ({enabled:?})");
+                        debug!("enabled qresync");
+                        trace!("{enabled:?}");
                         let parameters = vec![SelectParameter::CondStore];
                         let select = ImapMailboxSelect::new(
                             self.mailbox.clone(),
@@ -327,11 +358,9 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                         self.uid_validity = Some(uid_validity);
                         self.highest_mod_seq = highest_mod_seq;
-                        trace!(
-                            "watch: SELECT OK uidvalidity={} highestmodseq={}",
-                            uid_validity.get(),
-                            highest_mod_seq,
-                        );
+                        debug!("selected mailbox with condstore");
+                        trace!("uid_validity: {uid_validity}");
+                        trace!("highest_mod_seq: {highest_mod_seq}");
 
                         let sequence_set: SequenceSet = match "1:*".try_into() {
                             Ok(s) => s,
@@ -375,10 +404,8 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 self.shadow.insert(uid, flags);
                             }
                         }
-                        trace!(
-                            "watch: baseline shadow seeded with {} uids",
-                            self.shadow.len(),
-                        );
+                        debug!("seeded baseline shadow");
+                        trace!("uids: {}", self.shadow.len());
                         self.state = State::BeginIdle;
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
@@ -399,7 +426,7 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                 State::Idle(mut idle) => match idle.resume(fragmentizer, arg.take()) {
                     ImapCoroutineState::Yielded(ImapIdleYield::Event(_)) => {
-                        trace!("watch: IDLE saw untagged data");
+                        debug!("idle saw untagged data");
                         self.idle_saw_data = true;
                         self.idle_done.store(true, Ordering::SeqCst);
                         self.state = State::Idle(idle);
@@ -420,7 +447,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                         }
 
                         if self.idle_saw_data {
-                            // SAFETY: uid_validity is set by SelectInitial
+                            // NOTE: uid_validity is set by SelectInitial.
                             let uid_validity = self.uid_validity.unwrap();
                             let modseq = NonZeroU64::new(self.highest_mod_seq)
                                 .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
@@ -436,7 +463,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                             );
                             self.state = State::SelectQresync(select);
                         } else {
-                            trace!("watch: IDLE timed out with no data, restarting");
+                            debug!("idle timed out with no data, restarting");
                             self.state = State::BeginIdle;
                         }
                     }

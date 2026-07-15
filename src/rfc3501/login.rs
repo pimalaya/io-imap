@@ -15,7 +15,7 @@
 //!     rfc3501::login::{ImapLogin, ImapLoginOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -60,7 +60,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -68,20 +68,25 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Failure causes during the IMAP LOGIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapLoginError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP LOGIN failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP LOGIN failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP LOGIN failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP LOGIN failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP LOGIN failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
+    /// The post-login CAPABILITY round-trip failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+    /// The post-login ID round-trip failed.
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
 }
@@ -89,7 +94,11 @@ pub enum ImapLoginError {
 /// Optional post-authentication round-trips.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapLoginOptions {
+    /// Fetch capabilities explicitly when the LOGIN response carries
+    /// none. Defaults to skipping the extra round-trip.
     pub ensure_capabilities: bool,
+    /// Send an ID command right after login with these parameters (an
+    /// empty list sends `ID NIL`). Defaults to no ID round-trip.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
@@ -101,6 +110,9 @@ pub struct ImapLogin {
 }
 
 impl ImapLogin {
+    /// Builds a LOGIN coroutine authenticating with `user` and
+    /// `password`.
+    ///
     /// Fails on credentials that cannot be encoded as IMAP AStrings
     /// (NUL, CR, LF).
     pub fn new(
@@ -116,7 +128,7 @@ impl ImapLogin {
             body: CommandBody::Login { username, password },
         };
         trace!("send IMAP command {cmd:?}");
-        let send = SendImapCommand::new(CommandCodec::new(), cmd);
+        let send = ImapSend::new(CommandCodec::new(), cmd);
 
         Ok(Self {
             state: State::Send(send),
@@ -149,7 +161,6 @@ impl ImapCoroutine for ImapLogin {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("login: {}", self.state);
             match &mut self.state {
                 State::Send(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -194,11 +205,13 @@ impl ImapCoroutine for ImapLogin {
 
                     if let Some(next) = self.wants_capability() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -210,6 +223,7 @@ impl ImapCoroutine for ImapLogin {
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -227,7 +241,7 @@ impl ImapCoroutine for ImapLogin {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -246,7 +260,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use super::*;
+    use alloc::format;
+
+    use crate::rfc3501::login::*;
 
     #[test]
     fn success_returns_ok() {
@@ -332,8 +348,6 @@ mod tests {
             "expected construction to refuse NUL in password",
         );
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapLogin,

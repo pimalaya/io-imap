@@ -17,7 +17,7 @@
 //!     rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbearerOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -54,7 +54,9 @@ use core::{fmt, mem};
 
 use alloc::{
     borrow::Cow,
+    format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 
@@ -71,7 +73,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -79,32 +81,53 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Failure causes during the SASL OAUTHBEARER flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthOauthbearerError {
+    /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: NO {0}")]
     No(String),
+    /// The server rejected authentication with a tagged NO after
+    /// returning an error payload in a challenge.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: NO {info} ({err})")]
-    NoWithError { info: String, err: String },
+    NoWithError {
+        /// The tagged NO response text.
+        info: String,
+        /// The error payload extracted from the challenge.
+        err: String,
+    },
+    /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: BYE {0}")]
     Bye(String),
-
+    /// The server never returned the final tagged response.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server never sent the expected continuation request.
     #[error(
         "IMAP AUTHENTICATE OAUTHBEARER failed: server did not send the expected continuation request"
     )]
     ExpectedContinuationRequest,
+    /// The server answered the error acknowledgement with a status
+    /// other than the expected NO.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: expected NO got {kind:?} ({info})")]
-    UnexpectedStatus { kind: StatusKind, info: String },
+    UnexpectedStatus {
+        /// The status kind the server answered instead of NO.
+        kind: StatusKind,
+        /// The status response text.
+        info: String,
+    },
+    /// The server returned OK before the mechanism could complete.
     #[error(
         "IMAP AUTHENTICATE OAUTHBEARER failed: server returned OK before the mechanism could complete"
     )]
     UnexpectedOk,
-
+    /// The underlying send coroutine failed.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
+    /// The follow-up CAPABILITY command failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+    /// The follow-up ID command failed.
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
 }
@@ -115,7 +138,13 @@ pub struct ImapAuthOauthbearerOptions {
     /// `true` selects SASL-IR (RFC 4959, inline credentials);
     /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
+    /// Fetch CAPABILITY after authentication when the tagged response
+    /// carries no capability data. Defaults to `false`.
     pub ensure_capabilities: bool,
+    /// Chain an RFC 2971 ID round-trip right after authentication, as
+    /// required by some providers.
+    ///
+    /// Defaults to `None` (no ID); an empty list sends ID NIL.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
@@ -128,6 +157,12 @@ pub struct ImapAuthOauthbearer {
 }
 
 impl ImapAuthOauthbearer {
+    /// Builds a SASL OAUTHBEARER coroutine authenticating `user` with
+    /// the bearer `token`, targeting the server at `host` and `port`.
+    ///
+    /// Depending on `opts.initial_request`, the credentials go inline
+    /// with the AUTHENTICATE command (SASL-IR) or are uploaded after
+    /// the server challenge.
     pub fn new(
         user: impl AsRef<str>,
         host: impl AsRef<str>,
@@ -151,7 +186,7 @@ impl ImapAuthOauthbearer {
             };
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
-            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
+            State::SendIr(ImapSend::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::OAuthBearer,
@@ -159,7 +194,7 @@ impl ImapAuthOauthbearer {
             };
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
-            let send = SendImapCommand::new(CommandCodec::new(), cmd);
+            let send = ImapSend::new(CommandCodec::new(), cmd);
             State::Send { payload, send }
         };
 
@@ -231,7 +266,6 @@ impl ImapCoroutine for ImapAuthOauthbearer {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("auth OAUTHBEARER: {}", self.state);
             match &mut self.state {
                 State::Send { send, payload } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -245,7 +279,8 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                         let payload = mem::take(payload).into_owned();
                         let auth = AuthenticateData::r#continue(payload);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::Continue(SendImapCommand::new(codec, auth));
+                        self.state = State::Continue(ImapSend::new(codec, auth));
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -274,7 +309,8 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                         self.error.replace(Self::extract_json_error(&cr));
                         let auth = AuthenticateData::r#continue(vec![0x01]);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
+                        self.state = State::AcknowledgeError(ImapSend::new(codec, auth));
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -297,11 +333,13 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -320,7 +358,8 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                         self.error.replace(Self::extract_json_error(&cr));
                         let auth = AuthenticateData::r#continue(vec![0x01]);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(SendImapCommand::new(codec, auth));
+                        self.state = State::AcknowledgeError(ImapSend::new(codec, auth));
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -343,11 +382,13 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -387,6 +428,7 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -405,12 +447,12 @@ impl ImapCoroutine for ImapAuthOauthbearer {
 
 enum State {
     Send {
-        send: SendImapCommand<CommandCodec>,
+        send: ImapSend<CommandCodec>,
         payload: Cow<'static, [u8]>,
     },
-    SendIr(SendImapCommand<CommandCodec>),
-    Continue(SendImapCommand<AuthenticateDataCodec>),
-    AcknowledgeError(SendImapCommand<AuthenticateDataCodec>),
+    SendIr(ImapSend<CommandCodec>),
+    Continue(ImapSend<AuthenticateDataCodec>),
+    AcknowledgeError(ImapSend<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -432,7 +474,7 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use super::*;
+    use crate::rfc7628::auth_oauthbearer::*;
 
     #[test]
     fn ir_success_returns_ok() {
@@ -589,8 +631,6 @@ mod tests {
         assert_eq!(info, "SASL authentication failed");
         assert_eq!(err, err_json);
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapAuthOauthbearer,

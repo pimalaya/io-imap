@@ -1,7 +1,10 @@
-//! IMAP SORT coroutine ([`ImapMessageSort`]): runs the RFC 5256 SORT command,
-//! or, when the server lacks the SORT extension (or the caller opts out via
-//! `fallback`), falls back to SEARCH + FETCH + a local sort. Both paths return
-//! the same `Vec<NonZeroU32>`.
+//! IMAP SORT coroutine ([`ImapMessageSort`]) with a client-side
+//! fallback.
+//!
+//! Runs the RFC 5256 SORT command, or, when the server lacks the SORT
+//! extension (or the caller opts out via `fallback`), falls back to
+//! SEARCH + FETCH + a local sort. Both paths return the same
+//! `Vec<NonZeroU32>`.
 //!
 //! # Example
 //!
@@ -21,7 +24,7 @@
 //!     },
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -34,7 +37,8 @@
 //! .unwrap();
 //! let search_criteria = Vec1::try_from(vec![SearchKey::All]).unwrap();
 //! let opts = ImapMessageSortOptions::default();
-//! let mut coroutine = ImapMessageSort::new(sort_criteria, search_criteria, opts);
+//! let mut coroutine =
+//!     ImapMessageSort::new(sort_criteria, search_criteria, opts);
 //! let mut arg = None;
 //!
 //! let ids = loop {
@@ -71,7 +75,7 @@ use imap_codec::{
         sequence::SequenceSet,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
@@ -87,24 +91,31 @@ const MAX_CHUNK: usize = 255;
 /// Failure causes during the IMAP SORT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageSortError {
+    /// The server rejected the SORT command with a NO response.
     #[error("IMAP SORT failed: NO {0}")]
     No(String),
+    /// The server rejected the SORT command with a BAD response.
     #[error("IMAP SORT failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with a BYE response.
     #[error("IMAP SORT failed: BYE {0}")]
     Bye(String),
-
+    /// The server never answered with a tagged response.
     #[error("IMAP SORT failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server returned OK without any SORT data.
     #[error("IMAP SORT failed: server did not return any data")]
     MissingData,
+    /// A chunk of searched ids could not form a valid sequence set.
     #[error("IMAP SORT failed: could not build the fetch sequence set")]
     InvalidSequenceSet,
-
+    /// The underlying send sub-coroutine failed.
     #[error("IMAP SORT failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
+    /// The SEARCH step of the fallback failed.
     #[error(transparent)]
     Search(#[from] ImapMessageSearchError),
+    /// The FETCH step of the fallback failed.
     #[error(transparent)]
     Fetch(#[from] ImapMessageFetchError),
 }
@@ -114,9 +125,11 @@ pub enum ImapMessageSortError {
 pub struct ImapMessageSortOptions {
     /// When `true`, sort UIDs; returned ids are UIDs.
     pub uid: bool,
-    /// When `true`, skip the SORT command and sort client-side via SEARCH +
-    /// FETCH. The consumer sets this from a SORT capability check (or by
-    /// choice). Defaults to using the server SORT.
+    /// When `true`, skip the SORT command and sort client-side via
+    /// SEARCH + FETCH; defaults to using the server SORT.
+    ///
+    /// The consumer sets this from a SORT capability check (or by
+    /// choice).
     pub fallback: bool,
 }
 
@@ -135,6 +148,11 @@ pub struct ImapMessageSort {
 }
 
 impl ImapMessageSort {
+    /// Creates a coroutine that sorts the messages matching
+    /// `search_criteria` by `sort_criteria`, server-side or locally.
+    ///
+    /// `opts.fallback` selects the SEARCH + FETCH client-side path and
+    /// `opts.uid` the UID variant of every command involved.
     pub fn new(
         sort_criteria: Vec1<SortCriterion>,
         search_criteria: Vec1<SearchKey<'static>>,
@@ -158,9 +176,9 @@ impl ImapMessageSort {
                 },
             };
 
-            trace!("prepare IMAP command to be sent: {command:?}");
+            trace!("send IMAP command {command:?}");
 
-            State::Sort(SendImapCommand::new(CommandCodec::new(), command))
+            State::Sort(ImapSend::new(CommandCodec::new(), command))
         };
 
         Self {
@@ -245,8 +263,6 @@ impl ImapCoroutine for ImapMessageSort {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("{}", self.state);
-
             match &mut self.state {
                 State::Sort(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -290,7 +306,10 @@ impl ImapCoroutine for ImapMessageSort {
                     self.remaining = imap_try!(search, fragmentizer, arg);
 
                     match self.next_fetch() {
-                        Ok(Some(fetch)) => self.state = State::Fetch(fetch),
+                        Ok(Some(fetch)) => {
+                            self.state = State::Fetch(fetch);
+                            debug!("{}", self.state);
+                        }
                         Ok(None) => return ImapCoroutineState::Complete(Ok(Vec::new())),
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
@@ -300,7 +319,10 @@ impl ImapCoroutine for ImapMessageSort {
                     self.fetched.extend(map);
 
                     match self.next_fetch() {
-                        Ok(Some(fetch)) => self.state = State::Fetch(fetch),
+                        Ok(Some(fetch)) => {
+                            self.state = State::Fetch(fetch);
+                            debug!("{}", self.state);
+                        }
                         Ok(None) => return ImapCoroutineState::Complete(Ok(self.local_sort())),
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
                     }
@@ -311,7 +333,7 @@ impl ImapCoroutine for ImapMessageSort {
 }
 
 enum State {
-    Sort(SendImapCommand<CommandCodec>),
+    Sort(ImapSend<CommandCodec>),
     Search(ImapMessageSearch),
     Fetch(ImapMessageFetch),
 }
@@ -326,9 +348,11 @@ impl fmt::Display for State {
     }
 }
 
-/// The FETCH items needed to sort by `sort_criteria` locally. Display keys have
-/// no comparable data and are skipped; UID is added in UID mode to recover the
-/// sorted ids; an Envelope is always present so the Date tie-break works.
+/// The FETCH items needed to sort by `sort_criteria` locally.
+///
+/// Display keys have no comparable data and are skipped; UID is added
+/// in UID mode to recover the sorted ids; an Envelope is always
+/// present so the Date tie-break works.
 fn fetch_items(
     sort_criteria: &Vec1<SortCriterion>,
     uid: bool,
@@ -363,9 +387,11 @@ fn fetch_items(
     items
 }
 
-/// Compares two fetched messages by a single sort key. From/To/Cc/Display fall
-/// through to `Equal`: imap-types `Address` has no `Ord`, so (matching himalaya
-/// 1.2.0) those keys are a no-op and defer to the Date tie-break.
+/// Compares two fetched messages by a single sort key.
+///
+/// From/To/Cc/Display fall through to `Equal`: imap-types `Address`
+/// has no `Ord`, so (matching himalaya 1.2.0) those keys are a no-op
+/// and defer to the Date tie-break.
 fn cmp_fetch_items(
     key: &SortKey,
     a: &Vec1<MessageDataItem<'static>>,
@@ -430,9 +456,9 @@ fn cmp_fetch_items(
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
-    use super::*;
+    use crate::rfc5256::sort::*;
 
     fn arrival() -> Vec1<SortCriterion> {
         Vec1::try_from(vec![SortCriterion {
@@ -451,8 +477,6 @@ mod tests {
             .next()
             .expect("first whitespace-separated token")
     }
-
-    // --- server SORT ---
 
     #[test]
     fn sort_success_returns_ids() {
@@ -538,8 +562,6 @@ mod tests {
         assert_eq!(text, "no mailbox selected");
     }
 
-    // --- SEARCH + FETCH fallback ---
-
     #[test]
     fn fallback_searches_then_fetches_then_sorts() {
         let mut sort = ImapMessageSort::new(
@@ -552,7 +574,6 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        // 1. SEARCH command.
         let bytes = wants_write(&mut sort, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let search_tag = first_word(line).to_owned();
@@ -560,7 +581,6 @@ mod tests {
 
         wants_read(&mut sort, &mut frag, None);
 
-        // 2. SEARCH reply yields the FETCH command.
         let search_reply = format!("* SEARCH 1 2\r\n{search_tag} OK SEARCH completed\r\n");
         let bytes = wants_write(&mut sort, &mut frag, Some(search_reply.as_bytes()));
         let line = str::from_utf8(&bytes).expect("utf8 command");
@@ -571,8 +591,8 @@ mod tests {
 
         wants_read(&mut sort, &mut frag, None);
 
-        // 3. FETCH reply: UID 1 arrived later than UID 2, so arrival-ascending
-        //    sorts to [2, 1].
+        // NOTE: UID 1 arrived later than UID 2, so arrival-ascending
+        // sorts to [2, 1].
         let fetch_reply = format!(
             "* 1 FETCH (UID 1 INTERNALDATE \"02-Feb-2021 00:00:00 +0000\")\r\n\
              * 2 FETCH (UID 2 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\")\r\n\
@@ -637,8 +657,6 @@ mod tests {
         let ids = complete_ok(&mut sort, &mut frag, Some(search_reply.as_bytes()));
         assert!(ids.is_empty());
     }
-
-    // --- utils
 
     fn nz(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).expect("non-zero")

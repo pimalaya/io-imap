@@ -15,7 +15,7 @@
 //!     rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -58,7 +58,7 @@ use imap_codec::{
         utils::escape_byte_string,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::capability::*};
@@ -66,18 +66,24 @@ use crate::{coroutine::*, imap_try, rfc3501::capability::*};
 /// Failure causes while reading the IMAP greeting.
 #[derive(Clone, Debug, Error)]
 pub enum ImapGreetingGetError {
+    /// The server refused the connection with a BYE greeting.
     #[error("IMAP greeting failed: BYE {0}")]
     Bye(String),
-
+    /// The stream reached EOF before a complete greeting arrived.
     #[error("IMAP greeting failed: reached unexpected EOF on stream")]
     Eof,
+    /// The greeting line could not be decoded; carries the raw bytes.
     #[error("IMAP greeting failed: decode error")]
     DecodingFailure(Secret<Box<[u8]>>),
+    /// The `Fragmentizer` poisoned the message after a framing error;
+    /// carries the raw bytes.
     #[error("IMAP greeting failed: parse error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
+    /// The greeting exceeded the `Fragmentizer` size limit; carries the
+    /// raw bytes.
     #[error("IMAP greeting failed: parse error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
-
+    /// The follow-up CAPABILITY round-trip failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
 }
@@ -85,7 +91,11 @@ pub enum ImapGreetingGetError {
 /// Decoded greeting outcome.
 #[derive(Debug)]
 pub struct ImapGreetingOk {
+    /// Capabilities advertised in the greeting (or fetched right after,
+    /// see [`ImapGreetingGetOptions::ensure_capabilities`]).
     pub capability: Vec<Capability<'static>>,
+    /// Whether the greeting was `PREAUTH`: the session is already
+    /// authenticated and LOGIN must be skipped.
     pub pre_authenticated: bool,
 }
 
@@ -107,6 +117,8 @@ pub struct ImapGreetingGet {
 }
 
 impl ImapGreetingGet {
+    /// Builds a coroutine reading the server greeting; depending on
+    /// `opts`, it follows up with CAPABILITY when the greeting has none.
     pub fn new(opts: ImapGreetingGetOptions) -> Self {
         Self {
             codec: GreetingCodec::new(),
@@ -129,8 +141,6 @@ impl ImapCoroutine for ImapGreetingGet {
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("greeting: {}", self.state);
-
             if mem::take(&mut self.wants_read) {
                 return ImapCoroutineState::Yielded(ImapYield::WantsRead);
             }
@@ -171,7 +181,8 @@ impl ImapCoroutine for ImapGreetingGet {
                                 }
 
                                 if self.opts.ensure_capabilities && self.observed.is_empty() {
-                                    self.state = State::Capability(ImapCapabilityGet::new());
+                                    self.state = State::Capability(Box::default());
+                                    debug!("{}", self.state);
                                     continue;
                                 }
 
@@ -206,7 +217,7 @@ impl ImapCoroutine for ImapGreetingGet {
                     }
                 },
                 State::Capability(capability) => {
-                    let caps = imap_try!(capability, fragmentizer, arg.take());
+                    let caps = imap_try!(capability.as_mut(), fragmentizer, arg.take());
                     return ImapCoroutineState::Complete(Ok(ImapGreetingOk {
                         capability: caps,
                         pre_authenticated: self.pre_authenticated,
@@ -220,7 +231,7 @@ impl ImapCoroutine for ImapGreetingGet {
 enum State {
     Read,
     Deserialize,
-    Capability(ImapCapabilityGet),
+    Capability(Box<ImapCapabilityGet>),
 }
 
 impl fmt::Display for State {
@@ -237,7 +248,7 @@ impl fmt::Display for State {
 mod tests {
     use alloc::vec::Vec;
 
-    use super::*;
+    use crate::rfc3501::greeting::*;
 
     #[test]
     fn ok_with_inline_capability_returns_ok() {
@@ -255,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn ok_without_inline_capability_drives_extra_round_trip() {
+    fn ok_without_inline_capability_triggers_extra_round_trip() {
         let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions {
             ensure_capabilities: true,
         });
@@ -301,8 +312,6 @@ mod tests {
         let err = expect_complete_err(&mut greeting, &mut frag, b"");
         assert!(matches!(err, ImapGreetingGetError::Eof));
     }
-
-    // --- utils
 
     fn expect_wants_read(cor: &mut ImapGreetingGet, frag: &mut Fragmentizer) {
         match cor.resume(frag, None) {

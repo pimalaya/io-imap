@@ -9,6 +9,7 @@
 let
   inherit (pkgs)
     krb5
+    openssl
     pkg-config
     cargo-deny
     llvmPackages
@@ -34,6 +35,7 @@ shell.overrideAttrs (prev: {
 
   buildInputs = (prev.buildInputs or [ ]) ++ [
     krb5
+    openssl
     cargo-deny
   ];
 })

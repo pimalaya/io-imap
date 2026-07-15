@@ -1,6 +1,8 @@
-//! Base coroutine that all higher-level IMAP coroutines delegate to:
-//! serialises a command via `imap_codec`, drives read/write, and feeds
-//! responses back through the borrowed `Fragmentizer`.
+//! Base coroutine that all higher-level IMAP coroutines delegate to.
+//!
+//! Serialises a command via `imap_codec`, exchanges the bytes with the
+//! caller, and feeds responses back through the borrowed
+//! `Fragmentizer`.
 
 use core::mem;
 
@@ -18,37 +20,41 @@ use imap_codec::{
         utils::escape_byte_string,
     },
 };
-use log::{trace, warn};
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
 
-/// Failure causes raised by [`SendImapCommand`].
+/// Failure causes raised by [`ImapSend`].
 #[derive(Clone, Debug, Error)]
-pub enum SendImapCommandError {
+pub enum ImapSendError {
+    /// The stream reached EOF before the tagged response arrived.
     #[error("Reached unexpected EOF on IMAP stream")]
     Eof,
+    /// A response line could not be decoded; carries the raw bytes.
     #[error("Decode IMAP response error")]
     DecodingFailure(Secret<Box<[u8]>>),
+    /// The `Fragmentizer` poisoned the message after a framing error;
+    /// carries the raw bytes.
     #[error("Parse IMAP response error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
+    /// The response message exceeded the `Fragmentizer` size limit;
+    /// carries the raw bytes.
     #[error("Parse IMAP response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
 }
 
-/// Step output emitted by [`SendImapCommand::resume`].
-pub enum SendImapCommandResult<T: Encoder> {
-    Ok {
-        message: T::Message<'static>,
-        data: Vec<Data<'static>>,
-        untagged: Vec<StatusBody<'static>>,
-        tagged: Option<Tagged<'static>>,
-        bye: Option<Bye<'static>>,
-        continuation_request: Option<CommandContinuationRequest<'static>>,
-    },
+/// Step output emitted by [`ImapSend::resume`].
+pub enum ImapSendResult<T: Encoder> {
+    /// The exchange completed; carries the boxed output (boxed to keep
+    /// the enum small next to the I/O variants).
+    Ok(Box<ImapSendOutput<T>>),
+    /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
+    /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
-    Err(SendImapCommandError),
+    /// The exchange failed.
+    Err(ImapSendError),
 }
 
 #[derive(Debug)]
@@ -59,7 +65,7 @@ enum State {
 }
 
 /// I/O-free coroutine sending one IMAP command and parsing its response.
-pub struct SendImapCommand<T: Encoder> {
+pub struct ImapSend<T: Encoder> {
     message: Option<T::Message<'static>>,
     state: State,
     wants_read: bool,
@@ -75,7 +81,9 @@ pub struct SendImapCommand<T: Encoder> {
     done: bool,
 }
 
-impl<T: Encoder> SendImapCommand<T> {
+impl<T: Encoder> ImapSend<T> {
+    /// Builds a send serialising `message` through `encoder` and
+    /// parsing its response.
     pub fn new(encoder: T, message: T::Message<'static>) -> Self {
         let fragments = encoder.encode(&message).collect();
 
@@ -96,9 +104,11 @@ impl<T: Encoder> SendImapCommand<T> {
         }
     }
 
-    /// Receive-only: skips serialisation and parses the response of a request
-    /// whose bytes were written out of band (e.g. a streamed APPEND
-    /// literal). `message` is echoed back unchanged in the Ok variant.
+    /// Receive-only: skips serialisation and parses the response of a
+    /// request whose bytes were written out of band.
+    ///
+    /// Used by the streamed APPEND literal; `message` is echoed back
+    /// unchanged in the Ok output.
     pub fn receive(message: T::Message<'static>) -> Self {
         Self {
             message: Some(message),
@@ -123,14 +133,14 @@ impl<T: Encoder> SendImapCommand<T> {
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> SendImapCommandResult<T> {
+    ) -> ImapSendResult<T> {
         loop {
             if let Some(bytes) = self.wants_write.take() {
-                return SendImapCommandResult::WantsWrite(bytes);
+                return ImapSendResult::WantsWrite(bytes);
             }
 
             if mem::take(&mut self.wants_read) {
-                return SendImapCommandResult::WantsRead;
+                return ImapSendResult::WantsRead;
             }
 
             match self.state {
@@ -165,7 +175,7 @@ impl<T: Encoder> SendImapCommand<T> {
                 }
                 State::Read => match arg.take() {
                     Some(&[]) => {
-                        return SendImapCommandResult::Err(SendImapCommandError::Eof);
+                        return ImapSendResult::Err(ImapSendError::Eof);
                     }
                     Some(data) => {
                         trace!("read bytes: {}", escape_byte_string(data));
@@ -209,30 +219,31 @@ impl<T: Encoder> SendImapCommand<T> {
                                 let err = match decode_err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {
-                                        // Don't fail the whole command when an
-                                        // untagged response cannot be decoded:
+                                        // NOTE: do not fail the whole
+                                        // command when an untagged
+                                        // response cannot be decoded:
                                         // skip it with a warning
                                         // (pimalaya/himalaya#641).
                                         if bytes.starts_with(b"* ") {
-                                            let b = escape_byte_string(bytes);
-                                            warn!("skipping undecodable untagged response: {b}");
+                                            debug!("skipping undecodable untagged response");
+                                            trace!("{}", escape_byte_string(bytes));
                                             continue;
                                         }
 
                                         let err = Secret::new(bytes.into());
-                                        SendImapCommandError::DecodingFailure(err)
+                                        ImapSendError::DecodingFailure(err)
                                     }
                                     DecodeMessageError::MessageTooLong { .. } => {
                                         let err = Secret::new(bytes.into());
-                                        SendImapCommandError::MessageTooLong(err)
+                                        ImapSendError::MessageTooLong(err)
                                     }
                                     DecodeMessageError::MessagePoisoned { .. } => {
                                         let err = Secret::new(bytes.into());
-                                        SendImapCommandError::MessageIsPoisoned(err)
+                                        ImapSendError::MessageIsPoisoned(err)
                                     }
                                 };
 
-                                return SendImapCommandResult::Err(err);
+                                return ImapSendResult::Err(err);
                             }
                         }
                     }
@@ -241,15 +252,15 @@ impl<T: Encoder> SendImapCommand<T> {
                         trace!("read literal fragment ({} bytes)", bytes.len());
                     }
                     None if self.done => {
-                        // SAFETY: message always exists during a resume cycle
-                        return SendImapCommandResult::Ok {
+                        // NOTE: message always exists during a resume cycle.
+                        return ImapSendResult::Ok(Box::new(ImapSendOutput {
                             message: self.message.take().unwrap(),
                             data: mem::take(&mut self.data),
                             untagged: mem::take(&mut self.untagged),
                             tagged: self.tagged.take(),
                             bye: self.bye.take(),
                             continuation_request: self.cr.take(),
-                        };
+                        }));
                     }
                     None if self.limbo_literal.is_some() => {
                         self.state = State::Serialize;
@@ -263,20 +274,28 @@ impl<T: Encoder> SendImapCommand<T> {
     }
 }
 
-/// Trait-surface successful output: mirror of [`SendImapCommandResult::Ok`].
+/// Successful output of one command exchange: the echoed message plus
+/// everything the server answered before the tagged response.
 #[derive(Debug)]
-pub struct SendImapCommandOk<T: Encoder> {
+pub struct ImapSendOutput<T: Encoder> {
+    /// The sent message, echoed back to the caller.
     pub message: T::Message<'static>,
+    /// The untagged data responses collected during the exchange.
     pub data: Vec<Data<'static>>,
+    /// The untagged status responses collected during the exchange.
     pub untagged: Vec<StatusBody<'static>>,
+    /// The tagged response terminating the exchange, when one arrived.
     pub tagged: Option<Tagged<'static>>,
+    /// The BYE response, when the server closed the session instead.
     pub bye: Option<Bye<'static>>,
+    /// The continuation request that paused the exchange, when the
+    /// server asked for more data.
     pub continuation_request: Option<CommandContinuationRequest<'static>>,
 }
 
-impl<T: Encoder> ImapCoroutine for SendImapCommand<T> {
+impl<T: Encoder> ImapCoroutine for ImapSend<T> {
     type Yield = ImapYield;
-    type Return = Result<SendImapCommandOk<T>, SendImapCommandError>;
+    type Return = Result<ImapSendOutput<T>, ImapSendError>;
 
     fn resume(
         &mut self,
@@ -284,27 +303,13 @@ impl<T: Encoder> ImapCoroutine for SendImapCommand<T> {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         // NOTE: qualified path avoids recursing into this trait impl.
-        match SendImapCommand::<T>::resume(self, fragmentizer, arg) {
-            SendImapCommandResult::WantsRead => ImapCoroutineState::Yielded(ImapYield::WantsRead),
-            SendImapCommandResult::WantsWrite(bytes) => {
+        match ImapSend::<T>::resume(self, fragmentizer, arg) {
+            ImapSendResult::WantsRead => ImapCoroutineState::Yielded(ImapYield::WantsRead),
+            ImapSendResult::WantsWrite(bytes) => {
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes))
             }
-            SendImapCommandResult::Ok {
-                message,
-                data,
-                untagged,
-                tagged,
-                bye,
-                continuation_request,
-            } => ImapCoroutineState::Complete(Ok(SendImapCommandOk {
-                message,
-                data,
-                untagged,
-                tagged,
-                bye,
-                continuation_request,
-            })),
-            SendImapCommandResult::Err(err) => ImapCoroutineState::Complete(Err(err)),
+            ImapSendResult::Ok(output) => ImapCoroutineState::Complete(Ok(*output)),
+            ImapSendResult::Err(err) => ImapCoroutineState::Complete(Err(err)),
         }
     }
 }

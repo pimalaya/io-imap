@@ -14,7 +14,7 @@
 //!     rfc3691::unselect::ImapMailboxUnselect,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -59,18 +59,21 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP UNSELECT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxUnselectError {
+    /// The server rejected the UNSELECT command with a NO response.
     #[error("IMAP UNSELECT failed: NO {0}")]
     No(String),
+    /// The server rejected the UNSELECT command with a BAD response.
     #[error("IMAP UNSELECT failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with a BYE response.
     #[error("IMAP UNSELECT failed: BYE {0}")]
     Bye(String),
-
+    /// The server never answered with a tagged response.
     #[error("IMAP UNSELECT failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send sub-coroutine failed.
     #[error("IMAP UNSELECT failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP UNSELECT coroutine.
@@ -79,6 +82,8 @@ pub struct ImapMailboxUnselect {
 }
 
 impl ImapMailboxUnselect {
+    /// Creates a coroutine that UNSELECTs the current mailbox without
+    /// expunging its \Deleted messages.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -87,7 +92,7 @@ impl ImapMailboxUnselect {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -108,34 +113,30 @@ impl ImapCoroutine for ImapMailboxUnselect {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("unselect: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxUnselectError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxUnselectError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxUnselectError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                    StatusKind::No => {
+                        let err = ImapMailboxUnselectError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxUnselectError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-                        StatusKind::No => {
-                            let err = ImapMailboxUnselectError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxUnselectError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxUnselectError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -143,7 +144,7 @@ impl ImapCoroutine for ImapMailboxUnselect {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -158,9 +159,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3691::unselect::*;
 
     #[test]
     fn success_returns_ok() {
@@ -228,8 +229,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxUnselect,

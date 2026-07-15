@@ -1,3 +1,6 @@
+//! Live end-to-end test against a real Fastmail account; ignored by
+//! default, needs credentials in the environment.
+
 mod common;
 
 use std::env;

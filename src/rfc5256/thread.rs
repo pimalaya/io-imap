@@ -15,7 +15,7 @@
 //!     types::{extensions::thread::ThreadingAlgorithm, search::SearchKey},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -24,7 +24,8 @@
 //! let algorithm = ThreadingAlgorithm::OrderedSubject;
 //! let search_criteria = Vec1::try_from(vec![SearchKey::All]).unwrap();
 //! let opts = ImapMessageThreadOptions::default();
-//! let mut coroutine = ImapMessageThread::new(algorithm, search_criteria, opts);
+//! let mut coroutine =
+//!     ImapMessageThread::new(algorithm, search_criteria, opts);
 //! let mut arg = None;
 //!
 //! let threads = loop {
@@ -67,20 +68,24 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP THREAD flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageThreadError {
+    /// The server rejected the THREAD command with a NO response.
     #[error("IMAP THREAD failed: NO {0}")]
     No(String),
+    /// The server rejected the THREAD command with a BAD response.
     #[error("IMAP THREAD failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with a BYE response.
     #[error("IMAP THREAD failed: BYE {0}")]
     Bye(String),
-
+    /// The server never answered with a tagged response.
     #[error("IMAP THREAD failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server returned OK without any THREAD data.
     #[error("IMAP THREAD failed: server did not return any data")]
     MissingData,
-
+    /// The underlying send sub-coroutine failed.
     #[error("IMAP THREAD failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options for [`ImapMessageThread::new`].
@@ -96,6 +101,8 @@ pub struct ImapMessageThread {
 }
 
 impl ImapMessageThread {
+    /// Creates a coroutine that THREADs the messages matching
+    /// `search_criteria` with `algorithm` and returns the thread tree.
     pub fn new(
         algorithm: ThreadingAlgorithm<'static>,
         search_criteria: Vec1<SearchKey<'static>>,
@@ -113,7 +120,7 @@ impl ImapMessageThread {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -128,46 +135,42 @@ impl ImapCoroutine for ImapMessageThread {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("thread: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageThreadError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageThreadError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageThreadError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut threads = None;
+                for data in out.data {
+                    if let Data::Thread(t) = data {
+                        threads = Some(t);
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageThreadError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut threads = None;
-                    for data in out.data {
-                        if let Data::Thread(t) = data {
-                            threads = Some(t);
+                match body.kind {
+                    StatusKind::Ok => match threads {
+                        Some(threads) => ImapCoroutineState::Complete(Ok(threads)),
+                        None => {
+                            ImapCoroutineState::Complete(Err(ImapMessageThreadError::MissingData))
                         }
+                    },
+                    StatusKind::No => {
+                        let err = ImapMessageThreadError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => match threads {
-                            Some(threads) => ImapCoroutineState::Complete(Ok(threads)),
-                            None => ImapCoroutineState::Complete(Err(
-                                ImapMessageThreadError::MissingData,
-                            )),
-                        },
-                        StatusKind::No => {
-                            let err = ImapMessageThreadError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageThreadError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMessageThreadError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -175,7 +178,7 @@ impl ImapCoroutine for ImapMessageThread {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -190,9 +193,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
-    use super::*;
+    use crate::rfc5256::thread::*;
 
     fn algorithm() -> ThreadingAlgorithm<'static> {
         ThreadingAlgorithm::OrderedSubject
@@ -282,8 +285,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageThread,

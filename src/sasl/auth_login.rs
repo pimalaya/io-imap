@@ -18,7 +18,7 @@
 //!     sasl::auth_login::{ImapAuthLogin, ImapAuthLoginOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -63,7 +63,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -71,30 +71,38 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Failure causes during the SASL LOGIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthLoginError {
+    /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE LOGIN failed: NO {0}")]
     No(String),
+    /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE LOGIN failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE LOGIN failed: BYE {0}")]
     Bye(String),
-
+    /// The server never returned the final tagged response.
     #[error("IMAP AUTHENTICATE LOGIN failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server never sent the expected continuation request.
     #[error(
         "IMAP AUTHENTICATE LOGIN failed: server did not send the expected continuation request"
     )]
     ExpectedContinuationRequest,
+    /// The server sent a continuation request after the exchange ended.
     #[error("IMAP AUTHENTICATE LOGIN failed: server sent an unexpected continuation request")]
     UnexpectedContinuationRequest,
+    /// The server returned OK before the mechanism could complete.
     #[error(
         "IMAP AUTHENTICATE LOGIN failed: server returned OK before the mechanism could complete"
     )]
     UnexpectedOk,
-
+    /// The underlying send coroutine failed.
     #[error("IMAP AUTHENTICATE LOGIN failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
+    /// The follow-up CAPABILITY command failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+    /// The follow-up ID command failed.
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
 }
@@ -105,7 +113,13 @@ pub struct ImapAuthLoginOptions {
     /// `true` selects SASL-IR (RFC 4959, inline username);
     /// `false` selects the non-IR two-prompt flow.
     pub initial_request: bool,
+    /// Fetch CAPABILITY after authentication when the tagged response
+    /// carries no capability data. Defaults to `false`.
     pub ensure_capabilities: bool,
+    /// Chain an RFC 2971 ID round-trip right after authentication, as
+    /// required by some providers.
+    ///
+    /// Defaults to `None` (no ID); an empty list sends ID NIL.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
@@ -118,6 +132,12 @@ pub struct ImapAuthLogin {
 }
 
 impl ImapAuthLogin {
+    /// Builds a SASL LOGIN coroutine authenticating `user` with
+    /// `password`.
+    ///
+    /// Depending on `opts.initial_request`, the username goes inline
+    /// with the AUTHENTICATE command (SASL-IR) or is uploaded after
+    /// the first server prompt; the password always follows a prompt.
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -134,7 +154,7 @@ impl ImapAuthLogin {
             };
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
-            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
+            State::SendIr(ImapSend::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::Login,
@@ -143,7 +163,7 @@ impl ImapAuthLogin {
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
             State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), cmd),
+                send: ImapSend::new(CommandCodec::new(), cmd),
                 user: user.to_string(),
             }
         };
@@ -200,7 +220,7 @@ impl ImapAuthLogin {
         let password = mem::take(&mut self.password).into_bytes();
         let auth = AuthenticateData::r#continue(password);
         let codec = AuthenticateDataCodec::new();
-        State::ContinuePassword(SendImapCommand::new(codec, auth))
+        State::ContinuePassword(ImapSend::new(codec, auth))
     }
 }
 
@@ -214,7 +234,6 @@ impl ImapCoroutine for ImapAuthLogin {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("auth LOGIN: {}", self.state);
             match &mut self.state {
                 State::Send { send, user } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -228,7 +247,8 @@ impl ImapCoroutine for ImapAuthLogin {
                         let user = mem::take(user).into_bytes();
                         let auth = AuthenticateData::r#continue(user);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::ContinueUsername(SendImapCommand::new(codec, auth));
+                        self.state = State::ContinueUsername(ImapSend::new(codec, auth));
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -255,6 +275,7 @@ impl ImapCoroutine for ImapAuthLogin {
 
                     if out.continuation_request.is_some() {
                         self.state = self.next_continue_password();
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -281,6 +302,7 @@ impl ImapCoroutine for ImapAuthLogin {
 
                     if out.continuation_request.is_some() {
                         self.state = self.next_continue_password();
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -329,11 +351,13 @@ impl ImapCoroutine for ImapAuthLogin {
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -345,6 +369,7 @@ impl ImapCoroutine for ImapAuthLogin {
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -363,12 +388,12 @@ impl ImapCoroutine for ImapAuthLogin {
 
 enum State {
     Send {
-        send: SendImapCommand<CommandCodec>,
+        send: ImapSend<CommandCodec>,
         user: String,
     },
-    SendIr(SendImapCommand<CommandCodec>),
-    ContinueUsername(SendImapCommand<AuthenticateDataCodec>),
-    ContinuePassword(SendImapCommand<AuthenticateDataCodec>),
+    SendIr(ImapSend<CommandCodec>),
+    ContinueUsername(ImapSend<AuthenticateDataCodec>),
+    ContinuePassword(ImapSend<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -390,7 +415,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use super::*;
+    use alloc::format;
+
+    use crate::sasl::auth_login::*;
 
     #[test]
     fn ir_success_returns_ok() {
@@ -409,7 +436,7 @@ mod tests {
 
         expect_wants_read(&mut auth, &mut frag);
 
-        // "Password:" base64 = "UGFzc3dvcmQ6".
+        // NOTE: "Password:" base64 = "UGFzc3dvcmQ6".
         let pass = expect_wants_write(&mut auth, &mut frag, Some(b"+ UGFzc3dvcmQ6\r\n"));
         assert!(pass.ends_with(b"\r\n"));
 
@@ -480,13 +507,13 @@ mod tests {
 
         expect_wants_read(&mut auth, &mut frag);
 
-        // "Username:" base64 = "VXNlcm5hbWU6".
+        // NOTE: "Username:" base64 = "VXNlcm5hbWU6".
         let user = expect_wants_write(&mut auth, &mut frag, Some(b"+ VXNlcm5hbWU6\r\n"));
         assert!(user.ends_with(b"\r\n"));
 
         expect_wants_read(&mut auth, &mut frag);
 
-        // "Password:" base64 = "UGFzc3dvcmQ6".
+        // NOTE: "Password:" base64 = "UGFzc3dvcmQ6".
         let pass = expect_wants_write(&mut auth, &mut frag, Some(b"+ UGFzc3dvcmQ6\r\n"));
         assert!(pass.ends_with(b"\r\n"));
 
@@ -518,8 +545,6 @@ mod tests {
         };
         assert_eq!(text, "authentication failed");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapAuthLogin,

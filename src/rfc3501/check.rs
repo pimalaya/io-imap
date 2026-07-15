@@ -14,7 +14,7 @@
 //!     rfc3501::check::ImapMailboxCheck,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -59,18 +59,21 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP CHECK flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxCheckError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP CHECK failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP CHECK failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP CHECK failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP CHECK failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP CHECK failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP CHECK coroutine.
@@ -79,6 +82,8 @@ pub struct ImapMailboxCheck {
 }
 
 impl ImapMailboxCheck {
+    /// Builds a CHECK coroutine requesting a checkpoint of the selected
+    /// mailbox.
     pub fn new() -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -87,7 +92,7 @@ impl ImapMailboxCheck {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -108,34 +113,30 @@ impl ImapCoroutine for ImapMailboxCheck {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("check: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxCheckError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxCheckError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxCheckError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                    StatusKind::No => {
+                        let err = ImapMailboxCheckError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxCheckError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-                        StatusKind::No => {
-                            let err = ImapMailboxCheckError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxCheckError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxCheckError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -143,7 +144,7 @@ impl ImapCoroutine for ImapMailboxCheck {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -158,9 +159,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::check::*;
 
     #[test]
     fn success_returns_ok() {
@@ -228,8 +229,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxCheck,

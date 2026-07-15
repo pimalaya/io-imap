@@ -2,42 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
 ### Added
 
-- Added IMAP SORT with a client-side fallback via `ImapMessageSortWithFallback` and `ImapClientStd::sort_with_fallback`.
+- Added a client-side fallback to IMAP SORT via the `fallback` flag on `ImapMessageSortOptions`.
 
-  Composite coroutine gated on a `fallback: bool` flag (fed by the consumer from a SORT capability check, or by choice). With `fallback == false` it drives a plain server SORT; with `fallback == true` it SEARCHes the candidates, FETCHes the sort keys (chunked at 255), and sorts locally, returning the same `Vec<NonZeroU32>` either way. The local sort ports himalaya 1.2.0's semantics: Arrival/Date/Size/Subject are honoured; From/To/Cc/Display defer to the Date tie-break (imap-types `Address` has no `Ord`).
+  The flag is fed by the consumer from a SORT capability check, or by choice. With `fallback == false` the coroutine runs a plain server SORT; with `fallback == true` it SEARCHes the candidates, FETCHes the sort keys (chunked at 255), and sorts locally, returning the same `Vec<NonZeroU32>` either way. The local sort ports himalaya 1.2.0's semantics: Arrival/Date/Size/Subject are honoured; From/To/Cc/Display defer to the Date tie-break (imap-types `Address` has no `Ord`).
 
 - Added streaming IMAP FETCH body via `ImapMessageFetchStream` and `ImapClientStd::fetch_body_stream`.
 
-  Fetches one message body (single sequence number or UID, `BODY.PEEK[]` only) and streams it straight into a caller `Write` sink instead of buffering it whole. The body literal bypasses the `Fragmentizer`: the coroutine feeds it the framing lines one at a time, hands the announced octets to the driver via `ImapMessageFetchStreamYield::BodyChunk` / `WantsStream`, then resumes line parsing for the tagged response. A socket short of the declared length surfaces `ImapMessageFetchStreamError::ShortBody`; a missing id completes with an empty sink.
+  Fetches one message body (single sequence number or UID, `BODY.PEEK[]` only) and streams it straight into a caller `Write` sink instead of buffering it whole. The body literal bypasses the `Fragmentizer`: the coroutine feeds it the framing lines one at a time, hands the announced octets to the caller via `ImapMessageFetchStreamYield::BodyChunk` / `WantsStream`, then resumes line parsing for the tagged response. A socket short of the declared length surfaces `ImapMessageFetchStreamError::ShortBody`; a missing id completes with an empty sink.
 
 - Added streaming IMAP APPEND via `ImapMessageAppendStream` and `ImapClientStd::append_stream`.
 
-  Separate coroutine (own `ImapMessageAppendStreamYield`) that yields `WantsStream` at the literal boundary so the driver pumps the declared message octets straight from its own source to the socket; the body never lands in memory whole. `append_stream(mailbox, source, len, opts)` takes any `Read` source plus its exact octet count (IMAP declares it up front). A short source poisons the connection and surfaces `ImapMessageAppendStreamError::ShortMessage`.
+  Separate coroutine (own `ImapMessageAppendStreamYield`) that yields `WantsStream` at the literal boundary so the caller pumps the declared message octets straight from its own source to the socket; the body never lands in memory whole. `append_stream(mailbox, source, len, opts)` takes any `Read` source plus its exact octet count (IMAP declares it up front). A short source poisons the connection and surfaces `ImapMessageAppendStreamError::ShortMessage`.
 
 - Added the `non_sync` option on `ImapMessageAppendOptions`.
 
   Sends a non-synchronising literal (`{N+}`) and streams the body without waiting for the server continuation (requires LITERAL+ / LITERAL-). Defaults to a synchronising `{N}` literal so the server can still reject before the body is sent.
 
-- Added `SendImapCommand::receive`.
+- Added `ImapSend::receive`.
 
   Receive-only constructor that parses a response whose request bytes were written out of band; reused by the streamed APPEND literal.
 
 ### Changed
 
-- Reworked the `ImapClientStd` methods to forward the coroutine options struct directly instead of unpacking individual flags. `id`, `select`, `examine`, `fetch`, `search`, `store`, `copy`, `move`, `thread`, `sort` and `sort_with_fallback` now take their respective `Imap*Options` as the last argument (e.g. `fetch(sequence_set, items, opts)`, `select(mailbox, opts)`) and pass it straight through. Each is now a one-line forward.
+- Bumped pimalaya-stream to 0.1.
+- Changed coroutine logging to the shared Pimalaya convention.
+
+  The per-resume state trace is gone; coroutines now emit a `debug` with a short phrase when their state changes, usually followed by a `trace` carrying the data.
+
+- Reworked the `ImapClientStd` methods to forward the coroutine options struct directly instead of unpacking individual flags. `id`, `select`, `examine`, `fetch`, `search`, `store`, `copy`, `move`, `thread` and `sort` now take their respective `Imap*Options` as the last argument (e.g. `fetch(sequence_set, items, opts)`, `select(mailbox, opts)`) and pass it straight through. Each is now a one-line forward.
+
+- Renamed the send primitive types to follow the crate naming scheme: `SendImapCommand` is now `ImapSend`, `SendImapCommandOk` is now `ImapSendOutput`, `SendImapCommandError` is now `ImapSendError` and `SendImapCommandResult` is now `ImapSendResult`. `ImapSendResult::Ok` now carries a boxed `ImapSendOutput` instead of mirroring its fields inline.
+
+- Renamed the SELECT data types to follow the crate naming scheme: `SelectData` is now `ImapMailboxSelectData` and `SelectFetch` is now `ImapMailboxSelectFetch`.
 
 - Renamed `ImapMailboxSort` to `ImapMessageSort` (and `ImapMailboxSortOptions`/`ImapMailboxSortError` to `ImapMessageSort*`) for consistency with the sibling `ImapMessageThread`. The `ImapClientStd::sort` method name is unchanged; the error variant is now `ImapClientStdError::MessageSort`.
 
 - Changed the buffered `ImapMessageAppend` API.
 
-  `ImapMessageAppend::new(mailbox, message, opts)` now takes the message as `Vec<u8>` instead of a `LiteralOrLiteral8`; it still yields the shared `ImapYield` and is drivable by `ImapClientStd::run`. `ImapClientStd::append(mailbox, message, opts)` takes the message as `&[u8]`. Both APPEND coroutines share `ImapMessageAppendOptions` (now carrying `flags` / `date` / `non_sync`).
+  `ImapMessageAppend::new(mailbox, message, opts)` now takes the message as `Vec<u8>` instead of a `LiteralOrLiteral8`; it still yields the shared `ImapYield` and runs under `ImapClientStd::run`. `ImapClientStd::append(mailbox, message, opts)` takes the message as `&[u8]`. Both APPEND coroutines share `ImapMessageAppendOptions` (now carrying `flags` / `date` / `non_sync`).
 
 ## [0.1.0] - 2026-06-03
 
@@ -69,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added I/O-free IMAP APPENDUID-only coroutine following RFC 4315 (UIDPLUS).
 
-  Lighter than `ImapMessageAppend`; drops the EXISTS count and surfaces only the `NonZeroU32` APPENDUID pair.
+  Lighter than `ImapMessageAppend`; skips the EXISTS count and surfaces only the `NonZeroU32` APPENDUID pair.
 
 - Added I/O-free IMAP ENABLE coroutine following RFC 5161.
 
@@ -107,11 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `ImapClientStd::watch_mailbox(self, mailbox, capability) -> ImapMailboxWatchStream`.
 
-  Consumes the client, spawns a worker thread that drives `ImapMailboxWatch` over the socket, exposes events on a bounded mpsc channel. `close()` flips the shared shutdown atomic and joins the worker cleanly.
+  Consumes the client, spawns a worker thread that runs `ImapMailboxWatch` over the socket, exposes events on a bounded mpsc channel. `close()` flips the shared shutdown atomic and joins the worker cleanly.
 
 - Added the `rustls-ring` cargo feature (default) enabling `ImapClientStd::connect(url, tls, starttls, sasl, auto_id)`.
 
-  Opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream) with rustls + ring crypto provider, drives optional STARTTLS upgrade, reads greeting and capability, runs the chosen SASL mechanism, returns an authenticated client.
+  Opens `imap://` (plain TCP) or `imaps://` (implicit TLS) via [pimalaya/stream](https://github.com/pimalaya/stream) with rustls + ring crypto provider, performs the optional STARTTLS upgrade, reads greeting and capability, runs the chosen SASL mechanism, returns an authenticated client.
 
 - Added the `rustls-aws` cargo feature.
 

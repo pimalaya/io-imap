@@ -14,7 +14,7 @@
 //!     rfc3501::copy::{ImapMessageCopy, ImapMessageCopyOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -70,18 +70,21 @@ pub type ImapCopyUid = Option<(u32, Vec<u32>, Vec<u32>)>;
 /// Failure causes during the IMAP COPY flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageCopyError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP COPY failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP COPY failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP COPY failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP COPY failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP COPY failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options for [`ImapMessageCopy::new`].
@@ -97,6 +100,8 @@ pub struct ImapMessageCopy {
 }
 
 impl ImapMessageCopy {
+    /// Builds a COPY coroutine copying the `sequence_set` messages to
+    /// `mailbox`.
     pub fn new(
         sequence_set: SequenceSet,
         mut mailbox: Mailbox<'static>,
@@ -115,7 +120,7 @@ impl ImapMessageCopy {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -130,50 +135,46 @@ impl ImapCoroutine for ImapMessageCopy {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("copy: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageCopyError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageCopyError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageCopyError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                match body.kind {
+                    StatusKind::Ok => {
+                        let copyuid = if let Some(Code::CopyUid {
+                            uid_validity,
+                            source,
+                            destination,
+                        }) = body.code
+                        {
+                            Some((
+                                uid_validity.get(),
+                                uid_set_to_vec(source),
+                                uid_set_to_vec(destination),
+                            ))
+                        } else {
+                            None
+                        };
+                        ImapCoroutineState::Complete(Ok(copyuid))
                     }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageCopyError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    return match body.kind {
-                        StatusKind::Ok => {
-                            let copyuid = if let Some(Code::CopyUid {
-                                uid_validity,
-                                source,
-                                destination,
-                            }) = body.code
-                            {
-                                Some((
-                                    uid_validity.get(),
-                                    uid_set_to_vec(source),
-                                    uid_set_to_vec(destination),
-                                ))
-                            } else {
-                                None
-                            };
-                            ImapCoroutineState::Complete(Ok(copyuid))
-                        }
-                        StatusKind::No => {
-                            let err = ImapMessageCopyError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageCopyError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::No => {
+                        let err = ImapMessageCopyError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
+                    StatusKind::Bad => {
+                        let err = ImapMessageCopyError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -181,7 +182,7 @@ impl ImapCoroutine for ImapMessageCopy {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -220,9 +221,9 @@ pub(crate) fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format, vec};
 
-    use super::*;
+    use crate::rfc3501::copy::*;
 
     #[test]
     fn success_with_copyuid_returns_uids() {
@@ -322,8 +323,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageCopy,

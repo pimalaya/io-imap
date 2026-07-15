@@ -17,7 +17,7 @@
 #        - x:Account/set    create test user with strong password
 #        - x:NetworkListener/set update the default IMAPS listener to
 #          plain (useTls = false, tlsImplicit = false) so the test can
-#          drive it without TLS
+#          talk to it without TLS
 #        - x:Imap/set       set allowPlainTextAuth = true
 #        - x:Action/set     trigger ReloadSettings
 #   5. Restart the container so the now-plain listener rebinds. The

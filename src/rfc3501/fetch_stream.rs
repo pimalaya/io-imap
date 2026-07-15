@@ -4,7 +4,7 @@
 //! Targets a single sequence number or UID and requests `BODY.PEEK[]` only
 //! (peek so syncing does not set `\Seen`). The body literal bypasses the
 //! [`Fragmentizer`] entirely: the coroutine feeds it the framing lines one
-//! at a time, hands the announced octets to the driver via
+//! at a time, hands the announced octets to the caller via
 //! [`ImapMessageFetchStreamYield::BodyChunk`] /
 //! [`ImapMessageFetchStreamYield::WantsStream`], then resumes line parsing
 //! for the tagged response.
@@ -21,10 +21,12 @@
 //! use io_imap::{
 //!     codec::fragmentizer::Fragmentizer,
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
-//!     rfc3501::fetch_stream::{ImapMessageFetchStream, ImapMessageFetchStreamYield},
+//!     rfc3501::fetch_stream::{
+//!         ImapMessageFetchStream, ImapMessageFetchStreamYield,
+//!     },
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -37,18 +39,27 @@
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
-//!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(bytes)) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageFetchStreamYield::WantsWrite(bytes),
+//!         ) => {
 //!             stream.write_all(&bytes).unwrap();
 //!         }
-//!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageFetchStreamYield::WantsRead,
+//!         ) => {
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::BodyChunk(bytes)) => {
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageFetchStreamYield::BodyChunk(bytes),
+//!         ) => {
 //!             sink.write_all(&bytes).unwrap();
 //!         }
-//!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
-//!             io::copy(&mut (&mut stream).take(len as u64), &mut sink).unwrap();
+//!         ImapCoroutineState::Yielded(
+//!             ImapMessageFetchStreamYield::WantsStream { len },
+//!         ) => {
+//!             let mut body = (&mut stream).take(len as u64);
+//!             io::copy(&mut body, &mut sink).unwrap();
 //!         }
 //!         ImapCoroutineState::Complete(Ok(())) => break,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
@@ -74,7 +85,7 @@ use imap_codec::{
         sequence::{SeqOrUid, SequenceSet},
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::coroutine::*;
@@ -82,17 +93,24 @@ use crate::coroutine::*;
 /// Failure causes during the IMAP FETCH body-stream flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageFetchStreamError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP FETCH failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP FETCH failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP FETCH failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP FETCH failed: server did not return a tagged response")]
     MissingTagged,
+    /// The socket reached EOF before the declared body octets were all
+    /// streamed.
     #[error("IMAP FETCH failed: stream ended before the declared body length")]
     ShortBody,
+    /// A literal announcement appeared in the response trailer, where
+    /// only plain lines are expected.
     #[error("IMAP FETCH failed: unexpected literal in response trailer")]
     UnexpectedLiteral,
 }
@@ -100,14 +118,17 @@ pub enum ImapMessageFetchStreamError {
 /// Yield variants from the FETCH body-stream coroutine.
 #[derive(Debug)]
 pub enum ImapMessageFetchStreamYield {
+    /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
+    /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
     /// Body octets the coroutine already read past the header line; the
-    /// driver writes them to its sink.
+    /// caller writes them to its sink.
     BodyChunk(Vec<u8>),
     /// Read exactly `len` octets off the socket straight into the sink;
     /// resume with `None` on success or `Some(&[])` if the socket ran short.
     WantsStream {
+        /// Number of body octets left to stream.
         len: u32,
     },
 }
@@ -123,6 +144,8 @@ pub struct ImapMessageFetchStream {
 }
 
 impl ImapMessageFetchStream {
+    /// Builds a FETCH coroutine streaming the `BODY.PEEK[]` of message
+    /// `id`; when `uid` is `true`, sends `UID FETCH`.
     pub fn new(id: NonZeroU32, uid: bool) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
@@ -165,12 +188,11 @@ impl ImapCoroutine for ImapMessageFetchStream {
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("fetch stream: {}", self.state);
-
             match self.state {
                 State::SendCommand => {
                     let command = self.command.take().expect("command sent once");
                     self.state = State::Header;
+                    debug!("{}", self.state);
                     return ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(
                         command,
                     ));
@@ -195,19 +217,20 @@ impl ImapCoroutine for ImapMessageFetchStream {
                         fragmentizer.enqueue_bytes(&line);
 
                         match fragmentizer.progress() {
-                            // The FETCH line announces the body literal: take
-                            // its length and stream the body next.
+                            // NOTE: the FETCH line announces the body literal:
+                            // take its length and stream the body next.
                             Some(FragmentInfo::Line {
                                 announcement: Some(announcement),
                                 ..
                             }) => {
                                 self.remaining = announcement.length;
                                 self.state = State::Stream;
+                                debug!("{}", self.state);
                                 break;
                             }
-                            // A complete line without literal: a tagged status
-                            // (FETCH of a missing id returns OK with no body),
-                            // a BYE, or an untagged response we ignore.
+                            // NOTE: a complete line without literal: a tagged
+                            // status (FETCH of a missing id returns OK with no
+                            // body), a BYE, or an untagged response we ignore.
                             Some(FragmentInfo::Line {
                                 announcement: None, ..
                             }) => {
@@ -221,10 +244,11 @@ impl ImapCoroutine for ImapMessageFetchStream {
                 }
                 State::Stream => {
                     if self.remaining == 0 {
-                        // Drop the bypassed literal and resume line parsing
-                        // for the response trailer.
+                        // NOTE: drop the bypassed literal and resume line
+                        // parsing for the response trailer.
                         fragmentizer.skip_message();
                         self.state = State::Trailer;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -279,9 +303,9 @@ impl ImapCoroutine for ImapMessageFetchStream {
                                 let err = ImapMessageFetchStreamError::UnexpectedLiteral;
                                 return ImapCoroutineState::Complete(Err(err));
                             }
-                            // The literal close `)` and any other untagged
-                            // line are skipped; only the tagged status and BYE
-                            // terminate.
+                            // NOTE: the literal close `)` and any other
+                            // untagged line are skipped; only the tagged
+                            // status and BYE terminate.
                             Some(FragmentInfo::Line {
                                 announcement: None, ..
                             }) => {
@@ -299,10 +323,11 @@ impl ImapCoroutine for ImapMessageFetchStream {
 }
 
 impl ImapMessageFetchStream {
-    /// Decodes the completed message in `fragmentizer`. Returns `Some` for a
-    /// terminal tagged status or BYE; `None` for undecodable or untagged
-    /// lines that should be skipped (the literal close `)`, stray untagged
-    /// data).
+    /// Decodes the completed message in `fragmentizer`.
+    ///
+    /// Returns `Some` for a terminal tagged status or BYE; `None` for
+    /// undecodable or untagged lines that should be skipped (the literal
+    /// close `)`, stray untagged data).
     fn decode_terminal(
         &self,
         fragmentizer: &Fragmentizer,
@@ -351,9 +376,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc3501::fetch_stream::*;
 
     #[test]
     fn streams_body_in_one_read() {
@@ -367,12 +392,13 @@ mod tests {
 
         expect_wants_read(&mut cor, &mut frag, None);
 
-        // Header + whole body + trailer arrive together.
+        // NOTE: header, whole body and trailer arrive together.
         let reply = format!("* 1 FETCH (BODY[] {{5}}\r\nhello)\r\n{tag} OK FETCH completed\r\n");
         let chunk = expect_body_chunk(&mut cor, &mut frag, Some(reply.as_bytes()));
         assert_eq!(chunk, b"hello");
 
-        // No socket bytes left to stream; the trailer completes from pending.
+        // NOTE: no socket bytes left to stream; the trailer completes
+        // from pending.
         expect_complete_ok(&mut cor, &mut frag, None);
     }
 
@@ -389,11 +415,12 @@ mod tests {
 
         expect_wants_read(&mut cor, &mut frag, None);
 
-        // Only the header line arrives: the body must be streamed.
+        // NOTE: only the header line arrives: the body must be streamed.
         let len = expect_wants_stream(&mut cor, &mut frag, Some(b"* 9 FETCH (BODY[] {12}\r\n"));
         assert_eq!(len, 12);
 
-        // Driver streamed all 12 octets: resume clean, then read the trailer.
+        // NOTE: the caller streamed all 12 octets: resume clean, then
+        // read the trailer.
         expect_wants_read(&mut cor, &mut frag, None);
 
         let reply = format!(")\r\n{tag} OK FETCH completed\r\n");
@@ -410,11 +437,11 @@ mod tests {
 
         expect_wants_read(&mut cor, &mut frag, None);
 
-        // Header line plus the first 3 of 5 body octets.
+        // NOTE: header line plus the first 3 of 5 body octets.
         let chunk = expect_body_chunk(&mut cor, &mut frag, Some(b"* 1 FETCH (BODY[] {5}\r\nhel"));
         assert_eq!(chunk, b"hel");
 
-        // Remaining 2 octets streamed off the socket.
+        // NOTE: remaining 2 octets streamed off the socket.
         let len = expect_wants_stream(&mut cor, &mut frag, None);
         assert_eq!(len, 2);
 
@@ -434,7 +461,7 @@ mod tests {
 
         expect_wants_read(&mut cor, &mut frag, None);
 
-        // No untagged FETCH: the id did not exist.
+        // NOTE: no untagged FETCH: the id did not exist.
         let reply = format!("{tag} OK FETCH completed\r\n");
         expect_complete_ok(&mut cor, &mut frag, Some(reply.as_bytes()));
     }
@@ -466,12 +493,10 @@ mod tests {
         expect_wants_read(&mut cor, &mut frag, None);
         let _ = expect_wants_stream(&mut cor, &mut frag, Some(b"* 1 FETCH (BODY[] {12}\r\n"));
 
-        // Socket EOF mid-body: the driver signals a short read.
+        // NOTE: socket EOF mid-body: the caller signals a short read.
         let err = expect_complete_err(&mut cor, &mut frag, Some(&[]));
         assert!(matches!(err, ImapMessageFetchStreamError::ShortBody));
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMessageFetchStream,

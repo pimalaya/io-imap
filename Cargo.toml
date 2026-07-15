@@ -13,6 +13,7 @@ documentation = "https://docs.rs/io-imap/latest/io_imap"
 repository = "https://github.com/pimalaya/io-imap"
 
 [package.metadata.docs.rs]
+all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
@@ -57,7 +58,7 @@ hmac = { version = "0.13", optional = true }
 imap-codec = { version = "2.0.0-alpha.8", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
 log = "0.4"
 pbkdf2 = { version = "0.13", optional = true }
-pimalaya-stream = { version = "0.0.1", default-features = false, optional = true }
+pimalaya-stream = { version = "0.1", default-features = false, optional = true }
 rand = { version = "0.10", optional = true }
 secrecy = { version = "0.10", default-features = false }
 sha2 = { version = "0.11", optional = true }

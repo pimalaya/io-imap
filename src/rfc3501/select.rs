@@ -15,7 +15,7 @@
 //!     rfc3501::select::{ImapMailboxSelect, ImapMailboxSelectOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -68,41 +68,57 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 /// Failure causes during the IMAP SELECT flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxSelectError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP SELECT failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP SELECT failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP SELECT failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP SELECT failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP SELECT failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
-/// Decoded SELECT (or EXAMINE) response. CONDSTORE/QRESYNC extras
-/// (`highest_mod_seq`, `vanished_earlier`, `changed`) stay empty on the
-/// base call.
+/// Decoded SELECT (or EXAMINE) response.
+///
+/// CONDSTORE/QRESYNC extras (`highest_mod_seq`, `vanished_earlier`,
+/// `changed`) stay empty on the base call.
 #[derive(Clone, Debug, Default)]
-pub struct SelectData {
+pub struct ImapMailboxSelectData {
+    /// Flags defined in the mailbox (untagged FLAGS).
     pub flags: Option<Vec<Flag<'static>>>,
+    /// Number of messages in the mailbox (untagged EXISTS).
     pub exists: Option<u32>,
+    /// Number of messages with the `\Recent` flag (untagged RECENT).
     pub recent: Option<u32>,
+    /// Sequence number of the first unseen message (UNSEEN code).
     pub unseen: Option<NonZeroU32>,
+    /// Flags the client can change permanently (PERMANENTFLAGS code).
     pub permanent_flags: Option<Vec<FlagPerm<'static>>>,
+    /// Predicted UID of the next message (UIDNEXT code).
     pub uid_next: Option<NonZeroU32>,
+    /// UID validity of the mailbox (UIDVALIDITY code).
     pub uid_validity: Option<NonZeroU32>,
+    /// Highest modification sequence (CONDSTORE HIGHESTMODSEQ code).
     pub highest_mod_seq: Option<u64>,
+    /// UIDs expunged since the last sync (QRESYNC `VANISHED (EARLIER)`).
     pub vanished_earlier: Vec<NonZeroU32>,
-    pub changed: Vec<SelectFetch>,
+    /// Implicit FETCH responses for changed messages (QRESYNC).
+    pub changed: Vec<ImapMailboxSelectFetch>,
 }
 
 /// Implicit FETCH returned during a QRESYNC SELECT.
 #[derive(Clone, Debug)]
-pub struct SelectFetch {
+pub struct ImapMailboxSelectFetch {
+    /// Sequence number of the changed message.
     pub seq: NonZeroU32,
+    /// FETCH data items carried by the response.
     pub items: Vec1<MessageDataItem<'static>>,
 }
 
@@ -119,6 +135,8 @@ pub struct ImapMailboxSelect {
 }
 
 impl ImapMailboxSelect {
+    /// Builds a SELECT coroutine opening `mailbox` read-write;
+    /// `opts.parameters` opts into CONDSTORE/QRESYNC extras.
     pub fn new(mut mailbox: Mailbox<'static>, opts: ImapMailboxSelectOptions) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -132,7 +150,7 @@ impl ImapMailboxSelect {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -140,78 +158,74 @@ impl ImapMailboxSelect {
 
 impl ImapCoroutine for ImapMailboxSelect {
     type Yield = ImapYield;
-    type Return = Result<SelectData, ImapMailboxSelectError>;
+    type Return = Result<ImapMailboxSelectData, ImapMailboxSelectError>;
 
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("select: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxSelectError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxSelectError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxSelectError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut output = ImapMailboxSelectData::default();
+
+                for data in out.data {
+                    match data {
+                        Data::Flags(flags) => output.flags = Some(flags),
+                        Data::Exists(count) => output.exists = Some(count),
+                        Data::Recent(count) => output.recent = Some(count),
+                        Data::Fetch { seq, items } => {
+                            output.changed.push(ImapMailboxSelectFetch { seq, items });
+                        }
+                        Data::Vanished {
+                            earlier,
+                            known_uids,
+                        } if earlier => {
+                            output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                        }
+                        _ => {}
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxSelectError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut output = SelectData::default();
-
-                    for data in out.data {
-                        match data {
-                            Data::Flags(flags) => output.flags = Some(flags),
-                            Data::Exists(count) => output.exists = Some(count),
-                            Data::Recent(count) => output.recent = Some(count),
-                            Data::Fetch { seq, items } => {
-                                output.changed.push(SelectFetch { seq, items });
+                for StatusBody { kind, code, .. } in out.untagged {
+                    if let StatusKind::Ok = kind {
+                        match code {
+                            Some(Code::Unseen(seq)) => output.unseen = Some(seq),
+                            Some(Code::PermanentFlags(flags)) => {
+                                output.permanent_flags = Some(flags)
                             }
-                            Data::Vanished {
-                                earlier,
-                                known_uids,
-                            } if earlier => {
-                                output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                            Some(Code::UidNext(uid)) => output.uid_next = Some(uid),
+                            Some(Code::UidValidity(uid)) => output.uid_validity = Some(uid),
+                            Some(Code::HighestModSeq(modseq)) => {
+                                output.highest_mod_seq = Some(modseq.get());
                             }
                             _ => {}
                         }
                     }
+                }
 
-                    for StatusBody { kind, code, .. } in out.untagged {
-                        if let StatusKind::Ok = kind {
-                            match code {
-                                Some(Code::Unseen(seq)) => output.unseen = Some(seq),
-                                Some(Code::PermanentFlags(flags)) => {
-                                    output.permanent_flags = Some(flags)
-                                }
-                                Some(Code::UidNext(uid)) => output.uid_next = Some(uid),
-                                Some(Code::UidValidity(uid)) => output.uid_validity = Some(uid),
-                                Some(Code::HighestModSeq(modseq)) => {
-                                    output.highest_mod_seq = Some(modseq.get());
-                                }
-                                _ => {}
-                            }
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
+                    StatusKind::No => {
+                        let err = ImapMailboxSelectError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
-                        StatusKind::No => {
-                            let err = ImapMailboxSelectError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxSelectError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxSelectError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -219,7 +233,7 @@ impl ImapCoroutine for ImapMailboxSelect {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -241,9 +255,9 @@ fn expand_uid_set(uid_set: &SequenceSet) -> Vec<NonZeroU32> {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::select::*;
 
     #[test]
     fn success_collects_response() {
@@ -312,8 +326,6 @@ mod tests {
         assert_eq!(text, "going down");
     }
 
-    // --- utils
-
     fn expect_wants_write(
         cor: &mut ImapMailboxSelect,
         frag: &mut Fragmentizer,
@@ -336,7 +348,7 @@ mod tests {
         cor: &mut ImapMailboxSelect,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> SelectData {
+    ) -> ImapMailboxSelectData {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

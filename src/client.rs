@@ -18,13 +18,7 @@ use core::{
     feature = "native-tls"
 ))]
 use alloc::string::ToString;
-use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, vec::Vec};
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-use secrecy::ExposeSecret;
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 
 use std::{
     io::{self, Read, Write},
@@ -71,6 +65,12 @@ use pimalaya_stream::{
     std::stream::StreamStd,
     tls::Tls,
 };
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+use secrecy::ExposeSecret;
 use thiserror::Error;
 #[cfg(any(
     feature = "rustls-aws",
@@ -102,23 +102,32 @@ use crate::{
 /// Failure causes returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
 pub enum ImapClientStdError {
+    /// The greeting coroutine failed.
     #[error(transparent)]
     Greeting(#[from] ImapGreetingGetError),
+    /// The LOGIN coroutine failed.
     #[error(transparent)]
     Login(#[from] ImapLoginError),
+    /// The SASL LOGIN coroutine failed.
     #[error(transparent)]
     AuthLogin(#[from] ImapAuthLoginError),
+    /// The SASL PLAIN coroutine failed.
     #[error(transparent)]
     AuthPlain(#[from] ImapAuthPlainError),
+    /// The SASL ANONYMOUS coroutine failed.
     #[error(transparent)]
     AuthAnonymous(#[from] ImapAuthAnonymousError),
+    /// The SASL OAUTHBEARER coroutine failed.
     #[error(transparent)]
     AuthOAuthBearer(#[from] ImapAuthOauthbearerError),
+    /// The SASL XOAUTH2 coroutine failed.
     #[error(transparent)]
     AuthXOAuth2(#[from] ImapAuthXoauth2Error),
+    /// The SASL SCRAM-SHA-256 coroutine failed.
     #[cfg(feature = "scram")]
     #[error(transparent)]
     AuthScramSha256(#[from] ImapAuthScramSha256Error),
+    /// SCRAM-SHA-256 was requested but the scram feature is off.
     #[cfg(any(
         feature = "rustls-aws",
         feature = "rustls-ring",
@@ -127,76 +136,106 @@ pub enum ImapClientStdError {
     #[cfg(not(feature = "scram"))]
     #[error("SCRAM-SHA-256 SASL mechanism requires the `scram` cargo feature")]
     ScramSha256NotEnabled,
+    /// The LOGOUT coroutine failed.
     #[error(transparent)]
     Logout(#[from] ImapLogoutError),
-
+    /// The CAPABILITY coroutine failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+    /// The NOOP coroutine failed.
     #[error(transparent)]
     Noop(#[from] ImapNoopError),
+    /// The raw-command coroutine failed.
     #[error(transparent)]
     Raw(#[from] ImapRawError),
+    /// The ID coroutine failed.
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
+    /// The ENABLE coroutine failed.
     #[error(transparent)]
     ExtensionEnable(#[from] ImapExtensionEnableError),
-
+    /// The LIST coroutine failed.
     #[error(transparent)]
     MailboxList(#[from] ImapMailboxListError),
+    /// The LSUB coroutine failed.
     #[error(transparent)]
     MailboxLsub(#[from] ImapMailboxLsubError),
+    /// The STATUS coroutine failed.
     #[error(transparent)]
     MailboxStatus(#[from] ImapMailboxStatusError),
+    /// The CREATE coroutine failed.
     #[error(transparent)]
     MailboxCreate(#[from] ImapMailboxCreateError),
+    /// The DELETE coroutine failed.
     #[error(transparent)]
     MailboxDelete(#[from] ImapMailboxDeleteError),
+    /// The RENAME coroutine failed.
     #[error(transparent)]
     MailboxRename(#[from] ImapMailboxRenameError),
+    /// The SUBSCRIBE coroutine failed.
     #[error(transparent)]
     MailboxSubscribe(#[from] ImapMailboxSubscribeError),
+    /// The UNSUBSCRIBE coroutine failed.
     #[error(transparent)]
     MailboxUnsubscribe(#[from] ImapMailboxUnsubscribeError),
+    /// The SELECT coroutine failed.
     #[error(transparent)]
     MailboxSelect(#[from] ImapMailboxSelectError),
+    /// The EXAMINE coroutine failed.
     #[error(transparent)]
     MailboxExamine(#[from] ImapMailboxExamineError),
+    /// The mailbox watcher failed.
     #[error(transparent)]
     MailboxWatch(#[from] ImapMailboxWatchError),
+    /// The CLOSE coroutine failed.
     #[error(transparent)]
     MailboxClose(#[from] ImapMailboxCloseError),
+    /// The UNSELECT coroutine failed.
     #[error(transparent)]
     MailboxUnselect(#[from] ImapMailboxUnselectError),
+    /// The CHECK coroutine failed.
     #[error(transparent)]
     MailboxCheck(#[from] ImapMailboxCheckError),
+    /// The EXPUNGE coroutine failed.
     #[error(transparent)]
     MailboxExpunge(#[from] ImapMailboxExpungeError),
+    /// The SORT coroutine failed.
     #[error(transparent)]
     MessageSort(#[from] ImapMessageSortError),
-
+    /// The FETCH coroutine failed.
     #[error(transparent)]
     MessageFetch(#[from] ImapMessageFetchError),
+    /// The streaming FETCH coroutine failed.
     #[error(transparent)]
     MessageFetchStream(#[from] ImapMessageFetchStreamError),
+    /// The SEARCH coroutine failed.
     #[error(transparent)]
     MessageSearch(#[from] ImapMessageSearchError),
+    /// The STORE coroutine failed.
     #[error(transparent)]
     MessageStore(#[from] ImapMessageStoreError),
+    /// The COPY coroutine failed.
     #[error(transparent)]
     MessageCopy(#[from] ImapMessageCopyError),
+    /// The MOVE coroutine failed.
     #[error(transparent)]
     MessageMove(#[from] ImapMessageMoveError),
+    /// The buffered APPEND coroutine failed.
     #[error(transparent)]
     MessageAppend(#[from] ImapMessageAppendError),
+    /// The streaming APPEND coroutine failed.
     #[error(transparent)]
     MessageAppendStream(#[from] ImapMessageAppendStreamError),
+    /// The THREAD coroutine failed.
     #[error(transparent)]
     MessageThread(#[from] ImapMessageThreadError),
-
+    /// Reading from or writing to the stream failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The STARTTLS coroutine failed.
     #[error(transparent)]
     StartTls(#[from] ImapStartTlsError),
+    /// Opening the TCP/TLS connection failed.
     #[cfg(any(
         feature = "rustls-aws",
         feature = "rustls-ring",
@@ -204,6 +243,7 @@ pub enum ImapClientStdError {
     ))]
     #[error(transparent)]
     Tls(#[from] anyhow::Error),
+    /// The connect URL has no host to connect to.
     #[cfg(any(
         feature = "rustls-aws",
         feature = "rustls-ring",
@@ -211,6 +251,7 @@ pub enum ImapClientStdError {
     ))]
     #[error("IMAP URL `{0}` has no host")]
     UrlMissingHost(String),
+    /// The connect URL scheme is neither imap nor imaps.
     #[cfg(any(
         feature = "rustls-aws",
         feature = "rustls-ring",
@@ -218,6 +259,7 @@ pub enum ImapClientStdError {
     ))]
     #[error("IMAP URL `{0}` has unsupported scheme `{1}` (expected `imap` or `imaps`)")]
     UrlUnsupportedScheme(String, String),
+    /// STARTTLS was requested on an already-TLS imaps connection.
     #[cfg(any(
         feature = "rustls-aws",
         feature = "rustls-ring",
@@ -225,11 +267,13 @@ pub enum ImapClientStdError {
     ))]
     #[error("STARTTLS requested on an `imaps://` URL: TLS is already active")]
     StartTlsOverTls,
+    /// The LOGIN user or password failed imap-types validation.
     #[error("Invalid IMAP LOGIN credentials")]
     InvalidLoginCredentials(#[from] imap_codec::imap_types::error::ValidationError),
-
+    /// QRESYNC was requested but the capability list lacks it.
     #[error("IMAP server does not advertise QRESYNC capability")]
     QresyncNotSupported,
+    /// A QRESYNC SELECT was requested with a zero mod-sequence.
     #[error("Invalid mod-sequence value: 0")]
     InvalidModSeq,
 }
@@ -242,12 +286,19 @@ pub fn default_alpn() -> Vec<String> {
     vec![String::from("imap")]
 }
 
-/// `auto_id` is consumed by every auth_*/login: `None` skips,
-/// `Some(empty)` sends `ID NIL`, `Some(params)` sends `ID (k v ...)`.
-/// Required by a few providers (mail.qq.com, fastmail).
+/// Blocking IMAP client: a stream, the connection-wide `Fragmentizer`
+/// and one method per coroutine.
 pub struct ImapClientStd {
+    /// The stream carrying the connection to the IMAP server.
     pub stream: Box<dyn ImapStream>,
+    /// The connection-wide parser buffer shared by every coroutine run
+    /// on this connection.
     pub fragmentizer: Fragmentizer,
+    /// ID parameters consumed by every auth_*/login call; required by
+    /// a few providers (mail.qq.com, fastmail).
+    ///
+    /// `None` skips, `Some(empty)` sends `ID NIL`, `Some(params)`
+    /// sends `ID (k v ...)`.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
@@ -267,8 +318,11 @@ impl ImapClientStd {
         self.stream = Box::new(stream);
     }
 
-    /// Drives a standard-shape coroutine to completion. Richer yields (IDLE
-    /// events, watch deltas) need their own per-method loops.
+    /// Runs a standard-shape coroutine to completion, fulfilling its
+    /// read and write requests.
+    ///
+    /// Richer yields (IDLE events, watch deltas, streamed bodies) need
+    /// their own per-method loops.
     pub fn run<C, T, E>(&mut self, mut coroutine: C) -> Result<T, ImapClientStdError>
     where
         C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
@@ -293,8 +347,6 @@ impl ImapClientStd {
         }
     }
 
-    // ---- Session lifecycle ------------------------------------------------
-
     /// Consumes the greeting and returns the advertised capabilities
     /// (forcing a CAPABILITY round-trip if the greeting carried none).
     pub fn greeting(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
@@ -316,9 +368,11 @@ impl ImapClientStd {
     }
 
     /// `STARTTLS`. Caller still has to upgrade the socket and refresh
-    /// capabilities. Returns any bytes pre-read past the tagged
-    /// response (a non-empty return is a STARTTLS-injection signal:
-    /// refuse the upgrade).
+    /// capabilities.
+    ///
+    /// Returns any bytes pre-read past the tagged response; a
+    /// non-empty return is a STARTTLS-injection signal, refuse the
+    /// upgrade.
     pub fn starttls(&mut self) -> Result<Vec<u8>, ImapClientStdError> {
         self.run(ImapStartTls::new())
     }
@@ -394,8 +448,6 @@ impl ImapClientStd {
         self.run(ImapLogout::new())
     }
 
-    // ---- State / introspection -------------------------------------------
-
     /// `CAPABILITY`; returns the advertised capabilities.
     pub fn capability(&mut self) -> Result<Vec<Capability<'static>>, ImapClientStdError> {
         self.run(ImapCapabilityGet::new())
@@ -406,9 +458,11 @@ impl ImapClientStd {
         self.run(ImapNoop::new())
     }
 
-    /// Sends an arbitrary raw command line (no tag, no trailing CRLF) and
-    /// returns the verbatim server response up to and including the tagged
-    /// completion line. Synchronizing literals are not supported.
+    /// Sends an arbitrary raw command line (no tag, no trailing CRLF)
+    /// and returns the verbatim server response.
+    ///
+    /// The response spans up to and including the tagged completion
+    /// line. Synchronizing literals are not supported.
     pub fn raw(&mut self, command: impl AsRef<str>) -> Result<String, ImapClientStdError> {
         self.run(ImapRaw::new(command))
     }
@@ -428,8 +482,6 @@ impl ImapClientStd {
     ) -> Result<Option<Vec<CapabilityEnable<'static>>>, ImapClientStdError> {
         self.run(ImapExtensionEnable::new(capabilities))
     }
-
-    // ---- Mailbox structure -----------------------------------------------
 
     /// `LIST`; returns the mailboxes matching `reference` and `pattern`.
     pub fn list(
@@ -488,14 +540,12 @@ impl ImapClientStd {
         self.run(ImapMailboxUnsubscribe::new(mailbox))
     }
 
-    // ---- Mailbox selection -----------------------------------------------
-
     /// `SELECT`; opens `mailbox` for read-write and returns its state.
     pub fn select(
         &mut self,
         mailbox: Mailbox<'static>,
         opts: ImapMailboxSelectOptions,
-    ) -> Result<SelectData, ImapClientStdError> {
+    ) -> Result<ImapMailboxSelectData, ImapClientStdError> {
         self.run(ImapMailboxSelect::new(mailbox, opts))
     }
 
@@ -504,20 +554,21 @@ impl ImapClientStd {
         &mut self,
         mailbox: Mailbox<'static>,
         opts: ImapMailboxExamineOptions,
-    ) -> Result<SelectData, ImapClientStdError> {
+    ) -> Result<ImapMailboxSelectData, ImapClientStdError> {
         self.run(ImapMailboxExamine::new(mailbox, opts))
     }
 
-    /// `SELECT <mailbox> (QRESYNC ...)`. Errors with
-    /// `QresyncNotSupported` when `capability` lacks QRESYNC, with
-    /// `InvalidModSeq` when `highest_mod_seq` is 0.
+    /// `SELECT <mailbox> (QRESYNC ...)`.
+    ///
+    /// Errors with `QresyncNotSupported` when `capability` lacks
+    /// QRESYNC, with `InvalidModSeq` when `highest_mod_seq` is 0.
     pub fn select_qresync(
         &mut self,
         mailbox: Mailbox<'static>,
         uid_validity: NonZeroU32,
         highest_mod_seq: u64,
         capability: &[Capability<'static>],
-    ) -> Result<SelectData, ImapClientStdError> {
+    ) -> Result<ImapMailboxSelectData, ImapClientStdError> {
         if !capability.contains(&Capability::QResync) {
             return Err(ImapClientStdError::QresyncNotSupported);
         }
@@ -556,9 +607,10 @@ impl ImapClientStd {
         self.run(ImapMailboxExpunge::new())
     }
 
-    /// Consumes the client into a background watcher. Drop the
-    /// returned stream (or call its `close`) to wind down. Errors when
-    /// `capability` lacks QRESYNC.
+    /// Consumes the client into a background watcher.
+    ///
+    /// Drop the returned stream (or call its `close`) to wind down.
+    /// Errors when `capability` lacks QRESYNC.
     pub fn watch_mailbox(
         self,
         mailbox: Mailbox<'static>,
@@ -621,8 +673,6 @@ impl ImapClientStd {
         })
     }
 
-    // ---- Messages --------------------------------------------------------
-
     /// `FETCH`; returns the requested items keyed by message id.
     pub fn fetch(
         &mut self,
@@ -633,10 +683,11 @@ impl ImapClientStd {
         self.run(ImapMessageFetch::new(sequence_set, items, opts))
     }
 
-    /// `FETCH <id> (BODY.PEEK[])` streaming the message body straight into
-    /// `sink`; the body never lands in memory whole. Peek leaves `\Seen`
-    /// untouched. Returns once the tagged response is parsed; a missing id
-    /// completes with an empty sink.
+    /// `FETCH <id> (BODY.PEEK[])` streaming the message body straight
+    /// into `sink`; the body never lands in memory whole.
+    ///
+    /// Peek leaves `\Seen` untouched. Returns once the tagged response
+    /// is parsed; a missing id completes with an empty sink.
     pub fn fetch_body_stream(
         &mut self,
         id: NonZeroU32,
@@ -667,8 +718,8 @@ impl ImapClientStd {
                     let len = len as u64;
                     let mut stream = (&mut self.stream).take(len);
                     let n = io::copy(&mut stream, &mut sink)?;
-                    // An empty slice tells the coroutine the socket ran short
-                    // of the declared body length.
+                    // NOTE: an empty slice tells the coroutine the
+                    // socket ran short of the declared body length.
                     arg = (n != len).then_some(&[]);
                 }
             }
@@ -718,8 +769,9 @@ impl ImapClientStd {
     }
 
     /// `APPEND`; returns the optional EXISTS count and APPENDUID pair.
-    /// Buffered: the whole `message` is held in memory. For large messages
-    /// prefer [`Self::append_stream`].
+    ///
+    /// Buffered: the whole `message` is held in memory. For large
+    /// messages prefer [`Self::append_stream`].
     pub fn append(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -729,11 +781,13 @@ impl ImapClientStd {
         self.run(ImapMessageAppend::new(mailbox, message.to_vec(), opts))
     }
 
-    /// `APPEND` streaming `len` octets from `source` straight to the socket;
-    /// the body never lands in memory whole. `len` must match the source
-    /// exactly: IMAP declares the octet count up front, so a shorter source
-    /// poisons the connection. Synchronising by default so the server can
-    /// reject before the body is sent; set `opts.non_sync` to skip the wait.
+    /// `APPEND` streaming `len` octets from `source` straight to the
+    /// socket; the body never lands in memory whole.
+    ///
+    /// `len` must match the source exactly: IMAP declares the octet
+    /// count up front, so a shorter source poisons the connection.
+    /// Synchronising by default so the server can reject before the
+    /// body is sent; set `opts.non_sync` to skip the wait.
     pub fn append_stream(
         &mut self,
         mailbox: Mailbox<'static>,
@@ -761,20 +815,20 @@ impl ImapClientStd {
                     let len = len as u64;
                     let mut sink = source.by_ref().take(len);
                     let n = io::copy(&mut sink, &mut self.stream)?;
-                    // An empty slice tells the coroutine the source ran short
-                    // of the declared count.
+                    // NOTE: an empty slice tells the coroutine the
+                    // source ran short of the declared count.
                     arg = (n != len).then_some(&[]);
                 }
             }
         }
     }
 
-    // ---- RFC 5256: SORT / THREAD ------------------------------------------
-
-    /// `SORT` with a client-side fallback. With `opts.fallback == false` this
-    /// is a plain server SORT; with `opts.fallback == true` it SEARCHes,
-    /// FETCHes the sort keys, and sorts locally. Feed `fallback` from a SORT
-    /// capability check (the server SORT requires the extension).
+    /// `SORT` with a client-side fallback.
+    ///
+    /// With `opts.fallback == false` this is a plain server SORT; with
+    /// `opts.fallback == true` it SEARCHes, FETCHes the sort keys, and
+    /// sorts locally. Feed `fallback` from a SORT capability check
+    /// (the server SORT requires the extension).
     pub fn sort(
         &mut self,
         sort_criteria: Vec1<SortCriterion>,
@@ -863,9 +917,11 @@ impl Drop for ImapMailboxWatchStream {
 ))]
 impl ImapClientStd {
     /// End-to-end connect: TCP/TLS, optional STARTTLS, greeting,
-    /// optional SASL. `imap://` is plain TCP (143), `imaps://` is
-    /// implicit TLS (993). `starttls = true` is only valid on
-    /// `imap://`. Pass `Sasl::None` to skip auth.
+    /// optional SASL.
+    ///
+    /// `imap://` is plain TCP (143), `imaps://` is implicit TLS (993).
+    /// `starttls = true` is only valid on `imap://`. Pass `Sasl::None`
+    /// to skip auth.
     pub fn connect(
         url: &Url,
         tls: &Tls,
@@ -999,7 +1055,7 @@ impl ImapClientStd {
     }
 }
 
-/// Inline STARTTLS driver: keeps the concrete `StreamStd` so that
+/// Inline STARTTLS loop: keeps the concrete `StreamStd` so that
 /// `upgrade_tls` can swap the underlying socket afterwards.
 #[cfg(any(
     feature = "rustls-aws",
@@ -1029,10 +1085,13 @@ fn run_starttls(
     }
 }
 
-/// Auto-implemented for `Read + Write + Send + 'static`. `as_any_mut` supports
-/// downcasting back to the concrete stream when needed (e.g. for
-/// `set_read_timeout`).
+/// Blocking stream the client runs over, auto-implemented for any
+/// `Read + Write + Send + 'static`.
+///
+/// `as_any_mut` supports downcasting back to the concrete stream when
+/// needed (e.g. for `set_read_timeout`).
 pub trait ImapStream: Read + Write + Send + Any {
+    /// The stream as a mutable `Any`, ready for downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 

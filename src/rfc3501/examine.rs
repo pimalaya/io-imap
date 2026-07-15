@@ -14,7 +14,7 @@
 //!     rfc3501::examine::{ImapMailboxExamine, ImapMailboxExamineOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -65,31 +65,35 @@ use crate::{
     imap_try,
     rfc3501::{
         mailbox::encode_inplace,
-        select::{SelectData, SelectFetch},
+        select::{ImapMailboxSelectData, ImapMailboxSelectFetch},
     },
     send::*,
 };
 
-/// Decoded EXAMINE response (alias of [`SelectData`]).
-pub type ExamineData = SelectData;
-/// Implicit FETCH item from a QRESYNC EXAMINE (alias of [`SelectFetch`]).
-pub type ExamineFetch = SelectFetch;
+/// Decoded EXAMINE response (alias of [`ImapMailboxSelectData`]).
+pub type ExamineData = ImapMailboxSelectData;
+/// Implicit FETCH item from a QRESYNC EXAMINE (alias of
+/// [`ImapMailboxSelectFetch`]).
+pub type ExamineFetch = ImapMailboxSelectFetch;
 
 /// Failure causes during the IMAP EXAMINE flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxExamineError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP EXAMINE failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP EXAMINE failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP EXAMINE failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP EXAMINE failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP EXAMINE failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options for [`ImapMailboxExamine::new`].
@@ -105,6 +109,8 @@ pub struct ImapMailboxExamine {
 }
 
 impl ImapMailboxExamine {
+    /// Builds an EXAMINE coroutine opening `mailbox` read-only;
+    /// `opts.parameters` opts into CONDSTORE/QRESYNC extras.
     pub fn new(mut mailbox: Mailbox<'static>, opts: ImapMailboxExamineOptions) -> Self {
         encode_inplace(&mut mailbox);
 
@@ -118,7 +124,7 @@ impl ImapMailboxExamine {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -133,71 +139,67 @@ impl ImapCoroutine for ImapMailboxExamine {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("examine: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxExamineError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxExamineError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxExamineError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut output = ExamineData::default();
+
+                for data in out.data {
+                    match data {
+                        Data::Flags(flags) => output.flags = Some(flags),
+                        Data::Exists(count) => output.exists = Some(count),
+                        Data::Recent(count) => output.recent = Some(count),
+                        Data::Fetch { seq, items } => {
+                            output.changed.push(ExamineFetch { seq, items });
+                        }
+                        Data::Vanished {
+                            earlier,
+                            known_uids,
+                        } if earlier => {
+                            output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                        }
+                        _ => {}
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxExamineError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut output = ExamineData::default();
-
-                    for data in out.data {
-                        match data {
-                            Data::Flags(flags) => output.flags = Some(flags),
-                            Data::Exists(count) => output.exists = Some(count),
-                            Data::Recent(count) => output.recent = Some(count),
-                            Data::Fetch { seq, items } => {
-                                output.changed.push(ExamineFetch { seq, items });
+                for StatusBody { kind, code, .. } in out.untagged {
+                    if let StatusKind::Ok = kind {
+                        match code {
+                            Some(Code::Unseen(seq)) => output.unseen = Some(seq),
+                            Some(Code::PermanentFlags(flags)) => {
+                                output.permanent_flags = Some(flags)
                             }
-                            Data::Vanished {
-                                earlier,
-                                known_uids,
-                            } if earlier => {
-                                output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                            Some(Code::UidNext(uid)) => output.uid_next = Some(uid),
+                            Some(Code::UidValidity(uid)) => output.uid_validity = Some(uid),
+                            Some(Code::HighestModSeq(modseq)) => {
+                                output.highest_mod_seq = Some(modseq.get());
                             }
                             _ => {}
                         }
                     }
+                }
 
-                    for StatusBody { kind, code, .. } in out.untagged {
-                        if let StatusKind::Ok = kind {
-                            match code {
-                                Some(Code::Unseen(seq)) => output.unseen = Some(seq),
-                                Some(Code::PermanentFlags(flags)) => {
-                                    output.permanent_flags = Some(flags)
-                                }
-                                Some(Code::UidNext(uid)) => output.uid_next = Some(uid),
-                                Some(Code::UidValidity(uid)) => output.uid_validity = Some(uid),
-                                Some(Code::HighestModSeq(modseq)) => {
-                                    output.highest_mod_seq = Some(modseq.get());
-                                }
-                                _ => {}
-                            }
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
+                    StatusKind::No => {
+                        let err = ImapMailboxExamineError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
-                        StatusKind::No => {
-                            let err = ImapMailboxExamineError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxExamineError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxExamineError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -205,7 +207,7 @@ impl ImapCoroutine for ImapMailboxExamine {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -227,9 +229,9 @@ fn expand_uid_set(uid_set: &SequenceSet) -> Vec<NonZeroU32> {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc3501::examine::*;
 
     #[test]
     fn success_collects_response() {
@@ -319,8 +321,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxExamine,

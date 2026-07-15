@@ -14,7 +14,7 @@
 //!     rfc3501::list::ImapMailboxList,
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -77,18 +77,21 @@ pub type ImapMailboxListing = Vec<(
 /// Failure causes during the IMAP LIST flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMailboxListError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP LIST failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP LIST failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP LIST failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP LIST failed: server did not return a tagged response")]
     MissingTagged,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP LIST failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// I/O-free IMAP LIST coroutine.
@@ -97,6 +100,8 @@ pub struct ImapMailboxList {
 }
 
 impl ImapMailboxList {
+    /// Builds a LIST coroutine listing mailboxes matching
+    /// `mailbox_wildcard` under `reference`.
     pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
         encode_inplace(&mut reference);
 
@@ -110,7 +115,7 @@ impl ImapMailboxList {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -125,48 +130,44 @@ impl ImapCoroutine for ImapMailboxList {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("list: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMailboxListError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMailboxListError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMailboxListError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut mailboxes = Vec::new();
+                for data in out.data {
+                    if let Data::List {
+                        items,
+                        delimiter,
+                        mailbox,
+                    } = data
+                    {
+                        let mut mailbox = mailbox;
+                        decode_inplace(&mut mailbox);
+                        mailboxes.push((mailbox, delimiter, items));
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMailboxListError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut mailboxes = Vec::new();
-                    for data in out.data {
-                        if let Data::List {
-                            items,
-                            delimiter,
-                            mailbox,
-                        } = data
-                        {
-                            let mut mailbox = mailbox;
-                            decode_inplace(&mut mailbox);
-                            mailboxes.push((mailbox, delimiter, items));
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
+                    StatusKind::No => {
+                        let err = ImapMailboxListError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
-                        StatusKind::No => {
-                            let err = ImapMailboxListError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMailboxListError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMailboxListError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -174,7 +175,7 @@ impl ImapCoroutine for ImapMailboxList {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -189,9 +190,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec::Vec};
 
-    use super::*;
+    use crate::rfc3501::list::*;
 
     #[test]
     fn success_returns_rows() {
@@ -252,8 +253,6 @@ mod tests {
         };
         assert_eq!(text, "going down");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapMailboxList,

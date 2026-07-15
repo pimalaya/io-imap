@@ -1,6 +1,8 @@
 //! IMAP STARTTLS coroutine; returns any bytes received past the tagged
-//! response. RFC 3501 §6.2.1 forbids trailing bytes, so a non-empty return
-//! value is a STARTTLS-injection signal: refuse the upgrade.
+//! response.
+//!
+//! RFC 3501 §6.2.1 forbids trailing bytes, so a non-empty return value is
+//! a STARTTLS-injection signal: refuse the upgrade.
 //!
 //! # Example
 //!
@@ -65,6 +67,7 @@ use crate::coroutine::*;
 /// Failure causes during the IMAP STARTTLS handshake.
 #[derive(Clone, Debug, Error)]
 pub enum ImapStartTlsError {
+    /// The stream reached EOF during the STARTTLS exchange.
     #[error("IMAP STARTTLS failed: reached unexpected EOF on stream")]
     Eof,
 }
@@ -79,6 +82,8 @@ pub struct ImapStartTls {
 }
 
 impl ImapStartTls {
+    /// Builds a STARTTLS coroutine discarding the plain-text greeting,
+    /// requesting the upgrade and returning any leftover bytes.
     pub fn new() -> Self {
         let tag_bytes = TagGenerator::new().generate().as_ref().as_bytes().to_vec();
 
@@ -108,8 +113,6 @@ impl ImapCoroutine for ImapStartTls {
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("starttls: {}", self.state);
-
             if let Some(bytes) = self.wants_write.take() {
                 return ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes));
             }
@@ -135,7 +138,7 @@ impl ImapCoroutine for ImapStartTls {
                         trace!("discard greeting line: {}", escape_byte_string(&line));
 
                         let encoder = CommandCodec::new();
-                        // SAFETY: tag is always valid.
+                        // NOTE: the tag is always valid.
                         let tag: Tag = self.tag_bytes.as_slice().try_into().unwrap();
                         let starttls = Command {
                             tag,
@@ -143,7 +146,7 @@ impl ImapCoroutine for ImapStartTls {
                         };
 
                         let Some(Fragment::Line { data }) = encoder.encode(&starttls).next() else {
-                            // SAFETY: STARTTLS is one simple line.
+                            // NOTE: STARTTLS is one simple line.
                             unreachable!();
                         };
 

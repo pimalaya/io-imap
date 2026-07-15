@@ -1,6 +1,6 @@
 //! Shared helpers for provider integration tests.
 //!
-//! Each test drives the raw coroutine loop against a live IMAP
+//! Each test runs the raw coroutine loop against a live IMAP
 //! server using blocking [`Read`]/[`Write`] on the underlying stream.
 //!
 //! Each integration test compiles this module on its own and only
@@ -61,7 +61,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     let mut buf = [0u8; 16 * 1024];
     let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
 
-    // ── GREETING + CAPABILITY ─────────────────────────────────────────────────
+    // NOTE: greeting + capability step.
 
     let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions {
         ensure_capabilities: true,
@@ -83,7 +83,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     }
 
-    // ── LOGIN ─────────────────────────────────────────────────────────────────
+    // NOTE: login step.
 
     let opts = ImapLoginOptions {
         ensure_capabilities: true,
@@ -107,12 +107,13 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     };
 
-    // Servers without the SORT extension take the SEARCH + FETCH fallback.
+    // NOTE: servers without the SORT extension take the SEARCH +
+    // FETCH fallback.
     let has_sort = capabilities
         .iter()
         .any(|capability| matches!(capability, Capability::Sort(_)));
 
-    // ── SELECT INBOX ──────────────────────────────────────────────────────────
+    // NOTE: select inbox step.
 
     let mut coroutine = ImapMailboxSelect::new(
         "INBOX".try_into().unwrap(),
@@ -135,7 +136,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     }
 
-    // ── APPEND ────────────────────────────────────────────────────────────────
+    // NOTE: append step.
 
     let message = b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
         From: io-imap <test@pimalaya.org>\r\n\
@@ -166,8 +167,9 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     };
 
-    // Prefer the APPENDUID (UIDPLUS); otherwise the appended message is the
-    // new highest sequence number, i.e. the EXISTS count.
+    // NOTE: prefer the APPENDUID (UIDPLUS); otherwise the appended
+    // message is the new highest sequence number, i.e. the EXISTS
+    // count.
     let (id, uid) = match appenduid {
         Some((_uid_validity, uid)) => (NonZeroU32::new(uid).expect("non-zero APPENDUID"), true),
         None => {
@@ -176,7 +178,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     };
 
-    // ── FETCH (buffered) ──────────────────────────────────────────────────────
+    // NOTE: fetch (buffered) step.
 
     let items =
         MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::Envelope]);
@@ -206,10 +208,11 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     };
     assert!(!fetched.is_empty(), "buffered FETCH returned no message");
 
-    // ── FETCH (streamed, small chunks) ────────────────────────────────────────
+    // NOTE: fetch (streamed, small chunks) step.
 
-    // A deliberately tiny buffer fragments even a small body into many reads,
-    // exercising the streaming reassembly as if the content were heavy.
+    // NOTE: a deliberately tiny buffer fragments even a small body
+    // into many reads, exercising the streaming reassembly as if the
+    // content were heavy.
     let mut coroutine = ImapMessageFetchStream::new(id, uid);
     let mut chunk = [0u8; 64];
     let mut body: Vec<u8> = Vec::new();
@@ -244,7 +247,8 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
                     body.extend_from_slice(&chunk[..n]);
                     remaining -= n;
                 }
-                // An empty slice tells the coroutine the socket ran short.
+                // NOTE: an empty slice tells the coroutine the
+                // socket ran short.
                 arg = (remaining > 0).then_some(&[]);
             }
         }
@@ -254,7 +258,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         "streamed body missing the appended subject"
     );
 
-    // ── SORT ──────────────────────────────────────────────────────────────────
+    // NOTE: sort step.
 
     let sort_criteria = Vec1::try_from(vec![SortCriterion {
         reverse: true,
@@ -288,7 +292,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     };
     assert!(!ids.is_empty(), "SORT returned no ids after APPEND");
 
-    // ── LOGOUT ────────────────────────────────────────────────────────────────
+    // NOTE: logout step.
 
     let mut coroutine = ImapLogout::new();
     let mut arg: Option<&[u8]> = None;

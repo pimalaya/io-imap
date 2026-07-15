@@ -18,7 +18,7 @@
 //!     sasl::auth_plain::{ImapAuthPlain, ImapAuthPlainOptions},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -50,6 +50,7 @@ use core::{fmt, mem};
 
 use alloc::{
     borrow::Cow,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -65,7 +66,7 @@ use imap_codec::{
         secret::Secret,
     },
 };
-use log::trace;
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -73,30 +74,38 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 /// Failure causes during the SASL PLAIN flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapAuthPlainError {
+    /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE PLAIN failed: NO {0}")]
     No(String),
+    /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE PLAIN failed: BAD {0}")]
     Bad(String),
+    /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE PLAIN failed: BYE {0}")]
     Bye(String),
-
+    /// The server never returned the final tagged response.
     #[error("IMAP AUTHENTICATE PLAIN failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server never sent the expected continuation request.
     #[error(
         "IMAP AUTHENTICATE PLAIN failed: server did not send the expected continuation request"
     )]
     ExpectedContinuationRequest,
+    /// The server sent a continuation request after the exchange ended.
     #[error("IMAP AUTHENTICATE PLAIN failed: server sent an unexpected continuation request")]
     UnexpectedContinuationRequest,
+    /// The server returned OK before the mechanism could complete.
     #[error(
         "IMAP AUTHENTICATE PLAIN failed: server returned OK before the mechanism could complete"
     )]
     UnexpectedOk,
-
+    /// The underlying send coroutine failed.
     #[error("IMAP AUTHENTICATE PLAIN failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
+    /// The follow-up CAPABILITY command failed.
     #[error(transparent)]
     Capability(#[from] ImapCapabilityGetError),
+    /// The follow-up ID command failed.
     #[error(transparent)]
     ServerId(#[from] ImapServerIdError),
 }
@@ -107,7 +116,13 @@ pub struct ImapAuthPlainOptions {
     /// `true` selects SASL-IR (RFC 4959, inline credentials);
     /// `false` selects the non-IR upload-after-challenge flow.
     pub initial_request: bool,
+    /// Fetch CAPABILITY after authentication when the tagged response
+    /// carries no capability data. Defaults to `false`.
     pub ensure_capabilities: bool,
+    /// Chain an RFC 2971 ID round-trip right after authentication, as
+    /// required by some providers.
+    ///
+    /// Defaults to `None` (no ID); an empty list sends ID NIL.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
 }
 
@@ -119,8 +134,14 @@ pub struct ImapAuthPlain {
 }
 
 impl ImapAuthPlain {
+    /// Builds a SASL PLAIN coroutine authenticating `authcid` with
+    /// `password`.
+    ///
     /// `authzid` is the optional RFC 4616 authorization identity;
-    /// `authcid` is the authentication identity (typically username).
+    /// `authcid` is the authentication identity (typically the
+    /// username). Depending on `opts.initial_request`, the credentials
+    /// go inline with the AUTHENTICATE command (SASL-IR) or are
+    /// uploaded after the server challenge.
     pub fn new(
         authzid: Option<impl AsRef<str>>,
         authcid: impl AsRef<str>,
@@ -143,7 +164,7 @@ impl ImapAuthPlain {
             };
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
-            State::SendIr(SendImapCommand::new(CommandCodec::new(), cmd))
+            State::SendIr(ImapSend::new(CommandCodec::new(), cmd))
         } else {
             let body = CommandBody::Authenticate {
                 mechanism: AuthMechanism::Plain,
@@ -152,7 +173,7 @@ impl ImapAuthPlain {
             let cmd = Command { tag, body };
             trace!("send IMAP command {cmd:?}");
             State::Send {
-                send: SendImapCommand::new(CommandCodec::new(), cmd),
+                send: ImapSend::new(CommandCodec::new(), cmd),
                 payload: payload.into(),
             }
         };
@@ -215,7 +236,6 @@ impl ImapCoroutine for ImapAuthPlain {
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
-            trace!("auth PLAIN: {}", self.state);
             match &mut self.state {
                 State::Send { send, payload } => {
                     let out = imap_try!(send, fragmentizer, arg);
@@ -229,7 +249,8 @@ impl ImapCoroutine for ImapAuthPlain {
                         let payload = mem::take(payload).into_owned();
                         let auth = AuthenticateData::r#continue(payload);
                         let codec = AuthenticateDataCodec::new();
-                        self.state = State::Continue(SendImapCommand::new(codec, auth));
+                        self.state = State::Continue(ImapSend::new(codec, auth));
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -278,11 +299,13 @@ impl ImapCoroutine for ImapAuthPlain {
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -321,11 +344,13 @@ impl ImapCoroutine for ImapAuthPlain {
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -337,6 +362,7 @@ impl ImapCoroutine for ImapAuthPlain {
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
+                        debug!("{}", self.state);
                         continue;
                     }
 
@@ -355,11 +381,11 @@ impl ImapCoroutine for ImapAuthPlain {
 
 enum State {
     Send {
-        send: SendImapCommand<CommandCodec>,
+        send: ImapSend<CommandCodec>,
         payload: Cow<'static, [u8]>,
     },
-    SendIr(SendImapCommand<CommandCodec>),
-    Continue(SendImapCommand<AuthenticateDataCodec>),
+    SendIr(ImapSend<CommandCodec>),
+    Continue(ImapSend<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -380,7 +406,7 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use super::*;
+    use crate::sasl::auth_plain::*;
 
     #[test]
     fn ir_success_returns_ok() {
@@ -491,8 +517,6 @@ mod tests {
         };
         assert_eq!(text, "authentication failed");
     }
-
-    // --- utils
 
     fn expect_wants_write(
         cor: &mut ImapAuthPlain,

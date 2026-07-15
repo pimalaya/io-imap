@@ -149,7 +149,7 @@ fn decode(input: &str) -> String {
                         .collect();
                     out.push_str(&String::from_utf16_lossy(&units));
                 }
-                // Malformed shift: re-emit the source verbatim.
+                // NOTE: malformed shift: re-emit the source verbatim.
                 _ => {
                     out.push('&');
                     out.push_str(payload);
@@ -172,8 +172,7 @@ mod tests {
 
     use imap_codec::imap_types::mailbox::Mailbox;
 
-    use super::*;
-
+    use crate::rfc3501::mailbox::*;
     // NOTE: RFC 3501 §5.1.3 reference vector.
     const RUSSIAN_PLAIN: &str = "Отправленные";
     const RUSSIAN_WIRE: &str = "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-";

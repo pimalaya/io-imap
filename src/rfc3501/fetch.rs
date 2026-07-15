@@ -18,7 +18,7 @@
 //!     types::fetch::{Macro, MacroOrMessageDataItemNames},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -63,7 +63,7 @@
 //!     types::fetch::{Macro, MacroOrMessageDataItemNames},
 //! };
 //!
-//! // Ready stream needed (TCP-connected, TLS-negociated, IMAP-authenticated)
+//! // Ready stream needed (TCP-connected, TLS-negotiated, IMAP-authenticated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
 //!
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
@@ -115,20 +115,25 @@ use crate::{coroutine::*, imap_try, send::*};
 /// Failure causes during the IMAP FETCH flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapMessageFetchError {
+    /// The server rejected the command with a NO response.
     #[error("IMAP FETCH failed: NO {0}")]
     No(String),
+    /// The server rejected the command with a BAD response.
     #[error("IMAP FETCH failed: BAD {0}")]
     Bad(String),
+    /// The server closed the session with an untagged BYE.
     #[error("IMAP FETCH failed: BYE {0}")]
     Bye(String),
-
+    /// The exchange ended without a tagged response from the server.
     #[error("IMAP FETCH failed: server did not return a tagged response")]
     MissingTagged,
+    /// The server answered OK but returned no FETCH data for the
+    /// requested message.
     #[error("IMAP FETCH failed: server did not return any data")]
     MissingData,
-
+    /// The underlying send/receive exchange failed (EOF, decode, framing).
     #[error("IMAP FETCH failed: {0}")]
-    Send(#[from] SendImapCommandError),
+    Send(#[from] ImapSendError),
 }
 
 /// Options for the IMAP FETCH coroutines.
@@ -147,6 +152,8 @@ pub struct ImapMessageFetch {
 }
 
 impl ImapMessageFetch {
+    /// Builds a FETCH coroutine fetching `items` for every message in
+    /// `sequence_set`.
     pub fn new(
         sequence_set: SequenceSet,
         items: MacroOrMessageDataItemNames<'static>,
@@ -164,7 +171,7 @@ impl ImapMessageFetch {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -180,45 +187,41 @@ impl ImapCoroutine for ImapMessageFetch {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("fetch: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageFetchError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageFetchError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageFetchError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut output: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>> =
+                    BTreeMap::new();
+                for data in out.data {
+                    if let Data::Fetch { seq, items } = data {
+                        output.entry(seq).or_default().extend(items);
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageFetchError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut output: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>> =
-                        BTreeMap::new();
-                    for data in out.data {
-                        if let Data::Fetch { seq, items } = data {
-                            output.entry(seq).or_default().extend(items.into_iter());
-                        }
+                match body.kind {
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output
+                        .into_iter()
+                        .map(|(key, val)| (key, Vec1::unvalidated(val)))
+                        .collect())),
+                    StatusKind::No => {
+                        let err = ImapMessageFetchError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(output
-                            .into_iter()
-                            .map(|(key, val)| (key, Vec1::unvalidated(val)))
-                            .collect())),
-                        StatusKind::No => {
-                            let err = ImapMessageFetchError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageFetchError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMessageFetchError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -231,6 +234,8 @@ pub struct ImapMessageFetchFirst {
 }
 
 impl ImapMessageFetchFirst {
+    /// Builds a FETCH coroutine fetching `items` for the single message
+    /// `id`.
     pub fn new(
         id: NonZeroU32,
         items: MacroOrMessageDataItemNames<'static>,
@@ -248,7 +253,7 @@ impl ImapMessageFetchFirst {
 
         trace!("send IMAP command {command:?}");
 
-        let state = State::Send(SendImapCommand::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
 
         Self { state }
     }
@@ -263,46 +268,42 @@ impl ImapCoroutine for ImapMessageFetchFirst {
         fragmentizer: &mut Fragmentizer,
         arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        loop {
-            trace!("fetch first: {}", self.state);
+        match &mut self.state {
+            State::Send(send) => {
+                let out = imap_try!(send, fragmentizer, arg);
 
-            match &mut self.state {
-                State::Send(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                if let Some(bye) = out.bye {
+                    let err = ImapMessageFetchError::Bye(bye.text.to_string());
+                    return ImapCoroutineState::Complete(Err(err));
+                }
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapMessageFetchError::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
+                let Some(Tagged { body, .. }) = out.tagged else {
+                    let err = ImapMessageFetchError::MissingTagged;
+                    return ImapCoroutineState::Complete(Err(err));
+                };
+
+                let mut output = None;
+                for data in out.data {
+                    if let Data::Fetch { items, .. } = data {
+                        output = Some(items);
                     }
+                }
 
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapMessageFetchError::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let mut output = None;
-                    for data in out.data {
-                        if let Data::Fetch { items, .. } = data {
-                            output = Some(items);
+                match body.kind {
+                    StatusKind::Ok => match output {
+                        Some(items) => ImapCoroutineState::Complete(Ok(items)),
+                        None => {
+                            ImapCoroutineState::Complete(Err(ImapMessageFetchError::MissingData))
                         }
+                    },
+                    StatusKind::No => {
+                        let err = ImapMessageFetchError::No(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
                     }
-
-                    return match body.kind {
-                        StatusKind::Ok => match output {
-                            Some(items) => ImapCoroutineState::Complete(Ok(items)),
-                            None => ImapCoroutineState::Complete(Err(
-                                ImapMessageFetchError::MissingData,
-                            )),
-                        },
-                        StatusKind::No => {
-                            let err = ImapMessageFetchError::No(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                        StatusKind::Bad => {
-                            let err = ImapMessageFetchError::Bad(body.text.to_string());
-                            ImapCoroutineState::Complete(Err(err))
-                        }
-                    };
+                    StatusKind::Bad => {
+                        let err = ImapMessageFetchError::Bad(body.text.to_string());
+                        ImapCoroutineState::Complete(Err(err))
+                    }
                 }
             }
         }
@@ -310,7 +311,7 @@ impl ImapCoroutine for ImapMessageFetchFirst {
 }
 
 enum State {
-    Send(SendImapCommand<CommandCodec>),
+    Send(ImapSend<CommandCodec>),
 }
 
 impl fmt::Display for State {
@@ -325,9 +326,9 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
 
-    use super::*;
+    use crate::rfc3501::fetch::*;
 
     #[test]
     fn fetch_success_groups_by_seq() {
@@ -448,8 +449,6 @@ mod tests {
         let err = expect_complete_err_first(&mut fetch, &mut frag, reply.as_bytes());
         assert!(matches!(err, ImapMessageFetchError::MissingData));
     }
-
-    // --- utils
 
     fn expect_wants_write_fetch(
         cor: &mut ImapMessageFetch,
