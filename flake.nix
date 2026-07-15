@@ -1,5 +1,5 @@
 {
-  description = "IMAP client library, written in Rust";
+  description = "IMAP client library for Rust";
 
   inputs = {
     nixpkgs = {
@@ -20,6 +20,5 @@
     inputs:
     (import inputs.pimalaya).mkFlakeOutputs inputs {
       shell = ./shell.nix;
-      default = ./default.nix;
     };
 }

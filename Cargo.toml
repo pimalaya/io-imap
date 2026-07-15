@@ -1,6 +1,6 @@
 [package]
 name = "io-imap"
-description = "IMAP client library"
+description = "IMAP client library for Rust"
 version = "0.2.0"
 authors = ["soywod <pimalaya.org@posteo.net>"]
 rust-version = "1.87"
