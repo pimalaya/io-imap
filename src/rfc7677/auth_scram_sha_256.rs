@@ -53,7 +53,7 @@ use alloc::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use imap_codec::{
     AuthenticateDataCodec, CommandCodec,
     fragmentizer::Fragmentizer,
@@ -68,7 +68,7 @@ use imap_codec::{
     },
 };
 use log::trace;
-use rand::{Rng, distributions::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -548,7 +548,7 @@ fn escape_username(username: &str) -> String {
 }
 
 fn generate_nonce() -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(24)
         .map(char::from)

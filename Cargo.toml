@@ -53,13 +53,13 @@ url = "2"
 [dependencies]
 anyhow = { version = "1", optional = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 imap-codec = { version = "2.0.0-alpha.8", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
 log = "0.4"
-pbkdf2 = { version = "0.12", optional = true }
+pbkdf2 = { version = "0.13", optional = true }
 pimalaya-stream = { version = "0.0.1", default-features = false, optional = true }
-rand = { version = "0.8", optional = true }
+rand = { version = "0.10", optional = true }
 secrecy = { version = "0.10", default-features = false }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 thiserror = { version = "2", default-features = false }
 url = { version = "2.2", default-features = false, optional = true }
