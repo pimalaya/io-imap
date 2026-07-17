@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `ImapMessageMove` losing the `COPYUID` triple when the server returns it in an untagged `OK` rather than the tagged reply.
+
+  RFC 6851 §4.4 servers (Fastmail among them) emit the MOVE `COPYUID` in an untagged `OK` before the `EXPUNGE`, not in the tagged response the coroutine inspected, so every successful move returned `None`. It now reads the code from the tagged reply or any untagged status response, tagged first.
+
 ## [0.2.0] - 2026-07-15
 
 ### Added

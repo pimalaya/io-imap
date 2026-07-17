@@ -155,20 +155,15 @@ impl ImapCoroutine for ImapMessageMove {
 
                 match body.kind {
                     StatusKind::Ok => {
-                        let copyuid = if let Some(Code::CopyUid {
-                            uid_validity,
-                            source,
-                            destination,
-                        }) = body.code
-                        {
-                            Some((
-                                uid_validity.get(),
-                                uid_set_to_vec(source),
-                                uid_set_to_vec(destination),
-                            ))
-                        } else {
-                            None
-                        };
+                        // NOTE: COPY carries COPYUID in the tagged OK
+                        // (RFC 4315), but MOVE (RFC 6851 §4.4) emits it in an
+                        // untagged OK before the EXPUNGE, so accept either
+                        // placement, tagged first.
+                        let copyuid = copyuid_from_code(body.code).or_else(|| {
+                            out.untagged
+                                .into_iter()
+                                .find_map(|status| copyuid_from_code(status.code))
+                        });
                         ImapCoroutineState::Complete(Ok(copyuid))
                     }
                     StatusKind::No => {
@@ -182,6 +177,23 @@ impl ImapCoroutine for ImapMessageMove {
                 }
             }
         }
+    }
+}
+
+/// Extracts the `(uid_validity, source, destination)` COPYUID triple
+/// from a response code, whether it rode the tagged or an untagged OK.
+fn copyuid_from_code(code: Option<Code<'static>>) -> ImapCopyUid {
+    match code {
+        Some(Code::CopyUid {
+            uid_validity,
+            source,
+            destination,
+        }) => Some((
+            uid_validity.get(),
+            uid_set_to_vec(source),
+            uid_set_to_vec(destination),
+        )),
+        _ => None,
     }
 }
 
@@ -224,6 +236,36 @@ mod tests {
         let reply = format!("{tag} OK [COPYUID 1700 1:3 10:12] MOVE completed\r\n");
         let copyuid = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes())
             .expect("server returned COPYUID");
+        let (uid_validity, source, destination) = copyuid;
+        assert_eq!(1700, uid_validity);
+        assert_eq!(vec![1, 2, 3], source);
+        assert_eq!(vec![10, 11, 12], destination);
+    }
+
+    #[test]
+    fn success_with_untagged_copyuid_returns_uids() {
+        // NOTE: RFC 6851 §4.4 (and Fastmail in practice): MOVE carries
+        // COPYUID in an untagged OK before the EXPUNGE, not the tagged reply.
+        let mut mov = ImapMessageMove::new(
+            "1:3".try_into().expect("valid sequence set"),
+            "Archive".try_into().expect("valid mailbox"),
+            ImapMessageMoveOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut mov, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+
+        expect_wants_read(&mut mov, &mut frag);
+
+        let reply = format!(
+            "* OK [COPYUID 1700 1:3 10:12] Completed\r\n\
+             * 1 EXPUNGE\r\n\
+             {tag} OK MOVE completed\r\n"
+        );
+        let copyuid = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes())
+            .expect("server returned untagged COPYUID");
         let (uid_validity, source, destination) = copyuid;
         assert_eq!(1700, uid_validity);
         assert_eq!(vec![1, 2, 3], source);
