@@ -54,6 +54,7 @@ url = "2"
 [dependencies]
 anyhow = { version = "1", optional = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 hmac = { version = "0.13", optional = true }
 imap-codec = { version = "2.0.0-alpha.8", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
 log = "0.4"

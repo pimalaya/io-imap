@@ -586,6 +586,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chrono",
  "env_logger",
  "hmac",
  "imap-codec",

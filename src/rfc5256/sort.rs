@@ -58,9 +58,11 @@
 //! println!("{ids:?}");
 //! ```
 
-use core::{cmp::Ordering, fmt, mem, num::NonZeroU32};
+use core::{cmp::Ordering, fmt, mem, num::NonZeroU32, str::from_utf8};
 
 use alloc::{collections::BTreeMap, string::String, string::ToString, vec::Vec};
+
+use chrono::{DateTime, FixedOffset};
 
 use imap_codec::{
     CommandCodec,
@@ -421,6 +423,9 @@ fn cmp_fetch_items(
             a.cmp(&b)
         }
         SortKey::Date => {
+            // The ENVELOPE `date` is the raw `Date:` header (RFC 5322),
+            // so it must be parsed to an instant before comparing: a
+            // lexical string compare orders by weekday name, not time.
             let a = a.as_ref().iter().find_map(|item| match item {
                 MessageDataItem::Envelope(envelope) => envelope.date.0.as_ref().map(AsRef::as_ref),
                 _ => None,
@@ -429,7 +434,7 @@ fn cmp_fetch_items(
                 MessageDataItem::Envelope(envelope) => envelope.date.0.as_ref().map(AsRef::as_ref),
                 _ => None,
             });
-            a.cmp(&b)
+            date_sort_key(a).cmp(&date_sort_key(b))
         }
         SortKey::Subject => {
             let a = a.as_ref().iter().find_map(|item| match item {
@@ -450,6 +455,16 @@ fn cmp_fetch_items(
             Ordering::Equal
         }
     }
+}
+
+/// Parses a raw `Date:` header (RFC 5322 / 2822) into a comparable
+/// instant, so `SortKey::Date` orders chronologically rather than by the
+/// header's leading weekday. The ENVELOPE date arrives as bytes; a
+/// non-UTF-8, unparsable, or absent header yields `None`, which sorts
+/// before any real date.
+fn date_sort_key(raw: Option<&[u8]>) -> Option<DateTime<FixedOffset>> {
+    let raw = from_utf8(raw?).ok()?;
+    DateTime::parse_from_rfc2822(raw).ok()
 }
 
 #[cfg(test)]
@@ -656,6 +671,29 @@ mod tests {
         let search_reply = format!("* SEARCH\r\n{search_tag} OK SEARCH completed\r\n");
         let ids = complete_ok(&mut sort, &mut frag, Some(search_reply.as_bytes()));
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn date_sort_key_is_chronological_not_lexical() {
+        // Same format iCloud fixtures use: the weekday leads the string,
+        // so a lexical compare orders by weekday name, not by instant.
+        let mon = date_sort_key(Some(b"Mon, 13 Jul 2026 09:00:00 +0200"));
+        let fri = date_sort_key(Some(b"Fri, 17 Jul 2026 16:20:00 +0200"));
+
+        // Chronologically 13 Jul precedes 17 Jul...
+        assert!(mon < fri, "13 Jul must sort before 17 Jul");
+        // ...even though lexically the raw headers compare the other way.
+        assert!(*b"Fri, 17 Jul 2026 16:20:00 +0200" < *b"Mon, 13 Jul 2026 09:00:00 +0200");
+
+        // Offsets are honoured: 10:00 +0000 is after 11:00 +0200 (09:00Z).
+        let utc = date_sort_key(Some(b"Mon, 13 Jul 2026 10:00:00 +0000"));
+        let cest = date_sort_key(Some(b"Mon, 13 Jul 2026 11:00:00 +0200"));
+        assert!(cest < utc, "09:00Z must sort before 10:00Z");
+
+        // Absent or unparsable dates fall to the bottom, deterministically.
+        assert_eq!(date_sort_key(None), None);
+        assert_eq!(date_sort_key(Some(b"not a date")), None);
+        assert!(date_sort_key(None) < mon);
     }
 
     fn nz(n: u32) -> NonZeroU32 {
