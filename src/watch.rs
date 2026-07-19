@@ -1,11 +1,15 @@
 //! IMAP single-mailbox watcher: IDLE (RFC 2177) for the wake signal,
-//! SELECT (QRESYNC) (RFC 7162) for UID-keyed deltas.
+//! EXAMINE (QRESYNC) (RFC 7162) for UID-keyed deltas.
+//!
+//! The mailbox is opened with EXAMINE, not SELECT, so the session is
+//! **read-only**: the watcher never writes (no flag changes, no expunge),
+//! and it avoids SELECT's `\Recent` reset on every re-open.
 //!
 //! QRESYNC: <https://www.rfc-editor.org/rfc/rfc7162>
 //!
 //! ```text
-//! SELECT (CONDSTORE) → FETCH 1:* (UID FLAGS) [seed shadow]
-//!     → IDLE → SELECT (QRESYNC) → emit deltas → IDLE → ...
+//! EXAMINE (CONDSTORE) → FETCH 1:* (UID FLAGS) [seed shadow]
+//!     → IDLE → EXAMINE (QRESYNC) → emit deltas → IDLE → ...
 //! ```
 //!
 //! Connection is dedicated. Flip the shared [`AtomicBool`] to wind
@@ -93,11 +97,9 @@ use crate::{
     coroutine::*,
     rfc2177::idle::{ImapIdle, ImapIdleError, ImapIdleOptions, ImapIdleYield},
     rfc3501::{
+        examine::{ImapMailboxExamine, ImapMailboxExamineError, ImapMailboxExamineOptions},
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchOptions},
-        select::{
-            ImapMailboxSelect, ImapMailboxSelectData, ImapMailboxSelectError,
-            ImapMailboxSelectOptions,
-        },
+        select::ImapMailboxSelectData,
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
 };
@@ -142,20 +144,20 @@ pub enum ImapMailboxWatchError {
     /// The capability list given to `new` lacks QRESYNC.
     #[error("IMAP server does not advertise QRESYNC")]
     QresyncUnsupported,
-    /// The SELECT response carried no UIDVALIDITY, so deltas cannot be
+    /// The EXAMINE response carried no UIDVALIDITY, so deltas cannot be
     /// keyed safely.
-    #[error("IMAP server did not return UIDVALIDITY in SELECT response")]
+    #[error("IMAP server did not return UIDVALIDITY in EXAMINE response")]
     MissingUidValidity,
-    /// The SELECT response carried no HIGHESTMODSEQ, so there is no
+    /// The EXAMINE response carried no HIGHESTMODSEQ, so there is no
     /// resync point.
-    #[error("IMAP server did not return HIGHESTMODSEQ in SELECT response")]
+    #[error("IMAP server did not return HIGHESTMODSEQ in EXAMINE response")]
     MissingHighestModSeq,
     /// The baseline `1:*` sequence set failed to parse.
     #[error("Invalid `1:*` sequence set: {0}")]
     InvalidSequenceSet(String),
-    /// The initial or QRESYNC SELECT failed.
-    #[error("IMAP SELECT error")]
-    Select(#[from] ImapMailboxSelectError),
+    /// The initial or QRESYNC EXAMINE failed.
+    #[error("IMAP EXAMINE error")]
+    Examine(#[from] ImapMailboxExamineError),
     /// The baseline FETCH failed.
     #[error("IMAP FETCH error")]
     Fetch(#[from] ImapMessageFetchError),
@@ -180,11 +182,11 @@ pub enum ImapMailboxWatchYield {
 
 enum State {
     EnableQresync(ImapExtensionEnable),
-    SelectInitial(ImapMailboxSelect),
+    ExamineInitial(ImapMailboxExamine),
     FetchBaseline(ImapMessageFetch),
     BeginIdle,
     Idle(ImapIdle),
-    SelectQresync(ImapMailboxSelect),
+    ExamineQresync(ImapMailboxExamine),
     EmitDeltas,
     Terminal,
 }
@@ -322,69 +324,72 @@ impl ImapCoroutine for ImapMailboxWatch {
                         debug!("enabled qresync");
                         trace!("{enabled:?}");
                         let parameters = vec![SelectParameter::CondStore];
-                        let select = ImapMailboxSelect::new(
+                        let examine = ImapMailboxExamine::new(
                             self.mailbox.clone(),
-                            ImapMailboxSelectOptions { parameters },
+                            ImapMailboxExamineOptions { parameters },
                         );
-                        self.state = State::SelectInitial(select);
+                        self.state = State::ExamineInitial(examine);
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
                         return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
 
-                State::SelectInitial(mut select) => match select.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::SelectInitial(select);
-                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-                        self.state = State::SelectInitial(select);
-                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
-                            bytes,
-                        ));
-                    }
-                    ImapCoroutineState::Complete(Ok(data)) => {
-                        let Some(uid_validity) = data.uid_validity else {
-                            return ImapCoroutineState::Complete(Err(
-                                ImapMailboxWatchError::MissingUidValidity,
+                State::ExamineInitial(mut examine) => {
+                    match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::ExamineInitial(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.state = State::ExamineInitial(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
+                                bytes,
                             ));
-                        };
-                        let Some(highest_mod_seq) = data.highest_mod_seq else {
-                            return ImapCoroutineState::Complete(Err(
-                                ImapMailboxWatchError::MissingHighestModSeq,
-                            ));
-                        };
-
-                        self.uid_validity = Some(uid_validity);
-                        self.highest_mod_seq = highest_mod_seq;
-                        debug!("selected mailbox with condstore");
-                        trace!("uid_validity: {uid_validity}");
-                        trace!("highest_mod_seq: {highest_mod_seq}");
-
-                        let sequence_set: SequenceSet = match "1:*".try_into() {
-                            Ok(s) => s,
-                            Err(_) => {
+                        }
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            let Some(uid_validity) = data.uid_validity else {
                                 return ImapCoroutineState::Complete(Err(
-                                    ImapMailboxWatchError::InvalidSequenceSet("1:*".into()),
+                                    ImapMailboxWatchError::MissingUidValidity,
                                 ));
-                            }
-                        };
-                        let item_names = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
-                            MessageDataItemName::Uid,
-                            MessageDataItemName::Flags,
-                        ]);
-                        let fetch = ImapMessageFetch::new(
-                            sequence_set,
-                            item_names,
-                            ImapMessageFetchOptions::default(),
-                        );
-                        self.state = State::FetchBaseline(fetch);
+                            };
+                            let Some(highest_mod_seq) = data.highest_mod_seq else {
+                                return ImapCoroutineState::Complete(Err(
+                                    ImapMailboxWatchError::MissingHighestModSeq,
+                                ));
+                            };
+
+                            self.uid_validity = Some(uid_validity);
+                            self.highest_mod_seq = highest_mod_seq;
+                            debug!("examined mailbox with condstore");
+                            trace!("uid_validity: {uid_validity}");
+                            trace!("highest_mod_seq: {highest_mod_seq}");
+
+                            let sequence_set: SequenceSet = match "1:*".try_into() {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    return ImapCoroutineState::Complete(Err(
+                                        ImapMailboxWatchError::InvalidSequenceSet("1:*".into()),
+                                    ));
+                                }
+                            };
+                            let item_names =
+                                MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+                                    MessageDataItemName::Uid,
+                                    MessageDataItemName::Flags,
+                                ]);
+                            let fetch = ImapMessageFetch::new(
+                                sequence_set,
+                                item_names,
+                                ImapMessageFetchOptions::default(),
+                            );
+                            self.state = State::FetchBaseline(fetch);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
                     }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return ImapCoroutineState::Complete(Err(err.into()));
-                    }
-                },
+                }
 
                 State::FetchBaseline(mut fetch) => match fetch.resume(fragmentizer, arg.take()) {
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
@@ -447,7 +452,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                         }
 
                         if self.idle_saw_data {
-                            // NOTE: uid_validity is set by SelectInitial.
+                            // NOTE: uid_validity is set by ExamineInitial.
                             let uid_validity = self.uid_validity.unwrap();
                             let modseq = NonZeroU64::new(self.highest_mod_seq)
                                 .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
@@ -457,11 +462,11 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 known_uids: None,
                                 seq_match_data: None,
                             }];
-                            let select = ImapMailboxSelect::new(
+                            let examine = ImapMailboxExamine::new(
                                 self.mailbox.clone(),
-                                ImapMailboxSelectOptions { parameters },
+                                ImapMailboxExamineOptions { parameters },
                             );
-                            self.state = State::SelectQresync(select);
+                            self.state = State::ExamineQresync(examine);
                         } else {
                             debug!("idle timed out with no data, restarting");
                             self.state = State::BeginIdle;
@@ -472,28 +477,30 @@ impl ImapCoroutine for ImapMailboxWatch {
                     }
                 },
 
-                State::SelectQresync(mut select) => match select.resume(fragmentizer, arg.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::SelectQresync(select);
-                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-                        self.state = State::SelectQresync(select);
-                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
-                            bytes,
-                        ));
-                    }
-                    ImapCoroutineState::Complete(Ok(data)) => {
-                        self.compute_deltas(&data);
-                        if let Some(new_modseq) = data.highest_mod_seq {
-                            self.highest_mod_seq = new_modseq;
+                State::ExamineQresync(mut examine) => {
+                    match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::ExamineQresync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
                         }
-                        self.state = State::EmitDeltas;
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.state = State::ExamineQresync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
+                                bytes,
+                            ));
+                        }
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            self.compute_deltas(&data);
+                            if let Some(new_modseq) = data.highest_mod_seq {
+                                self.highest_mod_seq = new_modseq;
+                            }
+                            self.state = State::EmitDeltas;
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
                     }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return ImapCoroutineState::Complete(Err(err.into()));
-                    }
-                },
+                }
 
                 State::EmitDeltas => {
                     if let Some(event) = self.pending.pop_front() {
