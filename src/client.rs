@@ -337,6 +337,13 @@ impl ImapClientStd {
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = self.stream.read(&mut buf)?;
+                    // NOTE: a zero-length read is EOF; error out instead of
+                    // feeding the coroutine an empty buffer forever.
+                    if n == 0 {
+                        let kind = io::ErrorKind::UnexpectedEof;
+                        let err = io::Error::new(kind, "IMAP server closed the connection");
+                        return Err(err.into());
+                    }
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
