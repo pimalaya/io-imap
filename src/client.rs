@@ -300,6 +300,11 @@ pub struct ImapClientStd {
     /// `None` skips, `Some(empty)` sends `ID NIL`, `Some(params)`
     /// sends `ID (k v ...)`.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+    /// Whether the server greeting was `PREAUTH`: the session opened
+    /// already authenticated (a socket proxy such as sirup), so
+    /// [`connect`](Self::connect) skipped the SASL step. Stays `false`
+    /// on a freshly-opened connection.
+    pub pre_authenticated: bool,
 }
 
 impl ImapClientStd {
@@ -310,6 +315,7 @@ impl ImapClientStd {
             stream: Box::new(stream),
             fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
             auto_id: None,
+            pre_authenticated: false,
         }
     }
 
@@ -936,19 +942,28 @@ impl ImapClientStd {
         sasl: Option<impl Into<Sasl>>,
         auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<(Self, Vec<Capability<'static>>), ImapClientStdError> {
-        let Some(host) = url.host_str() else {
-            return Err(ImapClientStdError::UrlMissingHost(url.to_string()));
-        };
-
         let (stream, is_tls) = match url.scheme() {
-            scheme if scheme.eq_ignore_ascii_case("imap") => (
-                StreamStd::connect_tcp(host, url.port().unwrap_or(143))?,
-                false,
-            ),
-            scheme if scheme.eq_ignore_ascii_case("imaps") => (
-                StreamStd::connect_tls(host, url.port().unwrap_or(993), tls)?,
-                true,
-            ),
+            scheme if scheme.eq_ignore_ascii_case("imap") => {
+                let host = tcp_host(url)?;
+                (
+                    StreamStd::connect_tcp(host, url.port().unwrap_or(143))?,
+                    false,
+                )
+            }
+            scheme if scheme.eq_ignore_ascii_case("imaps") => {
+                let host = tcp_host(url)?;
+                (
+                    StreamStd::connect_tls(host, url.port().unwrap_or(993), tls)?,
+                    true,
+                )
+            }
+            // NOTE: a `unix://` URL reaches a local socket proxy such as
+            // sirup: no host, no TLS, and the session is usually already
+            // authenticated (see the PREAUTH handling below). The path is
+            // the socket path, e.g. `unix:///run/sirup.sock`.
+            scheme if scheme.eq_ignore_ascii_case("unix") => {
+                (StreamStd::connect_unix(url.path())?, false)
+            }
             scheme => {
                 let url = url.to_string();
                 let scheme = scheme.to_string();
@@ -978,13 +993,20 @@ impl ImapClientStd {
         let mut client = Self::new(stream);
         client.auto_id = auto_id;
 
-        let mut capability = if starttls {
-            client.capability()?
+        let (mut capability, pre_authenticated) = if starttls {
+            (client.capability()?, false)
         } else {
-            client.greeting()?
+            let greeting = client.run(ImapGreetingGet::new(ImapGreetingGetOptions {
+                ensure_capabilities: true,
+            }))?;
+            (greeting.capability, greeting.pre_authenticated)
         };
+        client.pre_authenticated = pre_authenticated;
 
-        if let Some(sasl) = sasl.map(Into::into) {
+        // NOTE: a PREAUTH greeting means the session opened already
+        // authenticated (a sirup-style proxy), so the SASL step is
+        // skipped even when credentials are configured.
+        if let Some(sasl) = sasl.map(Into::into).filter(|_| !pre_authenticated) {
             let ir = capability.contains(&Capability::SaslIr);
 
             capability = match sasl {
@@ -1060,6 +1082,13 @@ impl ImapClientStd {
 
         Ok((client, capability))
     }
+}
+
+/// Extracts the host from a TCP-bound IMAP URL (`imap`/`imaps`), erroring
+/// when it carries none. The `unix` scheme does not go through here.
+fn tcp_host(url: &Url) -> Result<&str, ImapClientStdError> {
+    url.host_str()
+        .ok_or_else(|| ImapClientStdError::UrlMissingHost(url.to_string()))
 }
 
 /// Inline STARTTLS loop: keeps the concrete `StreamStd` so that
