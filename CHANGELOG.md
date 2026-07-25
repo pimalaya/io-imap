@@ -6,11 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-25
+
 ### Fixed
 
 - Fixed `ImapMessageMove` losing the `COPYUID` triple when the server returns it in an untagged `OK` rather than the tagged reply.
 
   RFC 6851 §4.4 servers (Fastmail among them) emit the MOVE `COPYUID` in an untagged `OK` before the `EXPUNGE`, not in the tagged response the coroutine inspected, so every successful move returned `None`. It now reads the code from the tagged reply or any untagged status response, tagged first.
+
+- Fixed the client-side SORT fallback ordering `SortKey::Date` by the header's leading weekday instead of chronologically.
+
+  The ENVELOPE date arrives as the raw RFC 5322 `Date:` header, so a lexical byte compare ordered messages by weekday name. It now parses each header to an instant, honouring the timezone offset, before comparing; an absent or unparsable date sorts first, deterministically.
+
+- Fixed `ImapMailboxWatch` opening the mailbox with SELECT instead of EXAMINE.
+
+  SELECT starts a read-write session and resets `\Recent` on every re-open, but the watcher only reads. It now opens the mailbox read-only with EXAMINE (QRESYNC/CONDSTORE), so it never mutates the mailbox and avoids the `\Recent` churn across its IDLE and re-open loop. The `ImapMailboxWatchError` `Select*` variants become `Examine*` accordingly.
 
 ## [0.2.0] - 2026-07-15
 
@@ -141,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.2.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.3.0..HEAD
+[0.3.0]: https://github.com/pimalaya/io-imap/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-imap/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-imap/compare/root..v0.1.0
