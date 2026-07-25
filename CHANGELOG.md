@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-25
+
+### Added
+
+- Added `unix://` URL scheme support and PREAUTH handling to `ImapClientStd::connect`.
+
+  A `unix://` URL now connects to a local Unix domain socket (via `StreamStd::connect_unix` over its path) to reach a socket proxy such as sirup. When the server greeting is `PREAUTH` the session opens already authenticated, so the SASL step is skipped; the new `ImapClientStd::pre_authenticated` field records it. Host extraction for the `imap`/`imaps` schemes moved into a `tcp_host` helper.
+
+- Added a global tag prefix that can be set `crate::tag::set_tag_prefix`.
+
+  This avoid tag conflicts between multiple instances of `io-imap`.
+
+- Added `default_port`, returning the default IMAP port for a scheme (993 for `imaps`, 143 otherwise).
+
+  Exposed so config-based callers derive the fallback port identically to `ImapClientStd::connect`, which now shares the same helper.
+
+### Fixed
+
+- Fixed the std client spinning on a closed connection: a zero-length read is now treated as EOF and returns an `UnexpectedEof` error instead of feeding the coroutine an empty buffer forever.
+
 ## [0.3.0] - 2026-07-25
 
 ### Fixed
@@ -151,7 +171,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.3.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.3.1..HEAD
+[0.3.1]: https://github.com/pimalaya/io-imap/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/pimalaya/io-imap/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-imap/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-imap/compare/root..v0.1.0

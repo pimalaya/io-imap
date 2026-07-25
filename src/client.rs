@@ -286,6 +286,15 @@ pub fn default_alpn() -> Vec<String> {
     vec![String::from("imap")]
 }
 
+/// Default IMAP port for `scheme`: 993 for `imaps`, 143 otherwise.
+pub fn default_port(scheme: &str) -> u16 {
+    if scheme.eq_ignore_ascii_case("imaps") {
+        993
+    } else {
+        143
+    }
+}
+
 /// Blocking IMAP client: a stream, the connection-wide `Fragmentizer`
 /// and one method per coroutine.
 pub struct ImapClientStd {
@@ -946,14 +955,14 @@ impl ImapClientStd {
             scheme if scheme.eq_ignore_ascii_case("imap") => {
                 let host = tcp_host(url)?;
                 (
-                    StreamStd::connect_tcp(host, url.port().unwrap_or(143))?,
+                    StreamStd::connect_tcp(host, url.port().unwrap_or(default_port(scheme)))?,
                     false,
                 )
             }
             scheme if scheme.eq_ignore_ascii_case("imaps") => {
                 let host = tcp_host(url)?;
                 (
-                    StreamStd::connect_tls(host, url.port().unwrap_or(993), tls)?,
+                    StreamStd::connect_tls(host, url.port().unwrap_or(default_port(scheme)), tls)?,
                     true,
                 )
             }
