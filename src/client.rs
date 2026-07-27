@@ -480,13 +480,16 @@ impl ImapClientStd {
         self.run(ImapNoop::new())
     }
 
-    /// Sends an arbitrary raw command line (no tag, no trailing CRLF)
-    /// and returns the verbatim server response.
+    /// Sends one or more caller-tagged command lines byte-for-byte and
+    /// returns the verbatim server response.
     ///
-    /// The response spans up to and including the tagged completion
-    /// line. Synchronizing literals are not supported.
-    pub fn raw(&mut self, command: impl AsRef<str>) -> Result<String, ImapClientStdError> {
-        self.run(ImapRaw::new(command))
+    /// The bytes are written to the server exactly as given (no tag is
+    /// injected, no CRLF is trimmed or appended), so callers must tag every
+    /// command and separate them with CRLF. The response spans up to and
+    /// including the tagged completion of every command, which may arrive
+    /// out of order.
+    pub fn raw(&mut self, command: impl AsRef<[u8]>) -> Result<String, ImapClientStdError> {
+        self.run(ImapRaw::new(command)?)
     }
 
     /// `ID`. An `opts.parameters` of `None` sends `ID NIL`.

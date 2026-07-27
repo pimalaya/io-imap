@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Reworked `ImapRaw` into a byte-verbatim batch passthrough. **Breaking.**
+
+  `ImapRaw::new` (and `ImapClientStd::raw`) now take `impl AsRef<[u8]>` and send the given bytes exactly as-is: no tag is injected and no CRLF is trimmed or appended. Callers therefore tag every command and separate them with CRLF, which lets a whole pipeline be sent in one exchange. The input is parsed up front to collect every command's tag, and the exchange reads until all of them are acknowledged, tolerating out-of-order tagged completions (RFC 3501 §5.5). `ImapRaw::new` is now fallible, validating the input and rejecting an untagged, duplicate-tagged, unterminated or empty batch via the new `ImapRawError` variants `NoCommand`, `MissingTag`, `DuplicateTag` and `IncompleteCommand`.
+
 ## [0.3.1] - 2026-07-25
 
 ### Added

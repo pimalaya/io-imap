@@ -1,11 +1,20 @@
-//! IMAP raw passthrough coroutine; sends an arbitrary command line and
-//! returns the verbatim server response.
+//! IMAP raw passthrough coroutine; writes one or more caller-tagged
+//! command lines byte-for-byte and returns the verbatim server response.
 //!
-//! The input is a command WITHOUT tag and WITHOUT trailing CRLF (e.g.
-//! `SEARCH FROM "foo@bar"` or `CAPABILITY`); the coroutine prepends a
-//! generated tag and appends CRLF, then reads every response up to and
-//! including the tagged completion line matching that tag. Synchronizing
-//! literals (`{n}` continuation requests) are out of scope.
+//! The input is sent to the server exactly as given: no tag is injected,
+//! no CRLF is trimmed or appended. Callers are therefore responsible for
+//! tagging every command and separating them with CRLF, which makes it
+//! possible to pipeline a whole batch in a single exchange, e.g.
+//!
+//! ```text
+//! a1 SELECT INBOX\r\na2 SEARCH ALL\r\na3 FETCH 1 BODY[]\r\n
+//! ```
+//!
+//! Before anything hits the wire the input is parsed to extract the tag
+//! of every command; the exchange then reads responses until *all* those
+//! tags have been acknowledged by a matching tagged completion line. This
+//! tolerates the server answering pipelined commands out of order (RFC
+//! 3501 §5.5), which a "wait for the last tag" strategy would not.
 //!
 //! # Example
 //!
@@ -27,7 +36,7 @@
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
-//! let mut coroutine = ImapRaw::new("CAPABILITY");
+//! let mut coroutine = ImapRaw::new(b"a1 CAPABILITY\r\n").unwrap();
 //! let mut arg = None;
 //!
 //! let response = loop {
@@ -49,21 +58,40 @@
 
 use core::{fmt, mem};
 
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeSet, string::String, vec::Vec};
 
 use imap_codec::{
     fragmentizer::{FragmentInfo, Fragmentizer},
-    imap_types::{core::TagGenerator, utils::escape_byte_string},
+    imap_types::utils::escape_byte_string,
 };
 use log::trace;
 use thiserror::Error;
 
 use crate::coroutine::*;
 
+/// Upper bound on the size of a single parsed command, mirroring the
+/// read-side fragmentizer cap.
+const MAX_COMMAND_SIZE: u32 = 50 * 1024 * 1024;
+
 /// Failure causes during the IMAP raw passthrough flow.
 #[derive(Clone, Debug, Error)]
 pub enum ImapRawError {
-    /// The stream reached EOF before the tagged completion line arrived.
+    /// The input carried no complete, tagged command.
+    #[error("IMAP raw command failed: no tagged command in input")]
+    NoCommand,
+    /// A command line carried no valid tag (untagged `*`/`+` line, a bare
+    /// word with no command, or otherwise malformed).
+    #[error("IMAP raw command failed: a command line carries no valid tag")]
+    MissingTag,
+    /// The same tag was reused by more than one command in the batch,
+    /// which would make its completion ambiguous.
+    #[error("IMAP raw command failed: tag `{0}` is used by more than one command")]
+    DuplicateTag(String),
+    /// The final command was not terminated by CRLF (or a literal was
+    /// truncated), so it would reach the server incomplete.
+    #[error("IMAP raw command failed: the last command is not terminated")]
+    IncompleteCommand,
+    /// The stream reached EOF before every tagged completion line arrived.
     #[error("IMAP raw command failed: reached unexpected EOF on stream")]
     Eof,
 }
@@ -73,44 +101,74 @@ pub enum ImapRawError {
 /// The returned String is a lossy UTF-8 decoding of the raw bytes, so binary
 /// payloads carried in literals are rendered with replacement characters.
 pub struct ImapRaw {
-    tag_bytes: Vec<u8>,
     command: Vec<u8>,
+    pending: BTreeSet<Vec<u8>>,
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
     response: Vec<u8>,
-    done: bool,
 }
 
 impl ImapRaw {
-    /// Builds the wire line `<tag> <command>\r\n` around a freshly
-    /// generated tag.
+    /// Builds a raw passthrough over `command`, whose bytes are written to
+    /// the server verbatim.
     ///
-    /// A trailing CRLF on `command` is trimmed so callers cannot
-    /// accidentally emit an empty extra line.
-    pub fn new(command: impl AsRef<str>) -> Self {
-        let tag = TagGenerator::new().generate();
-        let tag_bytes = tag.as_ref().as_bytes().to_vec();
+    /// The input must contain one or more IMAP commands, each carrying its
+    /// own tag and terminated by CRLF; the tags are extracted up front so
+    /// the exchange knows exactly how many tagged completions to wait for.
+    /// Nothing is added to or stripped from the bytes sent on the wire.
+    ///
+    /// Returns an error when the input holds no tagged command, when a
+    /// command carries no valid tag, when a tag is reused, or when the last
+    /// command is not terminated.
+    pub fn new(command: impl AsRef<[u8]>) -> Result<Self, ImapRawError> {
+        let command = command.as_ref().to_vec();
 
-        let command = command.as_ref().trim_end_matches(['\r', '\n']);
+        // NOTE: parse the outgoing bytes with the same fragmentizer the
+        // read side uses, so tags are extracted correctly across literals
+        // and CRLF-separated command boundaries.
+        let mut probe = Fragmentizer::new(MAX_COMMAND_SIZE);
+        probe.enqueue_bytes(&command);
 
-        let mut line = Vec::with_capacity(tag_bytes.len() + command.len() + 3);
-        line.extend_from_slice(&tag_bytes);
-        line.push(b' ');
-        line.extend_from_slice(command.as_bytes());
-        line.extend_from_slice(b"\r\n");
+        let mut pending = BTreeSet::new();
 
-        trace!("build raw command: {}", escape_byte_string(&line));
+        while probe.progress().is_some() {
+            if !probe.is_message_complete() {
+                continue;
+            }
 
-        Self {
-            tag_bytes,
-            command: line,
+            let tag = probe.decode_tag().ok_or(ImapRawError::MissingTag)?;
+            let tag_bytes = tag.as_ref().as_bytes().to_vec();
+
+            if !pending.insert(tag_bytes) {
+                return Err(ImapRawError::DuplicateTag(String::from(tag.as_ref())));
+            }
+        }
+
+        // NOTE: once the input is drained, a non-empty current message is a
+        // trailing command that never reached its terminating CRLF.
+        if !probe.message_bytes().is_empty() {
+            return Err(ImapRawError::IncompleteCommand);
+        }
+
+        if pending.is_empty() {
+            return Err(ImapRawError::NoCommand);
+        }
+
+        trace!(
+            "build raw batch ({} command(s)): {}",
+            pending.len(),
+            escape_byte_string(&command),
+        );
+
+        Ok(Self {
+            command,
+            pending,
             state: State::Write,
             wants_read: false,
             wants_write: None,
             response: Vec::new(),
-            done: false,
-        }
+        })
     }
 }
 
@@ -161,16 +219,11 @@ impl ImapCoroutine for ImapRaw {
                         trace!("captured response message: {}", escape_byte_string(bytes));
                         self.response.extend_from_slice(bytes);
 
-                        // NOTE: the only tagged response in a single-command
-                        // exchange is our completion line; an untagged
-                        // response decodes to no tag and is captured then
-                        // skipped.
-                        let is_completion = fragmentizer
-                            .decode_tag()
-                            .is_some_and(|tag| tag.as_ref().as_bytes() == self.tag_bytes);
-
-                        if is_completion {
-                            self.done = true;
+                        // NOTE: untagged responses decode to no tag and are
+                        // captured then ignored; a tagged completion clears
+                        // the matching command from the pending set.
+                        if let Some(tag) = fragmentizer.decode_tag() {
+                            self.pending.remove(tag.as_ref().as_bytes());
                         }
                     }
                     Some(FragmentInfo::Literal { .. }) => {
@@ -178,7 +231,7 @@ impl ImapCoroutine for ImapRaw {
                         // they are captured wholesale once its final line
                         // completes.
                     }
-                    None if self.done => {
+                    None if self.pending.is_empty() => {
                         let response = String::from_utf8_lossy(&self.response).into_owned();
                         trace!("raw response complete ({} bytes)", self.response.len());
                         return ImapCoroutineState::Complete(Ok(response));
@@ -217,42 +270,57 @@ mod tests {
     use crate::rfc3501::raw::*;
 
     #[test]
-    fn success_returns_full_raw_response() {
-        let mut raw = ImapRaw::new("CAPABILITY");
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+    fn command_is_written_verbatim() {
+        let input = b"a1 CAPABILITY\r\n";
+        let mut raw = ImapRaw::new(input).unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
 
         let bytes = expect_wants_write(&mut raw, &mut frag, None);
-        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
+        assert_eq!(bytes, input);
+    }
 
+    #[test]
+    fn success_returns_full_raw_response() {
+        let mut raw = ImapRaw::new(b"a1 CAPABILITY\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
+
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = format!("* CAPABILITY IMAP4REV1 IDLE\r\n{tag} OK CAPABILITY completed\r\n");
+        let reply = "* CAPABILITY IMAP4REV1 IDLE\r\na1 OK CAPABILITY completed\r\n";
         let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
         assert_eq!(out, reply);
     }
 
     #[test]
-    fn command_line_carries_generated_tag_and_crlf() {
-        let mut raw = ImapRaw::new("CAPABILITY");
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+    fn batch_waits_for_every_tag_out_of_order() {
+        let input = b"a1 SELECT INBOX\r\na2 CAPABILITY\r\n";
+        let mut raw = ImapRaw::new(input).unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
 
         let bytes = expect_wants_write(&mut raw, &mut frag, None);
-        let line = str::from_utf8(&bytes).expect("utf8 command");
-        let tag = first_word(line);
-        assert_eq!(line, format!("{tag} CAPABILITY\r\n"));
+        assert_eq!(bytes, input);
+
+        expect_wants_read(&mut raw, &mut frag);
+
+        // Server answers the second command before the first.
+        let first = "* CAPABILITY IMAP4REV1\r\na2 OK CAPABILITY completed\r\n";
+        expect_wants_read_after(&mut raw, &mut frag, first.as_bytes());
+
+        let second = "* 3 EXISTS\r\na1 OK [READ-WRITE] SELECT completed\r\n";
+        let out = expect_complete_ok(&mut raw, &mut frag, second.as_bytes());
+        assert_eq!(out, format!("{first}{second}"));
     }
 
     #[test]
     fn tagged_no_is_returned_as_payload_not_error() {
-        let mut raw = ImapRaw::new("SELECT INBOX");
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let mut raw = ImapRaw::new(b"a1 SELECT INBOX\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
 
-        let bytes = expect_wants_write(&mut raw, &mut frag, None);
-        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
-
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = format!("{tag} NO mailbox does not exist\r\n");
+        let reply = "a1 NO mailbox does not exist\r\n";
         let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
         assert_eq!(out, reply);
         assert!(out.contains("NO mailbox does not exist"));
@@ -260,24 +328,63 @@ mod tests {
 
     #[test]
     fn response_with_literal_is_captured_verbatim() {
-        let mut raw = ImapRaw::new("FETCH 1 BODY[]");
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let mut raw = ImapRaw::new(b"a1 FETCH 1 BODY[]\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
 
-        let bytes = expect_wants_write(&mut raw, &mut frag, None);
-        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
-
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = format!("* 1 FETCH (BODY[] {{3}}\r\nabc)\r\n{tag} OK FETCH completed\r\n");
+        let reply = "* 1 FETCH (BODY[] {3}\r\nabc)\r\na1 OK FETCH completed\r\n";
         let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
         assert_eq!(out, reply);
         assert!(out.contains("abc"));
     }
 
     #[test]
+    fn command_with_literal_is_parsed_for_its_tag() {
+        // The command itself spans a synchronizing literal; its single tag
+        // must still be extracted so exactly one completion is awaited.
+        let input = b"a1 LOGIN {5}\r\nADMIN {5}\r\nsesam\r\n";
+        let raw = ImapRaw::new(input).unwrap();
+        assert_eq!(raw.pending.len(), 1);
+        assert!(raw.pending.contains(b"a1".as_slice()));
+    }
+
+    #[test]
+    fn missing_tag_is_rejected() {
+        let err = expect_new_err(b"CAPABILITY\r\n");
+        assert!(matches!(err, ImapRawError::MissingTag));
+    }
+
+    #[test]
+    fn duplicate_tag_is_rejected() {
+        let err = expect_new_err(b"a1 NOOP\r\na1 NOOP\r\n");
+        assert!(matches!(err, ImapRawError::DuplicateTag(tag) if tag == "a1"));
+    }
+
+    #[test]
+    fn unterminated_command_is_rejected() {
+        let err = expect_new_err(b"a1 CAPABILITY");
+        assert!(matches!(err, ImapRawError::IncompleteCommand));
+    }
+
+    #[test]
+    fn empty_input_is_rejected() {
+        let err = expect_new_err(b"");
+        assert!(matches!(err, ImapRawError::NoCommand));
+    }
+
+    fn expect_new_err(command: &[u8]) -> ImapRawError {
+        match ImapRaw::new(command) {
+            Ok(_) => panic!("expected ImapRaw::new to fail"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
     fn eof_before_tagged_returns_error() {
-        let mut raw = ImapRaw::new("CAPABILITY");
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let mut raw = ImapRaw::new(b"a1 CAPABILITY\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
 
         let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
@@ -304,6 +411,13 @@ mod tests {
         }
     }
 
+    fn expect_wants_read_after(cor: &mut ImapRaw, frag: &mut Fragmentizer, reply: &[u8]) {
+        match cor.resume(frag, Some(reply)) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
     fn expect_complete_ok(cor: &mut ImapRaw, frag: &mut Fragmentizer, reply: &[u8]) -> String {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
@@ -320,11 +434,5 @@ mod tests {
             ImapCoroutineState::Complete(Err(err)) => err,
             state => panic!("expected Complete(Err), got {state:?}"),
         }
-    }
-
-    fn first_word(line: &str) -> &str {
-        line.split_whitespace()
-            .next()
-            .expect("first whitespace-separated token")
     }
 }
