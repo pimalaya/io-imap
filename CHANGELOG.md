@@ -6,7 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `rfc3501::capability::available_auth_mechanisms`, mapping a server's advertised capability list to the pimalaya-stream `SaslMechanism` tags a client authenticates with, most preferred first and the plain IMAP `LOGIN` command last (offered unless `LOGINDISABLED`).
+
+  It lets a caller (a setup wizard) offer only what the server actually supports instead of guessing a SASL mechanism; a perdition-style proxy advertising a bare `IMAP4 IMAP4REV1` yields just the `LOGIN` command. Reusing the existing `SaslMechanism` rather than a new enum keeps the probe result and the `Sasl` the client connects with in one vocabulary. It lives in the coroutine core (no `client` feature or TLS provider required), so a caller driving the coroutines over its own transport can use it too.
+
 ### Changed
+
+- Made pimalaya-stream a non-optional dependency, pulled with no features so a minimal build gets only its SASL credential types (no TLS provider, no socket runtime).
+
+  It was previously optional and enabled only by a TLS-provider feature. Making it always present lets `available_auth_mechanisms` live in the coroutine core and return `SaslMechanism` regardless of features. The heavier `std::stream` and `tls` layers still require a TLS-provider feature, so a no-provider build stays lean.
 
 - Reworked `ImapRaw` into a byte-verbatim batch passthrough. **Breaking.**
 

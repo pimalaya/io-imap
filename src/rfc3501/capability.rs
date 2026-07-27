@@ -48,12 +48,14 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
+        auth::AuthMechanism,
         command::{Command, CommandBody},
         core::TagGenerator,
         response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
 use log::trace;
+use pimalaya_stream::sasl::SaslMechanism;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};
@@ -172,6 +174,56 @@ impl ImapCoroutine for ImapCapabilityGet {
             }
         }
     }
+}
+
+/// Returns the authentication mechanisms available for `capabilities`,
+/// most preferred first and the legacy `LOGIN` command last, as the
+/// [`SaslMechanism`] tags a client authenticates with.
+///
+/// Every advertised `AUTH=` capability maps to its mechanism; unknown
+/// ones are ignored. `SaslMechanism::Login` (the plain IMAP `LOGIN`
+/// command, per this crate's SASL convention) is offered unless the
+/// server advertises `LOGINDISABLED`. A perdition-style proxy
+/// advertising a bare `IMAP4 IMAP4REV1`, with no `AUTH=` and no
+/// `LOGINDISABLED`, therefore yields just `[SaslMechanism::Login]`.
+pub fn available_auth_mechanisms(capabilities: &[Capability]) -> Vec<SaslMechanism> {
+    let advertises = |name: &str| {
+        capabilities.iter().any(|capability| match capability {
+            Capability::Auth(mechanism) => {
+                AuthMechanism::as_ref(mechanism).eq_ignore_ascii_case(name)
+            }
+            _ => false,
+        })
+    };
+
+    let mut mechanisms = Vec::new();
+
+    if advertises("SCRAM-SHA-256") {
+        mechanisms.push(SaslMechanism::ScramSha256);
+    }
+    if advertises("PLAIN") {
+        mechanisms.push(SaslMechanism::Plain);
+    }
+    if advertises("OAUTHBEARER") {
+        mechanisms.push(SaslMechanism::OAuthBearer);
+    }
+    if advertises("XOAUTH2") {
+        mechanisms.push(SaslMechanism::XOAuth2);
+    }
+    if advertises("ANONYMOUS") {
+        mechanisms.push(SaslMechanism::Anonymous);
+    }
+
+    // The IMAP LOGIN command is the last-resort mechanism, available
+    // unless the server explicitly disabled it.
+    let login_disabled = capabilities
+        .iter()
+        .any(|capability| matches!(capability, Capability::LoginDisabled));
+    if !login_disabled {
+        mechanisms.push(SaslMechanism::Login);
+    }
+
+    mechanisms
 }
 
 enum State {
@@ -322,5 +374,57 @@ mod tests {
         line.split_whitespace()
             .next()
             .expect("first whitespace-separated token")
+    }
+
+    fn auth(name: &str) -> Capability<'static> {
+        Capability::Auth(AuthMechanism::try_from(name.to_owned()).expect("valid mechanism"))
+    }
+
+    #[test]
+    fn bare_capabilities_offer_only_the_login_command() {
+        // A perdition-style proxy: no AUTH=, no LOGINDISABLED.
+        let caps = [Capability::Imap4Rev1];
+        assert!(matches!(
+            available_auth_mechanisms(&caps).as_slice(),
+            [SaslMechanism::Login]
+        ));
+    }
+
+    #[test]
+    fn advertised_mechanisms_are_ordered_by_preference_with_login_last() {
+        // Advertisement order is PLAIN then SCRAM, but SCRAM outranks it
+        // and LOGIN always trails.
+        let caps = [Capability::Imap4Rev1, auth("PLAIN"), auth("SCRAM-SHA-256")];
+        assert!(matches!(
+            available_auth_mechanisms(&caps).as_slice(),
+            [
+                SaslMechanism::ScramSha256,
+                SaslMechanism::Plain,
+                SaslMechanism::Login,
+            ]
+        ));
+    }
+
+    #[test]
+    fn login_disabled_drops_the_login_command() {
+        let caps = [auth("PLAIN"), Capability::LoginDisabled];
+        assert!(matches!(
+            available_auth_mechanisms(&caps).as_slice(),
+            [SaslMechanism::Plain]
+        ));
+    }
+
+    #[test]
+    fn token_and_anonymous_mechanisms_are_recognised() {
+        let caps = [auth("XOAUTH2"), auth("OAUTHBEARER"), auth("ANONYMOUS")];
+        assert!(matches!(
+            available_auth_mechanisms(&caps).as_slice(),
+            [
+                SaslMechanism::OAuthBearer,
+                SaslMechanism::XOAuth2,
+                SaslMechanism::Anonymous,
+                SaslMechanism::Login,
+            ]
+        ));
     }
 }

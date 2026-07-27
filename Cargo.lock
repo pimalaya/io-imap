@@ -611,6 +611,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-proxy"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea1200e73a98f7a2500af468bb7857a1c78b5b4b453c8d69760c2a61b9df5303"
+dependencies = [
+ "base64 0.23.0",
+ "log",
+ "thiserror",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -886,11 +897,12 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pimalaya-stream"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3df89003eaaa8976938b48b80353cd4e9e286a6893cdf5d3d0380fe2ff78a168"
+checksum = "a6f95d38d529870b6ef4ca97d17a3abd371505d0e5c4337e97200d00b4c72ce2"
 dependencies = [
  "anyhow",
+ "io-proxy",
  "log",
  "native-tls",
  "rustls",
