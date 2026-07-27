@@ -319,7 +319,7 @@ pub struct ImapClientStd {
 impl ImapClientStd {
     /// Caller is responsible for opening the connection (TCP, TLS,
     /// STARTTLS).
-    pub fn new<S: Read + Write + Send + 'static>(stream: S) -> Self {
+    pub fn new<S: ImapStream + 'static>(stream: S) -> Self {
         Self {
             stream: Box::new(stream),
             fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
@@ -329,7 +329,7 @@ impl ImapClientStd {
     }
 
     /// Useful after a STARTTLS upgrade or on reconnection.
-    pub fn set_stream<S: Read + Write + Send + 'static>(&mut self, stream: S) {
+    pub fn set_stream<S: ImapStream + 'static>(&mut self, stream: S) {
         self.stream = Box::new(stream);
     }
 
@@ -646,6 +646,11 @@ impl ImapClientStd {
         let mut fragmentizer = self.fragmentizer;
         let mut stream = self.stream;
 
+        // NOTE: a periodic read wakeup (not a hard deadline) lets the
+        // worker re-observe the shutdown flag during a silent IDLE.
+        // Transports that cannot honor it (see ImapStream) no-op.
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientStdError>>(256);
         let shutdown_handle = shutdown.clone();
         let handle = thread::spawn(move || {
@@ -670,6 +675,21 @@ impl ImapClientStd {
                                 return;
                             }
                             Ok(n) => arg = Some(buf[..n].to_vec()),
+                            // SO_RCVTIMEO wakeup: WouldBlock on Unix,
+                            // TimedOut on Windows. Not a failure; re-check
+                            // shutdown and otherwise resume so the coroutine
+                            // can observe the flag and issue IDLE DONE.
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                arg = None;
+                            }
                             Err(err) => {
                                 tx.send(Err(err.into())).ok();
                                 return;
@@ -998,10 +1018,6 @@ impl ImapClientStd {
             stream
         };
 
-        // NOTE: 5s per-read timeout lets watch_mailbox poll shutdown
-        // during a silent IDLE; long FETCHes are unaffected.
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
         let mut client = Self::new(stream);
         client.auto_id = auto_id;
 
@@ -1133,18 +1149,28 @@ fn run_starttls(
     }
 }
 
-/// Blocking stream the client runs over, auto-implemented for any
-/// `Read + Write + Send + 'static`.
+/// Blocking stream the client runs over.
 ///
-/// `as_any_mut` supports downcasting back to the concrete stream when
-/// needed (e.g. for `set_read_timeout`).
+/// Implemented for the standard [`StreamStd`]; a custom transport (such
+/// as a JNI upcall bridge) implements it directly. `as_any_mut`
+/// supports downcasting back to the concrete stream when a caller needs
+/// a type-specific handle (e.g. sirup's socket proxy).
 pub trait ImapStream: Read + Write + Send + Any {
     /// The stream as a mutable `Any`, ready for downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Bounds each blocking read, used by the mailbox watch worker for a
+    /// periodic shutdown-poll wakeup. A transport that cannot honor it
+    /// returns `Ok(())` and manages its own read semantics.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
 
-impl<T: Read + Write + Send + Any> ImapStream for T {
+impl ImapStream for StreamStd {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        StreamStd::set_read_timeout(self, timeout)
     }
 }

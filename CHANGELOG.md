@@ -12,6 +12,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   `ImapRaw::new` (and `ImapClientStd::raw`) now take `impl AsRef<[u8]>` and send the given bytes exactly as-is: no tag is injected and no CRLF is trimmed or appended. Callers therefore tag every command and separate them with CRLF, which lets a whole pipeline be sent in one exchange. The input is parsed up front to collect every command's tag, and the exchange reads until all of them are acknowledged, tolerating out-of-order tagged completions (RFC 3501 §5.5). `ImapRaw::new` is now fallible, validating the input and rejecting an untagged, duplicate-tagged, unterminated or empty batch via the new `ImapRawError` variants `NoCommand`, `MissingTag`, `DuplicateTag` and `IncompleteCommand`.
 
+- Added a required `set_read_timeout` method to the `ImapStream` trait and made it an explicit contract. **Breaking.**
+
+  The blanket `impl<T: Read + Write + Send + Any> ImapStream for T` is gone: `ImapStream` is now implemented for `StreamStd` directly, and a custom transport implements it (and the new `set_read_timeout`, no-op when it cannot bound a read) by hand. Accordingly `ImapClientStd::new` and `set_stream` now bound their stream on `S: ImapStream` rather than `S: Read + Write + Send`. This lets the mailbox watch worker apply its shutdown-poll wakeup through the trait instead of downcasting to the concrete stream.
+
+### Fixed
+
+- Removed the blanket 5-second per-read timeout from `ImapClientStd::connect`, which made any command fail spuriously when the server stayed silent for more than 5 seconds on a single read.
+
+  The timeout was a per-read deadline, not a whole-command one, so a server that paused before answering (a slow server-side SEARCH or SORT, a large mailbox, a loaded server) or stalled mid-stream surfaced as a fatal error. The periodic wakeup that lets a background mailbox watch observe its shutdown flag now lives on the watch worker alone, and a read timeout there is treated as a wakeup that re-checks shutdown and resumes, instead of tearing the watch down on a silent IDLE.
+
 ## [0.3.1] - 2026-07-25
 
 ### Added
