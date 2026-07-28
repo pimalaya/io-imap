@@ -91,6 +91,7 @@ use crate::{
         starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
+    rfc4315::expunge_uid::*,
     rfc5161::enable::*,
     rfc5256::{sort::*, thread::*},
     rfc6851::r#move::*,
@@ -199,6 +200,9 @@ pub enum ImapClientStdError {
     /// The EXPUNGE coroutine failed.
     #[error(transparent)]
     MailboxExpunge(#[from] ImapMailboxExpungeError),
+    /// The UID EXPUNGE coroutine failed.
+    #[error(transparent)]
+    MessageExpungeUid(#[from] ImapMessageExpungeUidError),
     /// The SORT coroutine failed.
     #[error(transparent)]
     MessageSort(#[from] ImapMessageSortError),
@@ -630,6 +634,19 @@ impl ImapClientStd {
     /// `EXPUNGE`; returns the expunged sequence numbers.
     pub fn expunge(&mut self) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
         self.run(ImapMailboxExpunge::new())
+    }
+
+    /// `UID EXPUNGE <sequence_set>` (RFC 4315); permanently removes only
+    /// the `\Deleted` messages whose UID is in `sequence_set`, leaving
+    /// any other `\Deleted` message untouched.
+    ///
+    /// Requires the server to advertise `UIDPLUS` (see
+    /// [`Self::supports_uidplus`]); returns the expunged sequence numbers.
+    pub fn uid_expunge(
+        &mut self,
+        sequence_set: SequenceSet,
+    ) -> Result<Vec<NonZeroU32>, ImapClientStdError> {
+        self.run(ImapMessageExpungeUid::new(sequence_set))
     }
 
     /// Consumes the client into a background watcher.

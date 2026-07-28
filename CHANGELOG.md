@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added `rfc3501::capability::available_auth_mechanisms`, mapping a server's advertised capability list to the pimalaya-stream `SaslMechanism` tags a client authenticates with, most preferred first and the plain IMAP `LOGIN` command last (offered unless `LOGINDISABLED`).
 
+- Added `rfc4315::expunge_uid::ImapMessageExpungeUid`, the `UID EXPUNGE <sequence-set>` coroutine (RFC 4315, UIDPLUS), and the `ImapClientStd::uid_expunge` convenience method. Unlike plain `EXPUNGE`, it permanently removes only the `\Deleted` messages whose UID is in the given set, leaving any other `\Deleted` message untouched. Requires the server to advertise `UIDPLUS` (check `supports_uidplus`).
+
   It lets a caller (a setup wizard) offer only what the server actually supports instead of guessing a SASL mechanism; a perdition-style proxy advertising a bare `IMAP4 IMAP4REV1` yields just the `LOGIN` command. Reusing the existing `SaslMechanism` rather than a new enum keeps the probe result and the `Sasl` the client connects with in one vocabulary. It lives in the coroutine core (no `client` feature or TLS provider required), so a caller driving the coroutines over its own transport can use it too.
 
 ### Changed
