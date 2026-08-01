@@ -86,9 +86,9 @@ use crate::{
     rfc2971::id::*,
     rfc3501::{
         append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
-        delete::*, examine::*, expunge::*, fetch::*, fetch_stream::*, greeting::*, list::*,
-        login::*, logout::*, lsub::*, noop::*, raw::*, rename::*, search::*, select::*,
-        starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
+        delete::*, examine::*, expunge::*, fetch::*, fetch_stream::*, fetch_stream_batch::*,
+        greeting::*, list::*, login::*, logout::*, lsub::*, noop::*, raw::*, rename::*, search::*,
+        select::*, starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
     },
     rfc3691::unselect::*,
     rfc4315::expunge_uid::*,
@@ -212,6 +212,9 @@ pub enum ImapClientStdError {
     /// The streaming FETCH coroutine failed.
     #[error(transparent)]
     MessageFetchStream(#[from] ImapMessageFetchStreamError),
+    /// The batched streaming FETCH coroutine failed.
+    #[error(transparent)]
+    MessageFetchStreamBatch(#[from] ImapMessageFetchStreamBatchError),
     /// The SEARCH coroutine failed.
     #[error(transparent)]
     MessageSearch(#[from] ImapMessageSearchError),
@@ -283,6 +286,12 @@ pub enum ImapClientStdError {
 }
 
 const READ_BUFFER_SIZE: usize = 16 * 1024;
+/// Buffer for streaming a message body from the socket into the caller's sink.
+/// Larger than [`READ_BUFFER_SIZE`] because a body transfer is bulk data, not
+/// line-oriented parsing: 128 KB cuts the `read`/`write` syscall count (and TLS
+/// record crossings) on a large body versus the 8 KB `io::copy` default, for a
+/// small `sys`-time win. Heap-allocated once per fetch and reused.
+const BODY_COPY_BUFFER_SIZE: usize = 128 * 1024;
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Default ALPN identifier for IMAP TLS (RFC 7595).
@@ -758,6 +767,9 @@ impl ImapClientStd {
     ) -> Result<(), ImapClientStdError> {
         let mut coroutine = ImapMessageFetchStream::new(id, uid);
         let mut buf = [0u8; READ_BUFFER_SIZE];
+        // NOTE: reused across every WantsStream yield of this fetch; heap, not
+        // stack, so 128 KB is safe.
+        let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
 
         loop {
@@ -777,12 +789,96 @@ impl ImapClientStd {
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
-                    let len = len as u64;
-                    let mut stream = (&mut self.stream).take(len);
-                    let n = io::copy(&mut stream, &mut sink)?;
-                    // NOTE: an empty slice tells the coroutine the
-                    // socket ran short of the declared body length.
-                    arg = (n != len).then_some(&[]);
+                    // Stream the body in 128 KB chunks (vs io::copy's 8 KB), so a
+                    // large body costs far fewer syscalls / TLS record crossings.
+                    let mut remaining = len as u64;
+                    let mut short = false;
+                    while remaining > 0 {
+                        let want = remaining.min(body_buf.len() as u64) as usize;
+                        let n = self.stream.read(&mut body_buf[..want])?;
+                        if n == 0 {
+                            short = true;
+                            break;
+                        }
+                        sink.write_all(&body_buf[..n])?;
+                        remaining -= n as u64;
+                    }
+                    // NOTE: an empty slice tells the coroutine the socket ran short
+                    // of the declared body length.
+                    arg = short.then_some(&[]);
+                }
+            }
+        }
+    }
+
+    /// `UID FETCH <set> (UID BODY.PEEK[])` streaming every message body in one
+    /// command — N bodies for one round trip. Each message is routed to its own
+    /// sink: `open(uid)` returns a fresh sink when a message begins, its body is
+    /// streamed into it, and `done(uid, sink)` commits it when the message ends.
+    /// No body is held in memory whole. A requested UID absent on the server
+    /// simply never calls `open`/`done`.
+    pub fn fetch_bodies_stream<S: Write>(
+        &mut self,
+        sequence_set: SequenceSet,
+        uid: bool,
+        mut open: impl FnMut(u32) -> io::Result<S>,
+        mut done: impl FnMut(u32, S) -> io::Result<()>,
+    ) -> Result<(), ImapClientStdError> {
+        let mut coroutine = ImapMessageFetchStreamBatch::new(sequence_set, uid);
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
+        // The sink of the message currently streaming, opened at MessageStart and
+        // committed at MessageEnd.
+        let mut current: Option<(u32, S)> = None;
+        let mut arg: Option<&[u8]> = None;
+
+        loop {
+            match coroutine.resume(&mut self.fragmentizer, arg.take()) {
+                ImapCoroutineState::Complete(Ok(())) => return Ok(()),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsRead) => {
+                    let n = self.stream.read(&mut buf)?;
+                    arg = Some(&buf[..n]);
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsWrite(
+                    bytes,
+                )) => {
+                    self.stream.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::MessageStart {
+                    uid,
+                }) => {
+                    current = Some((uid, open(uid)?));
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::BodyChunk(bytes)) => {
+                    let (_, sink) = current.as_mut().expect("body chunk within a message");
+                    sink.write_all(&bytes)?;
+                    arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsStream {
+                    len,
+                }) => {
+                    let (_, sink) = current.as_mut().expect("stream within a message");
+                    let mut remaining = len as u64;
+                    let mut short = false;
+                    while remaining > 0 {
+                        let want = remaining.min(body_buf.len() as u64) as usize;
+                        let n = self.stream.read(&mut body_buf[..want])?;
+                        if n == 0 {
+                            short = true;
+                            break;
+                        }
+                        sink.write_all(&body_buf[..n])?;
+                        remaining -= n as u64;
+                    }
+                    arg = short.then_some(&[]);
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::MessageEnd) => {
+                    let (uid, sink) = current.take().expect("message end within a message");
+                    done(uid, sink)?;
+                    arg = None;
                 }
             }
         }

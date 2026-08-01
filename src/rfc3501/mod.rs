@@ -14,6 +14,7 @@ pub mod examine;
 pub mod expunge;
 pub mod fetch;
 pub mod fetch_stream;
+pub mod fetch_stream_batch;
 pub mod greeting;
 pub mod list;
 pub mod login;
