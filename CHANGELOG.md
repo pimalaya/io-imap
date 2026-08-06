@@ -6,13 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-07
+
 ### Added
+
+- Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch`, the batched `UID FETCH <set> (UID BODY.PEEK[])` body-stream coroutine, and the `ImapClientStd::fetch_bodies_stream` convenience method. It fetches the bodies of a whole sequence set in **one** command, so N bodies cost one round trip instead of N.
+
+  Each message is routed to its own sink: `open(uid)` returns a fresh sink when a message begins, the body is streamed into it, and `done(uid, sink)` commits it when the message ends, so no body is ever held in memory whole. `BODY.PEEK[]` leaves `\Seen` alone (a sync must not mark what it reads) and the `UID` data item makes every returned body self-identifying, since a batched response arrives in server order. A UID requested but absent on the server simply never calls `open` / `done`. A body whose FETCH line carries no parseable `UID` fails with `UidMissing` rather than misrouting the body, so the caller can fall back to per-message fetches.
 
 - Added `rfc3501::capability::available_auth_mechanisms`, mapping a server's advertised capability list to the pimalaya-stream `SaslMechanism` tags a client authenticates with, most preferred first and the plain IMAP `LOGIN` command last (offered unless `LOGINDISABLED`).
 
-- Added `rfc4315::expunge_uid::ImapMessageExpungeUid`, the `UID EXPUNGE <sequence-set>` coroutine (RFC 4315, UIDPLUS), and the `ImapClientStd::uid_expunge` convenience method. Unlike plain `EXPUNGE`, it permanently removes only the `\Deleted` messages whose UID is in the given set, leaving any other `\Deleted` message untouched. Requires the server to advertise `UIDPLUS` (check `supports_uidplus`).
-
   It lets a caller (a setup wizard) offer only what the server actually supports instead of guessing a SASL mechanism; a perdition-style proxy advertising a bare `IMAP4 IMAP4REV1` yields just the `LOGIN` command. Reusing the existing `SaslMechanism` rather than a new enum keeps the probe result and the `Sasl` the client connects with in one vocabulary. It lives in the coroutine core (no `client` feature or TLS provider required), so a caller driving the coroutines over its own transport can use it too.
+
+- Added `rfc4315::expunge_uid::ImapMessageExpungeUid`, the `UID EXPUNGE <sequence-set>` coroutine (RFC 4315, UIDPLUS), and the `ImapClientStd::uid_expunge` convenience method. Unlike plain `EXPUNGE`, it permanently removes only the `\Deleted` messages whose UID is in the given set, leaving any other `\Deleted` message untouched. Requires the server to advertise `UIDPLUS` (check `supports_uidplus`).
 
 ### Changed
 
@@ -199,7 +205,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.3.1..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.4.0..HEAD
+[0.4.0]: https://github.com/pimalaya/io-imap/compare/v0.3.1..v0.4.0
 [0.3.1]: https://github.com/pimalaya/io-imap/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/pimalaya/io-imap/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-imap/compare/v0.1.0..v0.2.0
