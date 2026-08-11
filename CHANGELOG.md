@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `client::ImapClientStdConnectOptions::sasl_ir`, forcing the RFC 4959 SASL-IR initial response on or off. `Some(true)` always sends the initial response inline with `AUTHENTICATE`, `Some(false)` never does and waits for the server's continuation request, and `None` (the default) keeps following the advertised `SASL-IR` capability.
+
+  The capability alone is not trustworthy: Coremail (126.com, 163.com) advertises `SASL-IR` yet answers the inline form with a tagged `BAD`, so `connect` could not authenticate against it at all. The override is a caller-side escape hatch because a lying capability leaves the client no signal of its own to go on. It applies to every SASL mechanism, since the defect is in the server's command parser rather than in any one mechanism.
+
+### Changed
+
+- Replaced the trailing `ImapClientStd::connect` parameters with the new `ImapClientStdConnectOptions`. **Breaking.**
+
+  `connect(url, tls, starttls, sasl, auto_id)` becomes `connect(url, tls, sasl, opts)`, where `opts` carries `starttls`, `auto_id` and the new `sasl_ir`. The signature had accumulated a tail of unrelated transport and provider-quirk arguments, and adding `sasl_ir` positionally would have put a second `bool`-shaped parameter next to `starttls`. `ImapClientStdConnectOptions::default()` reproduces the previous `(false, None)` behaviour.
+
 ## [0.4.0] - 2026-08-07
 
 ### Added

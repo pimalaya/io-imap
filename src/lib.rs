@@ -81,6 +81,11 @@
 //! Fastmail. Secrets ride in imap-types `Secret` wrappers so they never
 //! land in logs.
 //!
+//! The full client picks the flow from the advertised `SASL-IR`
+//! capability, which
+//! [`client::ImapClientStdConnectOptions::sasl_ir`] can override for a
+//! server that advertises it without honouring it (Coremail).
+//!
 //! ## Watching a mailbox
 //!
 //! [`watch`] provides `ImapMailboxWatch`, a composite coroutine

@@ -365,8 +365,6 @@ impl ImapClientStd {
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = self.stream.read(&mut buf)?;
-                    // NOTE: a zero-length read is EOF; error out instead of
-                    // feeding the coroutine an empty buffer forever.
                     if n == 0 {
                         let kind = io::ErrorKind::UnexpectedEof;
                         let err = io::Error::new(kind, "IMAP server closed the connection");
@@ -672,9 +670,6 @@ impl ImapClientStd {
         let mut fragmentizer = self.fragmentizer;
         let mut stream = self.stream;
 
-        // NOTE: a periodic read wakeup (not a hard deadline) lets the
-        // worker re-observe the shutdown flag during a silent IDLE.
-        // Transports that cannot honor it (see ImapStream) no-op.
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientStdError>>(256);
@@ -767,8 +762,6 @@ impl ImapClientStd {
     ) -> Result<(), ImapClientStdError> {
         let mut coroutine = ImapMessageFetchStream::new(id, uid);
         let mut buf = [0u8; READ_BUFFER_SIZE];
-        // NOTE: reused across every WantsStream yield of this fetch; heap, not
-        // stack, so 128 KB is safe.
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
 
@@ -789,10 +782,9 @@ impl ImapClientStd {
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
-                    // Stream the body in 128 KB chunks (vs io::copy's 8 KB), so a
-                    // large body costs far fewer syscalls / TLS record crossings.
                     let mut remaining = len as u64;
                     let mut short = false;
+
                     while remaining > 0 {
                         let want = remaining.min(body_buf.len() as u64) as usize;
                         let n = self.stream.read(&mut body_buf[..want])?;
@@ -803,8 +795,7 @@ impl ImapClientStd {
                         sink.write_all(&body_buf[..n])?;
                         remaining -= n as u64;
                     }
-                    // NOTE: an empty slice tells the coroutine the socket ran short
-                    // of the declared body length.
+
                     arg = short.then_some(&[]);
                 }
             }
@@ -973,8 +964,6 @@ impl ImapClientStd {
                     let len = len as u64;
                     let mut sink = source.by_ref().take(len);
                     let n = io::copy(&mut sink, &mut self.stream)?;
-                    // NOTE: an empty slice tells the coroutine the
-                    // source ran short of the declared count.
                     arg = (n != len).then_some(&[]);
                 }
             }
@@ -1068,6 +1057,41 @@ impl Drop for ImapMailboxWatchStream {
     }
 }
 
+/// Transport and provider-quirk options for [`ImapClientStd::connect`].
+///
+/// The default connects over the scheme's own transport, sends no `ID`
+/// and follows the server's advertised capabilities.
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+#[derive(Clone, Debug, Default)]
+pub struct ImapClientStdConnectOptions {
+    /// Whether to upgrade the connection with `STARTTLS` after the
+    /// greeting. Only valid on the cleartext `imap://` scheme, since
+    /// `imaps://` is already TLS-protected.
+    pub starttls: bool,
+    /// ID parameters consumed by the auth step, mirroring
+    /// [`ImapClientStd::auto_id`]; required by a few providers
+    /// (mail.qq.com, fastmail).
+    ///
+    /// `None` skips, `Some(empty)` sends `ID NIL`, `Some(params)`
+    /// sends `ID (k v ...)`.
+    pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+    /// Forces the RFC 4959 SASL-IR initial response on or off.
+    /// `Some(true)` always sends the initial response inline with the
+    /// `AUTHENTICATE` command; `Some(false)` never does and waits for
+    /// the server's continuation request instead. Left unset, it
+    /// follows the advertised `SASL-IR` capability.
+    ///
+    /// Needed because the capability alone is not trustworthy: Coremail
+    /// (126.com, 163.com) advertises `SASL-IR` yet answers the inline
+    /// form with a tagged `BAD`, which no amount of capability
+    /// inspection can predict.
+    pub sasl_ir: Option<bool>,
+}
+
 #[cfg(any(
     feature = "rustls-aws",
     feature = "rustls-ring",
@@ -1078,15 +1102,20 @@ impl ImapClientStd {
     /// optional SASL.
     ///
     /// `imap://` is plain TCP (143), `imaps://` is implicit TLS (993).
-    /// `starttls = true` is only valid on `imap://`. Pass `Sasl::None`
-    /// to skip auth.
+    /// `opts.starttls = true` is only valid on `imap://`. Pass
+    /// `Sasl::None` to skip auth.
     pub fn connect(
         url: &Url,
         tls: &Tls,
-        starttls: bool,
         sasl: Option<impl Into<Sasl>>,
-        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+        opts: ImapClientStdConnectOptions,
     ) -> Result<(Self, Vec<Capability<'static>>), ImapClientStdError> {
+        let ImapClientStdConnectOptions {
+            starttls,
+            auto_id,
+            sasl_ir,
+        } = opts;
+
         let (stream, is_tls) = match url.scheme() {
             scheme if scheme.eq_ignore_ascii_case("imap") => {
                 let host = tcp_host(url)?;
@@ -1102,10 +1131,6 @@ impl ImapClientStd {
                     true,
                 )
             }
-            // NOTE: a `unix://` URL reaches a local socket proxy such as
-            // sirup: no host, no TLS, and the session is usually already
-            // authenticated (see the PREAUTH handling below). The path is
-            // the socket path, e.g. `unix:///run/sirup.sock`.
             scheme if scheme.eq_ignore_ascii_case("unix") => {
                 (StreamStd::connect_unix(url.path())?, false)
             }
@@ -1120,8 +1145,6 @@ impl ImapClientStd {
             return Err(ImapClientStdError::StartTlsOverTls);
         }
 
-        // NOTE: STARTTLS needs the concrete StreamStd for upgrade_tls,
-        // so run it inline before boxing the stream.
         let stream = if starttls {
             let mut stream = stream;
             let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
@@ -1144,11 +1167,8 @@ impl ImapClientStd {
         };
         client.pre_authenticated = pre_authenticated;
 
-        // NOTE: a PREAUTH greeting means the session opened already
-        // authenticated (a sirup-style proxy), so the SASL step is
-        // skipped even when credentials are configured.
         if let Some(sasl) = sasl.map(Into::into).filter(|_| !pre_authenticated) {
-            let ir = capability.contains(&Capability::SaslIr);
+            let ir = sasl_ir.unwrap_or_else(|| capability.contains(&Capability::SaslIr));
 
             capability = match sasl {
                 Sasl::Anonymous(SaslAnonymous { message }) => {

@@ -263,8 +263,6 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
-    use core::str;
-
     use alloc::format;
 
     use crate::rfc3501::raw::*;
