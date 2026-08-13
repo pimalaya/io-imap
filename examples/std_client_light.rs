@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use io_imap::client::{ImapClientStd, ImapStream};
+use io_imap::client::{ImapClient, ImapClientStd, ImapStream};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls_platform_verifier::ConfigVerifierExt;
 
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stream = TlsStream(StreamOwned::new(tls, sock));
 
     let mut client = ImapClientStd::new(stream);
-    let capabilities = client.greeting()?;
+    let capabilities = client.greeting()?.capability;
 
     for capability in capabilities {
         println!("{capability:?}");

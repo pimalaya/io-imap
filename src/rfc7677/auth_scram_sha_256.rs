@@ -1,7 +1,19 @@
 //! IMAP SASL SCRAM-SHA-256 coroutine; supports both the non-IR and
 //! SASL-IR (RFC 4959) flows.
 //!
+//! The mechanism itself lives in io-sasl: this coroutine holds the IMAP
+//! half of the exchange, the `AUTHENTICATE SCRAM-SHA-256` command, the
+//! continuation requests, the tagged response and the post-auth
+//! follow-ups, and asks [`SaslScramSha256`] what to put in each
+//! response. The salted password, the client proof and the
+//! verification of the server signature are the mechanism's, and so is
+//! the refusal of an exchange that ends before that verification ran.
+//!
+//! The client nonce is generated here, since an I/O-free mechanism
+//! cannot produce entropy, and handed over with the credentials.
+//!
 //! SCRAM: <https://www.rfc-editor.org/rfc/rfc5802>
+//! SCRAM-SHA-256: <https://www.rfc-editor.org/rfc/rfc7677>
 //! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 //!
 //! # Example
@@ -48,14 +60,10 @@
 use core::{fmt, mem};
 
 use alloc::{
-    format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, KeyInit, Mac};
 use imap_codec::{
     AuthenticateDataCodec, CommandCodec,
     fragmentizer::Fragmentizer,
@@ -69,14 +77,18 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use io_sasl::{
+    coroutine::*,
+    rfc5801::SaslGs2ChannelBinding,
+    rfc5802::{SaslScramCreds, SaslScramError},
+    rfc7677::scram_sha_256::SaslScramSha256,
+};
 use log::{debug, trace};
 use rand::{RngExt, distr::Alphanumeric};
-use sha2::{Digest, Sha256};
+use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Failure causes during the SASL SCRAM-SHA-256 flow.
 #[derive(Clone, Debug, Error)]
@@ -103,41 +115,15 @@ pub enum ImapAuthScramSha256Error {
         "IMAP AUTHENTICATE SCRAM-SHA-256 failed: server returned OK before the mechanism could complete"
     )]
     UnexpectedOk,
-    /// A server challenge was not valid UTF-8.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid server message encoding")]
-    InvalidEncoding,
-    /// The server-first-message carried no r= nonce.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing nonce")]
-    MissingNonce,
-    /// The server-first-message carried no s= salt.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing salt")]
-    MissingSalt,
-    /// The server-first-message carried no i= iteration count.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server-first-message missing iteration count")]
-    MissingIterations,
-    /// A base64 value in a server message failed to decode.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid base64 in server message")]
-    InvalidBase64,
-    /// The i= iteration count of the server-first-message did not
-    /// parse as an integer.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid iteration count")]
-    InvalidIterationCount,
-    /// The server nonce did not start with the client nonce from the
-    /// client-first-message.
-    #[error(
-        "IMAP AUTHENTICATE SCRAM-SHA-256 failed: server nonce does not start with client nonce"
-    )]
-    NonceMismatch,
-    /// The v= signature of the server-final-message did not match the
-    /// locally computed one.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server signature verification failed")]
-    ServerSignatureMismatch,
-    /// The server-final-message reported an e= error.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server error: {0}")]
-    ServerError(String),
-    /// The server-final-message carried neither v= nor e=.
-    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: invalid server-final-message")]
-    InvalidServerFinal,
+    /// The mechanism refused the exchange.
+    ///
+    /// Every RFC 5802 failure lands here: a malformed server message, a
+    /// server nonce that does not extend the client one, an error the
+    /// server reported in place of its proof, a signature that does not
+    /// match, and an exchange ending before that signature was checked
+    /// at all.
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: {0}")]
+    Mechanism(#[from] SaslScramError),
     /// The underlying send coroutine failed.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: {0}")]
     Send(#[from] ImapSendError),
@@ -168,66 +154,45 @@ pub struct ImapAuthScramSha256Options {
 /// I/O-free SASL SCRAM-SHA-256 coroutine.
 pub struct ImapAuthScramSha256 {
     state: State,
-    password: Vec<u8>,
-    client_first_bare: String,
-    client_nonce: String,
+    mechanism: SaslScramSha256,
     observed: Vec<Capability<'static>>,
-    expected_server_signature: Option<Vec<u8>>,
     opts: ImapAuthScramSha256Options,
 }
 
 impl ImapAuthScramSha256 {
-    /// Builds a SASL SCRAM-SHA-256 coroutine authenticating `user`
-    /// with `password`, generating a fresh client nonce.
+    /// Builds a SASL SCRAM-SHA-256 coroutine authenticating `user` with
+    /// `password`.
     ///
-    /// Depending on `opts.initial_request`, the client-first-message
-    /// goes inline with the AUTHENTICATE command (SASL-IR) or is
-    /// uploaded after the server challenge.
+    /// The client nonce is generated here and handed to the mechanism,
+    /// which computes everything derived from it. Depending on
+    /// `opts.initial_request`, the client-first-message goes inline
+    /// with the AUTHENTICATE command (SASL-IR) or is uploaded after the
+    /// server challenge.
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
         opts: ImapAuthScramSha256Options,
     ) -> Self {
-        let user = user.as_ref();
-        let password = password.as_ref().as_bytes().to_vec();
-        let client_nonce = generate_nonce();
-        let escaped = escape_username(user);
-        let client_first_bare = format!("n={escaped},r={client_nonce}");
-        let client_first_message = format!("n,,{client_first_bare}");
-        let tag = TagGenerator::new().generate();
-
-        let state = if opts.initial_request {
-            let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::ScramSha256,
-                initial_response: Some(Secret::new(client_first_message.into_bytes().into())),
-            };
-            let cmd = Command { tag, body };
-            trace!("send IMAP command {cmd:?}");
-            State::SendIr(ImapSend::new(CommandCodec::new(), cmd))
-        } else {
-            let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::ScramSha256,
-                initial_response: None,
-            };
-            let cmd = Command { tag, body };
-            trace!("send IMAP command {cmd:?}");
-            State::Send {
-                send: ImapSend::new(CommandCodec::new(), cmd),
-                client_first_message,
-            }
-        };
+        let mechanism = SaslScramSha256::new(SaslScramCreds {
+            username: user.as_ref().to_string(),
+            password: SecretString::from(password.as_ref().to_string()),
+            nonce: generate_nonce(),
+            // NOTE: this crate never asks its TLS session what it
+            // exported, so an exchange it drives is never bound and
+            // always runs under the plain mechanism name.
+            channel_binding: SaslGs2ChannelBinding::Unsupported,
+        });
 
         Self {
-            state,
-            password,
-            client_first_bare,
-            client_nonce,
+            state: State::Start,
+            mechanism,
             observed: Vec::new(),
-            expected_server_signature: None,
             opts,
         }
     }
 
+    // helper that tells if the coroutine needs to fetch capability or not (in
+    // case found in data or untagged responses)
     fn wants_capability(
         &mut self,
         code: Option<Code<'static>>,
@@ -260,6 +225,7 @@ impl ImapAuthScramSha256 {
             .then(|| State::Capability(ImapCapabilityGet::new()))
     }
 
+    // helper that tells if the coroutine needs to exchange ID with server
     fn wants_id(&mut self) -> Option<State> {
         let params = self.opts.auto_id.take()?;
         let wire = (!params.is_empty()).then_some(params);
@@ -268,67 +234,23 @@ impl ImapAuthScramSha256 {
         })))
     }
 
-    fn build_client_final(
-        &mut self,
-        server_first_bytes: &[u8],
-    ) -> Result<ImapSend<AuthenticateDataCodec>, ImapAuthScramSha256Error> {
-        let server_first = String::from_utf8(server_first_bytes.to_vec())
-            .map_err(|_| ImapAuthScramSha256Error::InvalidEncoding)?;
-
-        let (nonce, salt, iterations) = parse_server_first(&server_first, &self.client_nonce)?;
-
-        // NOTE: c=biws is base64("n,,"), the GS2 header for no channel binding.
-        let client_final_without_proof = format!("c=biws,r={nonce}");
-
-        let auth_message = format!(
-            "{},{},{}",
-            self.client_first_bare, server_first, client_final_without_proof,
-        );
-
-        let (client_proof, server_signature) =
-            compute_scram_sha256(&self.password, &salt, iterations, auth_message.as_bytes());
-
-        self.expected_server_signature = Some(server_signature);
-
-        let client_final = format!(
-            "{},p={}",
-            client_final_without_proof,
-            STANDARD.encode(&client_proof),
-        );
-
-        let auth = AuthenticateData::r#continue(client_final.into_bytes());
-        Ok(ImapSend::new(AuthenticateDataCodec::new(), auth))
+    // helper that tells if the coroutine needs to send continuation auth data
+    fn wants_continue(payload: Vec<u8>) -> State {
+        let auth = AuthenticateData::r#continue(payload);
+        let codec = AuthenticateDataCodec::new();
+        State::Continue(ImapSend::new(codec, auth))
     }
 
-    fn verify_server_final(
-        &self,
-        server_final_bytes: &[u8],
-    ) -> Result<(), ImapAuthScramSha256Error> {
-        let server_final = String::from_utf8(server_final_bytes.to_vec())
-            .map_err(|_| ImapAuthScramSha256Error::InvalidEncoding)?;
-
-        if let Some(e) = server_final.strip_prefix("e=") {
-            return Err(ImapAuthScramSha256Error::ServerError(e.to_string()));
+    // helper that resumes SASL coroutine
+    fn resume_sasl(
+        &mut self,
+        arg: SaslArg<'_>,
+    ) -> Result<Option<Vec<u8>>, ImapAuthScramSha256Error> {
+        match self.mechanism.resume(arg) {
+            SaslCoroutineState::Yielded(SaslYield::WantsWrite(payload)) => Ok(Some(payload)),
+            SaslCoroutineState::Yielded(SaslYield::WantsRead) => Ok(None),
+            SaslCoroutineState::Complete(result) => result.map(|()| None).map_err(Into::into),
         }
-
-        let v = server_final
-            .strip_prefix("v=")
-            .ok_or(ImapAuthScramSha256Error::InvalidServerFinal)?;
-
-        let server_sig = STANDARD
-            .decode(v)
-            .map_err(|_| ImapAuthScramSha256Error::InvalidBase64)?;
-
-        let expected = self
-            .expected_server_signature
-            .as_ref()
-            .ok_or(ImapAuthScramSha256Error::InvalidServerFinal)?;
-
-        if server_sig != *expected {
-            return Err(ImapAuthScramSha256Error::ServerSignatureMismatch);
-        }
-
-        Ok(())
     }
 }
 
@@ -343,133 +265,78 @@ impl ImapCoroutine for ImapAuthScramSha256 {
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
-                State::Send {
-                    send,
-                    client_first_message,
-                } => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                State::Start => {
+                    let payload = match self.resume_sasl(SaslArg::None) {
+                        Ok(payload) => payload,
+                        Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                    };
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    if out.continuation_request.is_some() {
-                        let payload = mem::take(client_first_message).into_bytes();
-                        let auth = AuthenticateData::r#continue(payload);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::SendClientFirst(ImapSend::new(codec, auth));
-                        debug!("{}", self.state);
-                        continue;
-                    }
-
-                    if let Some(Tagged { body, .. }) = out.tagged {
-                        let err = match body.kind {
-                            StatusKind::Ok => ImapAuthScramSha256Error::UnexpectedOk,
-                            StatusKind::No => ImapAuthScramSha256Error::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthScramSha256Error::Bad(body.text.to_string()),
-                        };
-
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let err = ImapAuthScramSha256Error::ExpectedContinuationRequest;
-                    return ImapCoroutineState::Complete(Err(err));
-                }
-                State::SendIr(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    if let Some(cr) = out.continuation_request {
-                        let challenge = extract_challenge(cr);
-                        let send = match self.build_client_final(&challenge) {
-                            Ok(s) => s,
-                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
-                        };
-                        self.state = State::SendClientFinal(send);
-                        debug!("{}", self.state);
-                        continue;
-                    }
-
-                    if let Some(Tagged { body, .. }) = out.tagged {
-                        let err = match body.kind {
-                            StatusKind::Ok => ImapAuthScramSha256Error::UnexpectedOk,
-                            StatusKind::No => ImapAuthScramSha256Error::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthScramSha256Error::Bad(body.text.to_string()),
-                        };
-
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let err = ImapAuthScramSha256Error::ExpectedContinuationRequest;
-                    return ImapCoroutineState::Complete(Err(err));
-                }
-                State::SendClientFirst(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    if let Some(cr) = out.continuation_request {
-                        let challenge = extract_challenge(cr);
-                        let send = match self.build_client_final(&challenge) {
-                            Ok(s) => s,
-                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
-                        };
-                        self.state = State::SendClientFinal(send);
-                        debug!("{}", self.state);
-                        continue;
-                    }
-
-                    if let Some(Tagged { body, .. }) = out.tagged {
-                        let err = match body.kind {
-                            StatusKind::Ok => ImapAuthScramSha256Error::UnexpectedOk,
-                            StatusKind::No => ImapAuthScramSha256Error::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthScramSha256Error::Bad(body.text.to_string()),
-                        };
-
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let err = ImapAuthScramSha256Error::ExpectedContinuationRequest;
-                    return ImapCoroutineState::Complete(Err(err));
-                }
-                State::SendClientFinal(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    if let Some(cr) = out.continuation_request {
-                        let challenge = extract_challenge(cr);
-                        if let Err(err) = self.verify_server_final(&challenge) {
-                            return ImapCoroutineState::Complete(Err(err));
+                    // NOTE: the initial response travels inline only when the
+                    // server was found to support RFC 4959, which is a decision
+                    // taken before the exchange; otherwise it waits for the
+                    // empty challenge.
+                    let (initial_response, pending) = match payload {
+                        Some(payload) if self.opts.initial_request => {
+                            (Some(Secret::new(payload.into())), None)
                         }
+                        payload => (None, payload),
+                    };
 
-                        let auth = AuthenticateData::r#continue(vec![]);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::Acknowledge(ImapSend::new(codec, auth));
+                    let tag = TagGenerator::new().generate();
+                    let body = CommandBody::Authenticate {
+                        mechanism: AuthMechanism::ScramSha256,
+                        initial_response,
+                    };
+                    let cmd = Command { tag, body };
+                    trace!("send IMAP command {cmd:?}");
+
+                    self.state = State::Send {
+                        send: ImapSend::new(CommandCodec::new(), cmd),
+                        pending,
+                    };
+                    debug!("{}", self.state);
+                }
+                State::Send { send, pending } => {
+                    let out = imap_try!(send, fragmentizer, arg);
+
+                    if let Some(bye) = out.bye {
+                        let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    if let Some(cr) = out.continuation_request {
+                        // NOTE: with the client-first-message still held back
+                        // this is the empty challenge inviting it; with it
+                        // already inlined the challenge is the
+                        // server-first-message, which only the mechanism reads.
+                        let payload = match pending.take() {
+                            Some(payload) => payload,
+                            None => {
+                                match self.resume_sasl(SaslArg::Input(&extract_challenge(cr))) {
+                                    Ok(payload) => payload.unwrap_or_default(),
+                                    Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                                }
+                            }
+                        };
+
+                        self.state = Self::wants_continue(payload);
                         debug!("{}", self.state);
                         continue;
                     }
 
-                    // NOTE: some servers piggyback the server-final on the
-                    // tagged OK instead of sending it as a continuation.
+                    let inlined = pending.is_none();
+
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthScramSha256Error::MissingTagged;
+                        let err = ImapAuthScramSha256Error::ExpectedContinuationRequest;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
-                        StatusKind::Ok => body.code,
+                        StatusKind::Ok if inlined => body.code,
+                        StatusKind::Ok => {
+                            let err = ImapAuthScramSha256Error::UnexpectedOk;
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
                         StatusKind::No => {
                             let err = ImapAuthScramSha256Error::No(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
@@ -479,6 +346,14 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
+
+                    // NOTE: a server ending the exchange this early proved
+                    // nothing, and the mechanism says so rather than this
+                    // crate guessing: SCRAM refuses every end that comes
+                    // before it verified the server signature.
+                    if let Err(err) = self.resume_sasl(SaslArg::Done) {
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
@@ -495,12 +370,24 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
-                State::Acknowledge(send) => {
+                State::Continue(send) => {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
                         let err = ImapAuthScramSha256Error::Bye(bye.text.to_string());
                         return ImapCoroutineState::Complete(Err(err));
+                    }
+
+                    if let Some(cr) = out.continuation_request {
+                        let payload = match self.resume_sasl(SaslArg::Input(&extract_challenge(cr)))
+                        {
+                            Ok(payload) => payload.unwrap_or_default(),
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                        };
+
+                        self.state = Self::wants_continue(payload);
+                        debug!("{}", self.state);
+                        continue;
                     }
 
                     let Some(Tagged { body, .. }) = out.tagged else {
@@ -519,6 +406,15 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
+
+                    // NOTE: the tagged OK ends the exchange, and the mechanism
+                    // is told so rather than dropped. A server piggybacking
+                    // its server-final-message on that OK instead of sending
+                    // it as a continuation is refused here, where this crate
+                    // used to accept it and report a success nobody verified.
+                    if let Err(err) = self.resume_sasl(SaslArg::Done) {
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
@@ -558,14 +454,12 @@ impl ImapCoroutine for ImapAuthScramSha256 {
 }
 
 enum State {
+    Start,
     Send {
         send: ImapSend<CommandCodec>,
-        client_first_message: String,
+        pending: Option<Vec<u8>>,
     },
-    SendIr(ImapSend<CommandCodec>),
-    SendClientFirst(ImapSend<AuthenticateDataCodec>),
-    SendClientFinal(ImapSend<AuthenticateDataCodec>),
-    Acknowledge(ImapSend<AuthenticateDataCodec>),
+    Continue(ImapSend<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -573,124 +467,40 @@ enum State {
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Send { .. } => f.write_str("send auth"),
-            Self::SendIr(_) => f.write_str("send auth with ir"),
-            Self::SendClientFirst(_) => f.write_str("send client-first"),
-            Self::SendClientFinal(_) => f.write_str("send client-final"),
-            Self::Acknowledge(_) => f.write_str("acknowledge server-final"),
+            Self::Start => f.write_str("start mechanism"),
+            Self::Send { pending, .. } if pending.is_some() => f.write_str("send auth"),
+            Self::Send { .. } => f.write_str("send auth with ir"),
+            Self::Continue(_) => f.write_str("send response"),
             Self::Capability(_) => f.write_str("fetch capabilities"),
             Self::Id(_) => f.write_str("send id"),
         }
     }
 }
 
-fn escape_username(username: &str) -> String {
-    username.replace('=', "=3D").replace(',', "=2C")
-}
-
-fn generate_nonce() -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(24)
-        .map(char::from)
-        .collect()
+fn generate_nonce() -> Vec<u8> {
+    rand::rng().sample_iter(&Alphanumeric).take(24).collect()
 }
 
 fn extract_challenge(cr: CommandContinuationRequest<'static>) -> Vec<u8> {
     match cr {
+        CommandContinuationRequest::Basic(basic) => basic.text().to_string().into_bytes(),
         CommandContinuationRequest::Base64(data) => data.as_ref().to_vec(),
-        CommandContinuationRequest::Basic(_) => vec![],
     }
-}
-
-fn parse_server_first(
-    msg: &str,
-    client_nonce: &str,
-) -> Result<(String, Vec<u8>, u32), ImapAuthScramSha256Error> {
-    let mut nonce = None;
-    let mut salt = None;
-    let mut iterations = None;
-
-    for part in msg.split(',') {
-        if let Some(r) = part.strip_prefix("r=") {
-            nonce = Some(r.to_string());
-        } else if let Some(s) = part.strip_prefix("s=") {
-            salt = Some(
-                STANDARD
-                    .decode(s)
-                    .map_err(|_| ImapAuthScramSha256Error::InvalidBase64)?,
-            );
-        } else if let Some(i) = part.strip_prefix("i=") {
-            iterations = Some(
-                i.parse::<u32>()
-                    .map_err(|_| ImapAuthScramSha256Error::InvalidIterationCount)?,
-            );
-        }
-    }
-
-    let nonce = nonce.ok_or(ImapAuthScramSha256Error::MissingNonce)?;
-    let salt = salt.ok_or(ImapAuthScramSha256Error::MissingSalt)?;
-    let iterations = iterations.ok_or(ImapAuthScramSha256Error::MissingIterations)?;
-
-    if !nonce.starts_with(client_nonce) {
-        return Err(ImapAuthScramSha256Error::NonceMismatch);
-    }
-
-    Ok((nonce, salt, iterations))
-}
-
-fn compute_scram_sha256(
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    auth_message: &[u8],
-) -> (Vec<u8>, Vec<u8>) {
-    // NOTE: the labels below map each step to its RFC 5802 §3 formula.
-
-    // NOTE: SaltedPassword = PBKDF2(SHA-256, password, salt, iterations).
-    let mut salted_password = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut salted_password);
-
-    // NOTE: ClientKey = HMAC(SaltedPassword, "Client Key").
-    let mut mac = HmacSha256::new_from_slice(&salted_password).unwrap();
-    mac.update(b"Client Key");
-    let client_key = mac.finalize().into_bytes();
-
-    // NOTE: StoredKey = H(ClientKey).
-    let stored_key = Sha256::digest(client_key);
-
-    // NOTE: ClientSignature = HMAC(StoredKey, AuthMessage).
-    let mut mac = HmacSha256::new_from_slice(&stored_key).unwrap();
-    mac.update(auth_message);
-    let client_signature = mac.finalize().into_bytes();
-
-    // NOTE: ClientProof = ClientKey XOR ClientSignature.
-    let client_proof: Vec<u8> = client_key
-        .iter()
-        .zip(client_signature.iter())
-        .map(|(a, b)| a ^ b)
-        .collect();
-
-    // NOTE: ServerKey = HMAC(SaltedPassword, "Server Key").
-    let mut mac = HmacSha256::new_from_slice(&salted_password).unwrap();
-    mac.update(b"Server Key");
-    let server_key = mac.finalize().into_bytes();
-
-    // NOTE: ServerSignature = HMAC(ServerKey, AuthMessage).
-    let mut mac = HmacSha256::new_from_slice(&server_key).unwrap();
-    mac.update(auth_message);
-    let server_signature = mac.finalize().into_bytes();
-
-    (client_proof, server_signature.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use core::str;
 
-    use alloc::borrow::ToOwned;
+    use alloc::{borrow::ToOwned, format};
+
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
 
     use crate::rfc7677::auth_scram_sha_256::*;
+
+    type HmacSha256 = Hmac<Sha256>;
 
     #[test]
     fn ir_success_returns_ok() {
@@ -731,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_server_error_returns_server_error() {
+    fn ir_server_error_returns_mechanism_error() {
         let opts = ImapAuthScramSha256Options {
             initial_request: true,
             ..Default::default()
@@ -754,12 +564,9 @@ mod tests {
 
         let server_final = "e=invalid-proof";
         let challenge2 = format!("+ {}\r\n", STANDARD.encode(server_final));
-        let err = match auth.resume(&mut frag, Some(challenge2.as_bytes())) {
-            ImapCoroutineState::Complete(Err(err)) => err,
-            state => panic!("expected Complete(Err), got {state:?}"),
-        };
-        let ImapAuthScramSha256Error::ServerError(text) = err else {
-            panic!("expected ImapAuthScramSha256Error::ServerError, got {err:?}");
+        let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
+        let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
+            panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
         };
         assert_eq!(text, "invalid-proof");
     }
@@ -785,6 +592,42 @@ mod tests {
             panic!("expected ImapAuthScramSha256Error::Bad, got {err:?}");
         };
         assert_eq!(text, "AUTHENTICATE not enabled");
+    }
+
+    #[test]
+    fn ir_tagged_ok_before_the_server_proved_itself_returns_mechanism_error() {
+        let opts = ImapAuthScramSha256Options {
+            initial_request: true,
+            ..Default::default()
+        };
+
+        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        let tag = first_word(line).to_owned();
+        let client_first = decode_last_base64_token(line);
+        let client_nonce = extract_client_nonce(&client_first);
+
+        expect_wants_read(&mut auth, &mut frag);
+
+        let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
+        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
+
+        expect_wants_read(&mut auth, &mut frag);
+
+        // NOTE: a tagged OK arriving in place of the
+        // server-final-message ends the exchange with the server
+        // signature unchecked, which the mechanism refuses. This crate
+        // used to report it as a success.
+        let reply = format!("{tag} OK AUTHENTICATE completed\r\n");
+        let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
+        let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerSignatureNotVerified) = err
+        else {
+            panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
+        };
     }
 
     #[test]
@@ -834,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn non_ir_server_error_returns_server_error() {
+    fn non_ir_server_error_returns_mechanism_error() {
         let opts = ImapAuthScramSha256Options::default();
         let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
@@ -862,12 +705,9 @@ mod tests {
 
         let server_final = "e=invalid-proof";
         let challenge2 = format!("+ {}\r\n", STANDARD.encode(server_final));
-        let err = match auth.resume(&mut frag, Some(challenge2.as_bytes())) {
-            ImapCoroutineState::Complete(Err(err)) => err,
-            state => panic!("expected Complete(Err), got {state:?}"),
-        };
-        let ImapAuthScramSha256Error::ServerError(text) = err else {
-            panic!("expected ImapAuthScramSha256Error::ServerError, got {err:?}");
+        let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
+        let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
+            panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
         };
         assert_eq!(text, "invalid-proof");
     }
@@ -934,6 +774,10 @@ mod tests {
             .1
     }
 
+    /// The server-final-message a server holding the same password
+    /// would send, computed here rather than by the mechanism under
+    /// test, so that what verifies the signature is not what produced
+    /// it.
     fn build_server_final(client_first: &str, server_first: &str, client_final: &str) -> String {
         let client_first_bare = client_first.strip_prefix("n,,").expect("gs2 header");
         let client_final_without_proof = client_final
@@ -943,8 +787,21 @@ mod tests {
         let auth_message =
             format!("{client_first_bare},{server_first},{client_final_without_proof}");
         let salt = STANDARD.decode(SALT_B64).expect("valid salt");
-        let (_, server_sig) =
-            compute_scram_sha256(b"secret", &salt, ITERATIONS, auth_message.as_bytes());
-        format!("v={}", STANDARD.encode(server_sig))
+
+        // NOTE: SaltedPassword = PBKDF2(SHA-256, password, salt, iterations).
+        let mut salted_password = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, ITERATIONS, &mut salted_password);
+
+        // NOTE: ServerKey = HMAC(SaltedPassword, "Server Key").
+        let mut mac = HmacSha256::new_from_slice(&salted_password).unwrap();
+        mac.update(b"Server Key");
+        let server_key = mac.finalize().into_bytes();
+
+        // NOTE: ServerSignature = HMAC(ServerKey, AuthMessage).
+        let mut mac = HmacSha256::new_from_slice(&server_key).unwrap();
+        mac.update(auth_message.as_bytes());
+        let server_signature = mac.finalize().into_bytes();
+
+        format!("v={}", STANDARD.encode(server_signature))
     }
 }

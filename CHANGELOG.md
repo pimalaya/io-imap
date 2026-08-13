@@ -8,15 +8,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- Added `client::ImapClientStdConnectOptions::sasl_ir`, forcing the RFC 4959 SASL-IR initial response on or off. `Some(true)` always sends the initial response inline with `AUTHENTICATE`, `Some(false)` never does and waits for the server's continuation request, and `None` (the default) keeps following the advertised `SASL-IR` capability.
+- Added the `session` module, holding `ImapSessionOpen`: a composite coroutine covering everything between an address and an authenticated session, with transport-shaped yields (`WantsTcpConnect`, `WantsTlsConnect`, `WantsUnixConnect`, `WantsTlsUpgrade`) alongside the usual reads and writes.
 
-  The capability alone is not trustworthy: Coremail (126.com, 163.com) advertises `SASL-IR` yet answers the inline form with a tagged `BAD`, so `connect` could not authenticate against it at all. The override is a caller-side escape hatch because a lying capability leaves the client no signal of its own to go on. It applies to every SASL mechanism, since the defect is in the server's command parser rather than in any one mechanism.
+  Scheme dispatch, STARTTLS ordering, the greeting, PREAUTH detection, the SASL-IR policy with its Coremail override, `auto_id` chaining and the SASL mechanism match all used to live inside `ImapClientStd::connect`, where no consumer on another runtime could reach them. A caller now answers the transport yields with its own sockets and inherits the ordering and the provider quirks; a caller that skips a step cannot advance, because the state machine never asks for the next one.
+
+- Added the `client::ImapClient` and `client::ImapClientAsync` traits. Implement one `run` method, inherit forty-odd commands.
+
+  The `Yield = ImapYield` bound on `run` makes the surface self-selecting: coroutines that every client wraps identically are defaulted methods, and the five that declare their own yield vocabulary (watch, idle, streamed `APPEND`, the two streamed `FETCH`es) fall outside the trait, which is where implementations are expected to diverge anyway. `ImapClientAsync` declares `-> impl Future<..> + Send` with `Send` as a supertrait, so anything built from a default body survives `tokio::spawn`; a plain `async fn` in a trait cannot express that. `ImapClient` carries no `Send` bound on purpose, since a blocking call returns a value rather than a future and the bound would exclude a thread-affine client such as a JNI bridge. Neither trait is dyn-compatible: the dynamism this crate needs lives at `client::ImapStream`.
+
+- Added the `session::ImapSessionOpenOptions::sasl_ir` option.
+
+  Forces the RFC 4959 SASL-IR initial response on or off for every SASL mechanism: `Some(true)` always inlines it with `AUTHENTICATE`, `Some(false)` waits for the server's continuation request, and `None` follows the advertised `SASL-IR` capability. Coremail (126.com, 163.com) advertises `SASL-IR` yet answers the inline form with a tagged `BAD`, which no capability inspection can predict.
+
+- Added the `url` cargo feature, gating `session::ImapSessionTransport::from_url`. The three TLS features enable it. A consumer that brings its own TLS can parse IMAP URLs without pulling in the std client.
 
 ### Changed
 
-- Replaced the trailing `ImapClientStd::connect` parameters with the new `ImapClientStdConnectOptions`. **Breaking.**
+- `sasl::auth_login::ImapAuthLogin` now wraps io-sasl's LOGIN mechanism instead of computing the payloads itself. **Breaking.**
 
-  `connect(url, tls, starttls, sasl, auto_id)` becomes `connect(url, tls, sasl, opts)`, where `opts` carries `starttls`, `auto_id` and the new `sasl_ir`. The signature had accumulated a tail of unrelated transport and provider-quirk arguments, and adding `sasl_ir` positionally would have put a second `bool`-shaped parameter next to `starttls`. `ImapClientStdConnectOptions::default()` reproduces the previous `(false, None)` behaviour.
+  The coroutine keeps the IMAP half of the exchange, the `AUTHENTICATE LOGIN` command, the continuation requests, the tagged response and the post-auth follow-ups, and asks the mechanism what each response carries. Nothing in this crate knows any more that LOGIN answers two prompts in a fixed order, and the tagged `OK` is handed to the mechanism as the end of the exchange rather than assumed to be one, which is what will stop a SCRAM profile from treating a success reply as proof the server never gave. The wire bytes are unchanged, in both the SASL-IR and the two-prompt flows.
+
+  `ImapAuthLoginError` gained a `Mechanism` variant carrying the mechanism's own failure, and lost `UnexpectedContinuationRequest`: a prompt arriving once LOGIN has nothing left to say is now refused by the mechanism, which is the only party that knows how many prompts it answers.
+
+- `sasl::auth_plain::ImapAuthPlain` now wraps io-sasl's PLAIN mechanism, the same way. **Breaking.**
+
+  The NUL-separated triple is the mechanism's, and this crate keeps the command, the challenge and the tagged response. `ImapAuthPlainError` gained `Mechanism` and lost `UnexpectedContinuationRequest`, as LOGIN did. One behaviour was tightened on the way: a tagged `OK` answering the command now completes the exchange when the credentials went inline and fails with `UnexpectedOk` when they did not, where before the SASL-IR and the non-IR flows each hard-coded one of the two answers.
+
+- `sasl::auth_anonymous::ImapAuthAnonymous` now wraps io-sasl's ANONYMOUS mechanism. **Breaking.**
+
+  `ImapAuthAnonymousError` gained `Mechanism` and lost `UnexpectedContinuationRequest`.
+
+- `sasl::auth_xoauth2::ImapAuthXoauth2` and `rfc7628::auth_oauthbearer::ImapAuthOauthbearer` now wrap io-sasl's XOAUTH2 and OAUTHBEARER mechanisms. **Breaking.**
+
+  The rejection dance is the mechanism's: a challenge carrying the error JSON is answered with the empty response Google documents, or with the single `%x01` of RFC 7628 section 3.2.3, and the JSON comes back out when the exchange is declared over, still reported as `NoWithError`. Both error types gained `Mechanism` and lost `UnexpectedStatus`: a server answering the acknowledgement with `OK` instead of `NO` now reports the rejection it sent, and one answering with `BAD` reports the `BAD` text, both of which say more than the variant they replace.
+
+- `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` now wraps io-sasl's SCRAM-SHA-256 mechanism. **Breaking.**
+
+  RFC 5802 leaves this crate entirely: the salted password, the client proof, the parsing of the server messages and the verification of the server signature are the mechanism's. `ImapAuthScramSha256Error` keeps its framing variants and replaces the eleven RFC 5802 ones with a single `Mechanism`. The client nonce is still generated here, `rand` being the only thing an I/O-free mechanism cannot bring, and handed over with the credentials.
+
+  **This fixes a defect.** A server ending the exchange with a tagged `OK` in place of its server-final-message was reported as a success, with the server signature never verified, which is mutual authentication skipped by omission. The mechanism now refuses it with `ServerSignatureNotVerified`.
+
+- Moved `hmac`, `pbkdf2` and `sha2` to dev-dependencies, the SCRAM crypto now living in io-sasl. The `scram` cargo feature keeps `rand` and enables `io-sasl/scram`.
+
+- Moved the command methods off `ImapClientStd` and onto the `ImapClient` trait. **Breaking.**
+
+  Callers add `use io_imap::client::ImapClient;`. The methods keep their names and semantics. Argument types that were `impl AsRef<str>` or `impl AsRef<[u8]>` are now `&str` and `&[u8]`, and `status` takes `Cow<'static, [StatusDataItemName]>` rather than `impl Into<..>`, so one signature serves both the blocking and the async trait. The four opinionated methods (`watch_mailbox`, `fetch_body_stream`, `fetch_bodies_stream`, `append_stream`) stay inherent to `ImapClientStd`, because each encodes a runtime-specific choice.
+
+- Renamed `client::ImapClientStdError` to `client::ImapClientError` and gave it a `Transport` variant. **Breaking.**
+
+  It is now the error type of both client traits rather than of one concrete client, so the name no longer says `Std`. `Transport` carries a boxed error for implementors whose I/O is not `std::io::Error`, such as a JNI upcall.
+
+- Replaced the trailing `ImapClientStd::connect` parameters with `session::ImapSessionOpenOptions`. **Breaking.**
+
+  `connect(url, tls, starttls, sasl, auto_id)` becomes `connect(url, tls, sasl, opts)`, where `opts` carries `starttls`, `auto_id` and the new `sasl_ir`. The method is now a pump over `ImapSessionOpen` that answers its transport yields with `StreamStd`, and holds no protocol decision of its own. `ImapSessionOpenOptions::default()` reproduces the previous behaviour.
+
+- `ImapClient::greeting` returns the whole `ImapGreetingOk` rather than just its capability list. **Breaking.** Callers append `.capability`. The greeting also reports `pre_authenticated`, which the old signature discarded.
+
+- Moved `default_alpn` and `default_port` into the `session` module, next to the scheme table they belong to, and re-exported them from `client` so existing call sites keep working. They no longer require the `client` feature.
+
+### Fixed
+
+- `ImapSessionOpen` refuses the TLS upgrade when the server appends bytes to its `STARTTLS` tagged response, instead of discarding them. **Behaviour change.**
+
+  RFC 3501 §6.2.1 forbids trailing bytes, so their presence means an attacker injected plaintext commands the server would replay inside the TLS session. `ImapStartTls` has always returned them and documented them as an injection signal, but `ImapClientStd::connect` threw the value away. It now surfaces as `ImapSessionOpenError::StartTlsInjection`.
+
+- Building with the `client` feature alone now works. `impl ImapStream for StreamStd` was ungated while the `StreamStd` import was gated behind the TLS features, so the light client (the case where the caller brings its own transport) failed to compile.
 
 ## [0.4.0] - 2026-08-07
 

@@ -596,6 +596,7 @@ dependencies = [
  "env_logger",
  "hmac",
  "imap-codec",
+ "io-sasl",
  "log",
  "pbkdf2",
  "pimalaya-stream",
@@ -618,6 +619,20 @@ checksum = "ea1200e73a98f7a2500af468bb7857a1c78b5b4b453c8d69760c2a61b9df5303"
 dependencies = [
  "base64 0.23.1",
  "log",
+ "thiserror",
+]
+
+[[package]]
+name = "io-sasl"
+version = "0.1.0"
+source = "git+https://github.com/pimalaya/io-sasl#a2963f184eb0a809d2afd4b45b364598842338bd"
+dependencies = [
+ "base64 0.23.1",
+ "hmac",
+ "log",
+ "pbkdf2",
+ "secrecy",
+ "sha2",
  "thiserror",
 ]
 
@@ -1120,9 +1135,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -1231,6 +1246,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "simd_cesu8"
@@ -1362,6 +1387,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

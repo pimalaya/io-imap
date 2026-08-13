@@ -7,7 +7,7 @@
 
 use std::{env, error::Error};
 
-use io_imap::client::{ImapClientStd, ImapClientStdConnectOptions};
+use io_imap::{client::ImapClientStd, session::ImapSessionOpenOptions};
 use pimalaya_stream::{sasl::Sasl, tls::Tls};
 use url::Url;
 
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let url = Url::parse(&url)?;
     let tls = Tls::default();
 
-    let opts = ImapClientStdConnectOptions::default();
+    let opts = ImapSessionOpenOptions::default();
     let (_client, capabilities) = ImapClientStd::connect(&url, &tls, None::<Sasl>, opts)?;
 
     for capability in capabilities {

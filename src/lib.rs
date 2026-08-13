@@ -32,7 +32,7 @@
 //! surface as parameters and response fields of the [`rfc3501`]
 //! select, examine and fetch coroutines, and power [`watch`]. Code
 //! spanning several RFC modules lives at the crate root: [`send`],
-//! [`watch`], [`client`] and [`coroutine`].
+//! [`session`], [`watch`], [`client`] and [`coroutine`].
 //!
 //! Public types follow the Imap-Target-Verb naming scheme
 //! (`ImapMailboxCreate`, `ImapMessageFetchStream`) with Options, Error,
@@ -81,10 +81,21 @@
 //! Fastmail. Secrets ride in imap-types `Secret` wrappers so they never
 //! land in logs.
 //!
-//! The full client picks the flow from the advertised `SASL-IR`
-//! capability, which
-//! [`client::ImapClientStdConnectOptions::sasl_ir`] can override for a
-//! server that advertises it without honouring it (Coremail).
+//! Which flow to use is decided by [`session`], not by any client: it
+//! follows the advertised `SASL-IR` capability unless
+//! [`session::ImapSessionOpenOptions::sasl_ir`] overrides it for a
+//! server advertising it falsely (Coremail).
+//!
+//! ## Opening a session
+//!
+//! [`session`] provides `ImapSessionOpen`, the composite coroutine
+//! covering everything between an address and an authenticated session:
+//! transport selection, the optional STARTTLS upgrade, the greeting,
+//! PREAUTH detection, the SASL-IR policy and the SASL exchange. It
+//! yields transport requests (connect this socket, upgrade that one)
+//! alongside the usual reads and writes, so a caller on any runtime
+//! answers them with its own sockets and inherits the ordering and the
+//! provider quirks. The std client is a thirty-line pump over it.
 //!
 //! ## Watching a mailbox
 //!
@@ -94,14 +105,23 @@
 //! UID-keyed added/changed/removed events. The connection is dedicated;
 //! a shared `AtomicBool` winds it down cleanly.
 //!
-//! ## The std client
+//! ## The clients
 //!
-//! [`client::ImapClientStd`] (`client` feature) wraps any blocking
-//! `Read + Write` stream plus a per-connection `Fragmentizer`, and
-//! exposes one method per coroutine. The connect constructor (TLS
-//! features) parses an imap:// or imaps:// URL, opens the connection
-//! through pimalaya-stream, performs the optional STARTTLS upgrade,
-//! reads the greeting and runs the chosen SASL mechanism.
+//! The command surface is two traits, [`client::ImapClient`] for
+//! blocking callers and [`client::ImapClientAsync`] for async ones.
+//! Implement the single `run` method over your own transport and the
+//! forty-odd commands come with it. The `Yield = ImapYield` bound on
+//! `run` is what keeps the surface honest: the five coroutines with a
+//! yield vocabulary of their own cannot be defaulted, which is exactly
+//! where implementations are expected to differ.
+//!
+//! [`client::ImapClientStd`] (`client` feature) is the in-tree
+//! implementation, wrapping any blocking `Read + Write` stream plus a
+//! per-connection `Fragmentizer`. Its connect constructor (TLS features)
+//! is a pump over [`session::ImapSessionOpen`] answering the transport
+//! yields with pimalaya-stream, and the four opinionated methods
+//! (mailbox watch, streamed APPEND, the two streamed FETCHes) stay
+//! inherent to it because each encodes a runtime-specific choice.
 //!
 //! ## Conventions
 //!
@@ -137,6 +157,7 @@ pub mod rfc7628;
 pub mod rfc7677;
 pub mod sasl;
 pub mod send;
+pub mod session;
 pub mod watch;
 
 /// The imap-codec crate this version of io-imap builds on, re-exported

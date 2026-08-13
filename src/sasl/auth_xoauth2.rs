@@ -4,6 +4,14 @@
 //! XOAUTH2 is Google's pre-standard OAuth 2.0 mechanism, also
 //! accepted by Microsoft Exchange Online.
 //!
+//! The mechanism itself lives in io-sasl: this coroutine holds the IMAP
+//! half of the exchange, the `AUTHENTICATE XOAUTH2` command, the
+//! continuation requests, the tagged response and the post-auth
+//! follow-ups, and asks [`SaslXoauth2`] what to put in each response.
+//! The error dance is the mechanism's too: a challenge carrying the
+//! rejection JSON is answered with the empty response Google documents,
+//! and the JSON comes back out when the exchange is declared over.
+//!
 //! XOAUTH2: <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>
 //! SASL-IR: <https://www.rfc-editor.org/rfc/rfc4959>
 //!
@@ -51,10 +59,7 @@
 use core::{fmt, mem};
 
 use alloc::{
-    borrow::Cow,
-    format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 
@@ -71,7 +76,12 @@ use imap_codec::{
         secret::Secret,
     },
 };
+use io_sasl::{
+    coroutine::*,
+    xoauth2::{SaslXoauth2, SaslXoauth2Creds, SaslXoauth2Error},
+};
 use log::{debug, trace};
+use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -105,20 +115,18 @@ pub enum ImapAuthXoauth2Error {
         "IMAP AUTHENTICATE XOAUTH2 failed: server did not send the expected continuation request"
     )]
     ExpectedContinuationRequest,
-    /// The server answered the error acknowledgement with a status
-    /// other than the expected NO.
-    #[error("IMAP AUTHENTICATE XOAUTH2 failed: expected NO got {kind:?} ({info})")]
-    UnexpectedStatus {
-        /// The status kind the server answered instead of NO.
-        kind: StatusKind,
-        /// The status response text.
-        info: String,
-    },
     /// The server returned OK before the mechanism could complete.
     #[error(
         "IMAP AUTHENTICATE XOAUTH2 failed: server returned OK before the mechanism could complete"
     )]
     UnexpectedOk,
+    /// The mechanism refused the exchange.
+    ///
+    /// A rejected token whose exchange the server ended with something
+    /// other than a tagged NO lands here, carrying the JSON it sent,
+    /// as does a challenge arriving out of order.
+    #[error("IMAP AUTHENTICATE XOAUTH2 failed: {0}")]
+    Mechanism(#[from] SaslXoauth2Error),
     /// The underlying send coroutine failed.
     #[error("IMAP AUTHENTICATE XOAUTH2 failed: {0}")]
     Send(#[from] ImapSendError),
@@ -149,7 +157,7 @@ pub struct ImapAuthXoauth2Options {
 /// I/O-free SASL XOAUTH2 coroutine.
 pub struct ImapAuthXoauth2 {
     state: State,
-    error: Option<String>,
+    mechanism: SaslXoauth2,
     observed: Vec<Capability<'static>>,
     opts: ImapAuthXoauth2Options,
 }
@@ -166,39 +174,21 @@ impl ImapAuthXoauth2 {
         token: impl AsRef<str>,
         opts: ImapAuthXoauth2Options,
     ) -> Self {
-        let user = user.as_ref();
-        let token = token.as_ref();
-        let payload = format!("user={user}\x01auth=Bearer {token}\x01\x01");
-        let payload = Cow::from(payload.into_bytes());
-        let tag = TagGenerator::new().generate();
-
-        let state = if opts.initial_request {
-            let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::XOAuth2,
-                initial_response: Some(Secret::new(payload)),
-            };
-            let cmd = Command { tag, body };
-            trace!("send IMAP command {cmd:?}");
-            State::SendIr(ImapSend::new(CommandCodec::new(), cmd))
-        } else {
-            let body = CommandBody::Authenticate {
-                mechanism: AuthMechanism::XOAuth2,
-                initial_response: None,
-            };
-            let cmd = Command { tag, body };
-            trace!("send IMAP command {cmd:?}");
-            let send = ImapSend::new(CommandCodec::new(), cmd);
-            State::Send { send, payload }
-        };
+        let mechanism = SaslXoauth2::new(SaslXoauth2Creds {
+            username: user.as_ref().to_string(),
+            token: SecretString::from(token.as_ref().to_string()),
+        });
 
         Self {
-            state,
-            error: None,
+            state: State::Start,
+            mechanism,
             observed: Vec::new(),
             opts,
         }
     }
 
+    // helper that tells if the coroutine needs to fetch capability or not (in
+    // case found in data or untagged responses)
     fn wants_capability(
         &mut self,
         code: Option<Code<'static>>,
@@ -231,6 +221,7 @@ impl ImapAuthXoauth2 {
             .then(|| State::Capability(ImapCapabilityGet::new()))
     }
 
+    // helper that tells if the coroutine needs to exchange ID with server
     fn wants_id(&mut self) -> Option<State> {
         let params = self.opts.auto_id.take()?;
         let wire = (!params.is_empty()).then_some(params);
@@ -239,13 +230,32 @@ impl ImapAuthXoauth2 {
         })))
     }
 
-    fn extract_json_error(cr: &CommandContinuationRequest<'_>) -> String {
-        let err = match cr {
-            CommandContinuationRequest::Basic(err) => err.text().to_string().into(),
-            CommandContinuationRequest::Base64(err) => String::from_utf8_lossy(err),
-        };
+    // helper that tells if the coroutine needs to send continuation auth data
+    fn wants_continue(payload: Vec<u8>) -> State {
+        let auth = AuthenticateData::r#continue(payload);
+        let codec = AuthenticateDataCodec::new();
+        State::Continue(ImapSend::new(codec, auth))
+    }
 
-        err.to_string()
+    // helper that resumes SASL coroutine
+    fn resume_sasl(&mut self, arg: SaslArg<'_>) -> Result<Option<Vec<u8>>, ImapAuthXoauth2Error> {
+        match self.mechanism.resume(arg) {
+            SaslCoroutineState::Yielded(SaslYield::WantsWrite(payload)) => Ok(Some(payload)),
+            SaslCoroutineState::Yielded(SaslYield::WantsRead) => Ok(None),
+            SaslCoroutineState::Complete(result) => result.map(|()| None).map_err(Into::into),
+        }
+    }
+
+    // helper that turns a tagged NO into the reason the mechanism holds, when
+    // it holds one: the JSON explaining a rejected token was sent in a
+    // challenge, and the mechanism gives it up once the exchange is over
+    fn no(&mut self, info: String) -> ImapAuthXoauth2Error {
+        match self.mechanism.resume(SaslArg::Done) {
+            SaslCoroutineState::Complete(Err(SaslXoauth2Error::Rejected(err))) => {
+                ImapAuthXoauth2Error::NoWithError { info, err }
+            }
+            _ => ImapAuthXoauth2Error::No(info),
+        }
     }
 }
 
@@ -260,37 +270,38 @@ impl ImapCoroutine for ImapAuthXoauth2 {
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
-                State::Send { send, payload } => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                State::Start => {
+                    let payload = match self.resume_sasl(SaslArg::None) {
+                        Ok(payload) => payload,
+                        Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                    };
 
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
+                    // NOTE: the initial response travels inline only when the
+                    // server was found to support RFC 4959, which is a decision
+                    // taken before the exchange; otherwise it waits for the
+                    // empty challenge.
+                    let (initial_response, pending) = match payload {
+                        Some(payload) if self.opts.initial_request => {
+                            (Some(Secret::new(payload.into())), None)
+                        }
+                        payload => (None, payload),
+                    };
 
-                    if out.continuation_request.is_some() {
-                        let payload = mem::take(payload).into_owned();
-                        let auth = AuthenticateData::r#continue(payload);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::Continue(ImapSend::new(codec, auth));
-                        debug!("{}", self.state);
-                        continue;
-                    }
+                    let tag = TagGenerator::new().generate();
+                    let body = CommandBody::Authenticate {
+                        mechanism: AuthMechanism::XOAuth2,
+                        initial_response,
+                    };
+                    let cmd = Command { tag, body };
+                    trace!("send IMAP command {cmd:?}");
 
-                    if let Some(Tagged { body, .. }) = out.tagged {
-                        let err = match body.kind {
-                            StatusKind::Ok => ImapAuthXoauth2Error::UnexpectedOk,
-                            StatusKind::No => ImapAuthXoauth2Error::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthXoauth2Error::Bad(body.text.to_string()),
-                        };
-
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let err = ImapAuthXoauth2Error::ExpectedContinuationRequest;
-                    return ImapCoroutineState::Complete(Err(err));
+                    self.state = State::Send {
+                        send: ImapSend::new(CommandCodec::new(), cmd),
+                        pending,
+                    };
+                    debug!("{}", self.state);
                 }
-                State::SendIr(send) => {
+                State::Send { send, pending } => {
                     let out = imap_try!(send, fragmentizer, arg);
 
                     if let Some(bye) = out.bye {
@@ -299,23 +310,44 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     }
 
                     if let Some(cr) = out.continuation_request {
-                        self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![]);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(ImapSend::new(codec, auth));
+                        // NOTE: with the credentials still held back this is
+                        // the empty challenge inviting them; with them already
+                        // inlined it carries the rejection JSON, which only
+                        // the mechanism reads and answers.
+                        let payload = match pending.take() {
+                            Some(payload) => payload,
+                            None => {
+                                match self.resume_sasl(SaslArg::Input(&extract_challenge(cr))) {
+                                    Ok(payload) => payload.unwrap_or_default(),
+                                    Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                                }
+                            }
+                        };
+
+                        self.state = Self::wants_continue(payload);
                         debug!("{}", self.state);
                         continue;
                     }
 
+                    // NOTE: with the credentials inlined there is nothing left
+                    // to send, so the tagged response ends the exchange here
+                    // rather than after a continuation. Without them, a server
+                    // finishing now never asked for what it is authenticating.
+                    let inlined = pending.is_none();
+
                     let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthXoauth2Error::MissingTagged;
+                        let err = ImapAuthXoauth2Error::ExpectedContinuationRequest;
                         return ImapCoroutineState::Complete(Err(err));
                     };
 
                     let code = match body.kind {
-                        StatusKind::Ok => body.code,
+                        StatusKind::Ok if inlined => body.code,
+                        StatusKind::Ok => {
+                            let err = ImapAuthXoauth2Error::UnexpectedOk;
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
                         StatusKind::No => {
-                            let err = ImapAuthXoauth2Error::No(body.text.to_string());
+                            let err = self.no(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
@@ -323,6 +355,10 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
+
+                    if let Err(err) = self.resume_sasl(SaslArg::Done) {
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
@@ -348,10 +384,13 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     }
 
                     if let Some(cr) = out.continuation_request {
-                        self.error.replace(Self::extract_json_error(&cr));
-                        let auth = AuthenticateData::r#continue(vec![]);
-                        let codec = AuthenticateDataCodec::new();
-                        self.state = State::AcknowledgeError(ImapSend::new(codec, auth));
+                        let payload = match self.resume_sasl(SaslArg::Input(&extract_challenge(cr)))
+                        {
+                            Ok(payload) => payload.unwrap_or_default(),
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                        };
+
+                        self.state = Self::wants_continue(payload);
                         debug!("{}", self.state);
                         continue;
                     }
@@ -364,7 +403,7 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthXoauth2Error::No(body.text.to_string());
+                            let err = self.no(body.text.to_string());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
@@ -372,6 +411,14 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
+
+                    // NOTE: the tagged OK ends the exchange, and the mechanism
+                    // is told so rather than dropped: a token the server
+                    // rejected mid-exchange is reported here, with the JSON
+                    // that explained it, rather than read as a success.
+                    if let Err(err) = self.resume_sasl(SaslArg::Done) {
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
 
                     if let Some(next) = self.wants_capability(code, out.data, out.untagged) {
                         self.state = next;
@@ -387,34 +434,6 @@ impl ImapCoroutine for ImapAuthXoauth2 {
 
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
-                }
-                State::AcknowledgeError(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
-
-                    if let Some(bye) = out.bye {
-                        let err = ImapAuthXoauth2Error::Bye(bye.text.to_string());
-                        return ImapCoroutineState::Complete(Err(err));
-                    }
-
-                    let Some(Tagged { body, .. }) = out.tagged else {
-                        let err = ImapAuthXoauth2Error::MissingTagged;
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let info = body.text.to_string();
-
-                    let StatusKind::No = body.kind else {
-                        let kind = body.kind;
-                        let err = ImapAuthXoauth2Error::UnexpectedStatus { kind, info };
-                        return ImapCoroutineState::Complete(Err(err));
-                    };
-
-                    let err = match self.error.take() {
-                        Some(err) => ImapAuthXoauth2Error::NoWithError { info, err },
-                        None => ImapAuthXoauth2Error::No(info),
-                    };
-
-                    return ImapCoroutineState::Complete(Err(err));
                 }
                 State::Capability(capability) => {
                     self.observed = imap_try!(capability, fragmentizer, arg);
@@ -439,13 +458,12 @@ impl ImapCoroutine for ImapAuthXoauth2 {
 }
 
 enum State {
+    Start,
     Send {
         send: ImapSend<CommandCodec>,
-        payload: Cow<'static, [u8]>,
+        pending: Option<Vec<u8>>,
     },
-    SendIr(ImapSend<CommandCodec>),
     Continue(ImapSend<AuthenticateDataCodec>),
-    AcknowledgeError(ImapSend<AuthenticateDataCodec>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -453,19 +471,28 @@ enum State {
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Send { .. } => f.write_str("send auth"),
-            Self::SendIr(_) => f.write_str("send auth with ir"),
-            Self::Continue(_) => f.write_str("send credentials"),
-            Self::AcknowledgeError(_) => f.write_str("acknowledge error"),
+            Self::Start => f.write_str("start mechanism"),
+            Self::Send { pending, .. } if pending.is_some() => f.write_str("send auth"),
+            Self::Send { .. } => f.write_str("send auth with ir"),
+            Self::Continue(_) => f.write_str("send response"),
             Self::Capability(_) => f.write_str("fetch capabilities"),
             Self::Id(_) => f.write_str("send id"),
         }
     }
 }
 
+fn extract_challenge(cr: CommandContinuationRequest<'static>) -> Vec<u8> {
+    match cr {
+        CommandContinuationRequest::Basic(basic) => basic.text().to_string().into_bytes(),
+        CommandContinuationRequest::Base64(data) => data.as_ref().to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::str;
+
+    use alloc::format;
 
     use crate::sasl::auth_xoauth2::*;
 
@@ -539,9 +566,40 @@ mod tests {
         let reply = format!("{tag} BAD AUTHENTICATE not enabled\r\n");
         let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
         let ImapAuthXoauth2Error::Bad(text) = err else {
-            panic!("expected ImapAuthXoauth2Error::NoWithError, got {err:?}");
+            panic!("expected ImapAuthXoauth2Error::Bad, got {err:?}");
         };
         assert_eq!(text, "AUTHENTICATE not enabled");
+    }
+
+    #[test]
+    fn ir_rejected_token_acknowledged_then_ok_returns_mechanism_error() {
+        let opts = ImapAuthXoauth2Options {
+            initial_request: true,
+            ..Default::default()
+        };
+
+        let mut auth = ImapAuthXoauth2::new("user@example.org", "expired-token", opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
+
+        expect_wants_read(&mut auth, &mut frag);
+
+        let (err_json_b64, err_json) = fake_json_error();
+        let challenge = format!("+ {err_json_b64}\r\n");
+        expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
+        expect_wants_read(&mut auth, &mut frag);
+
+        // NOTE: a server answering the acknowledgement with OK contradicts the
+        // rejection it just sent. The mechanism read that JSON and keeps it,
+        // so the failure is reported with the reason rather than as a success.
+        let reply = format!("{tag} OK AUTHENTICATE completed\r\n");
+        let err = expect_complete_err(&mut auth, &mut frag, reply.as_bytes());
+        let ImapAuthXoauth2Error::Mechanism(SaslXoauth2Error::Rejected(json)) = err else {
+            panic!("expected ImapAuthXoauth2Error::Mechanism, got {err:?}");
+        };
+        assert_eq!(json, err_json);
     }
 
     #[test]
