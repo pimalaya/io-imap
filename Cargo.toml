@@ -75,7 +75,7 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 imap-codec = { version = "2.0.0-alpha.8", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
 io-sasl = { version = "0.1", default-features = false }
 log = "0.4"
-pimalaya-stream = { version = "0.1", default-features = false }
+pimalaya-stream = { version = "0.2", default-features = false, optional = true }
 rand = { version = "0.10", optional = true }
 secrecy = { version = "0.10", default-features = false }
 thiserror = { version = "2", default-features = false }
@@ -83,3 +83,4 @@ url = { version = "2.2", default-features = false, optional = true }
 
 [patch.crates-io]
 io-sasl.git = "https://github.com/pimalaya/io-sasl"
+pimalaya-stream.git = "https://github.com/pimalaya/stream"

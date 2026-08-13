@@ -29,14 +29,14 @@
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     session::{ImapSessionOpen, ImapSessionOpenOptions, ImapSessionOpenYield, ImapSessionTransport},
 //! };
-//! use pimalaya_stream::sasl::SaslPlain;
+//! use io_sasl::rfc4616::plain::SaslPlainCreds;
 //!
 //! let transport = ImapSessionTransport::Tcp {
 //!     host: String::from("localhost"),
 //!     port: 143,
 //! };
 //!
-//! let sasl = SaslPlain {
+//! let sasl = SaslPlainCreds {
 //!     authzid: None,
 //!     authcid: String::from("alice"),
 //!     passwd: String::from("secret").into(),
@@ -81,12 +81,15 @@ use imap_codec::{
         response::Capability,
     },
 };
-use log::debug;
-#[cfg(feature = "scram")]
-use pimalaya_stream::sasl::SaslScramSha256;
-use pimalaya_stream::sasl::{
-    Sasl, SaslAnonymous, SaslLogin, SaslOauthbearer, SaslPlain, SaslXoauth2,
+use io_sasl::{
+    login::SaslLoginCreds,
+    mechanism::{Sasl, SaslMechanism},
+    rfc4505::anonymous::SaslAnonymousCreds,
+    rfc4616::plain::SaslPlainCreds,
+    rfc7628::oauthbearer::SaslOauthbearerCreds,
+    xoauth2::SaslXoauth2Creds,
 };
+use log::debug;
 use secrecy::ExposeSecret;
 use thiserror::Error;
 #[cfg(feature = "url")]
@@ -115,10 +118,14 @@ pub enum ImapSessionOpenError {
     /// session. The upgrade is refused rather than performed.
     #[error("IMAP STARTTLS response carried trailing bytes: refusing the TLS upgrade")]
     StartTlsInjection,
-    /// SCRAM-SHA-256 was requested but the scram feature is off.
-    #[cfg(not(feature = "scram"))]
-    #[error("SCRAM-SHA-256 SASL mechanism requires the `scram` cargo feature")]
-    ScramSha256NotEnabled,
+    /// Credentials were given for a mechanism this crate does not
+    /// frame.
+    ///
+    /// io-sasl computes more mechanisms than IMAP wires up here; the
+    /// ones left out are named rather than silently skipped, so a
+    /// caller learns which of its credentials this crate cannot use.
+    #[error("{} SASL mechanism is not supported by this crate", .0.as_str())]
+    UnsupportedMechanism(SaslMechanism),
     /// The URL carries no host to connect to.
     #[cfg(feature = "url")]
     #[error("IMAP URL `{0}` has no host")]
@@ -359,7 +366,7 @@ impl ImapSessionOpen {
         let ensure_capabilities = true;
 
         let auth = match sasl {
-            Sasl::Anonymous(SaslAnonymous { message }) => {
+            Sasl::Anonymous(SaslAnonymousCreds { message }) => {
                 let opts = ImapAuthAnonymousOptions {
                     initial_request,
                     ensure_capabilities,
@@ -368,7 +375,7 @@ impl ImapSessionOpen {
 
                 Auth::Anonymous(ImapAuthAnonymous::new(message, opts))
             }
-            Sasl::Login(SaslLogin { username, password }) => {
+            Sasl::Login(SaslLoginCreds { username, password }) => {
                 let opts = ImapLoginOptions {
                     ensure_capabilities,
                     auto_id,
@@ -376,7 +383,7 @@ impl ImapSessionOpen {
 
                 Auth::Login(ImapLogin::new(username, password.expose_secret(), opts)?)
             }
-            Sasl::Plain(SaslPlain {
+            Sasl::Plain(SaslPlainCreds {
                 authzid,
                 authcid,
                 passwd,
@@ -394,7 +401,7 @@ impl ImapSessionOpen {
                     opts,
                 ))
             }
-            Sasl::Oauthbearer(SaslOauthbearer {
+            Sasl::Oauthbearer(SaslOauthbearerCreds {
                 username,
                 host,
                 port,
@@ -414,7 +421,7 @@ impl ImapSessionOpen {
                     opts,
                 ))
             }
-            Sasl::Xoauth2(SaslXoauth2 { username, token }) => {
+            Sasl::Xoauth2(SaslXoauth2Creds { username, token }) => {
                 let opts = ImapAuthXoauth2Options {
                     initial_request,
                     ensure_capabilities,
@@ -424,22 +431,22 @@ impl ImapSessionOpen {
                 Auth::Xoauth2(ImapAuthXoauth2::new(username, token.expose_secret(), opts))
             }
             #[cfg(feature = "scram")]
-            Sasl::ScramSha256(SaslScramSha256 { username, password }) => {
+            Sasl::ScramSha256(creds) => {
                 let opts = ImapAuthScramSha256Options {
                     initial_request,
                     ensure_capabilities,
                     auto_id,
                 };
 
-                Auth::ScramSha256(ImapAuthScramSha256::new(
-                    username,
-                    password.expose_secret(),
-                    opts,
-                ))
+                Auth::ScramSha256(ImapAuthScramSha256::new(creds, opts))
             }
-            #[cfg(not(feature = "scram"))]
-            Sasl::ScramSha256(_) => {
-                return Err(ImapSessionOpenError::ScramSha256NotEnabled);
+            // NOTE: RFC 4422 frames any mechanism, but each one still
+            // needs its own coroutine here, and these have none. The arm
+            // also catches whatever io-sasl gains under a feature this
+            // crate does not enable but another crate in the build does.
+            sasl => {
+                let mechanism = sasl.mechanism();
+                return Err(ImapSessionOpenError::UnsupportedMechanism(mechanism));
             }
         };
 
@@ -693,7 +700,7 @@ mod tests {
     #[test]
     fn preauth_greeting_skips_the_sasl_step() {
         let transport = ImapSessionTransport::Unix("/run/sirup.sock".to_string());
-        let sasl = SaslPlain {
+        let sasl = SaslPlainCreds {
             authzid: None,
             authcid: "alice".to_string(),
             passwd: "secret".to_string().into(),

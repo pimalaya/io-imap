@@ -9,8 +9,11 @@
 //! verification of the server signature are the mechanism's, and so is
 //! the refusal of an exchange that ends before that verification ran.
 //!
-//! The client nonce is generated here, since an I/O-free mechanism
-//! cannot produce entropy, and handed over with the credentials.
+//! The client nonce travels with the credentials, an I/O-free coroutine
+//! having no source of randomness; [`ImapClientStd::connect`] draws one
+//! for credentials that carry none.
+//!
+//! [`ImapClientStd::connect`]: crate::client::ImapClientStd::connect
 //!
 //! SCRAM: <https://www.rfc-editor.org/rfc/rfc5802>
 //! SCRAM-SHA-256: <https://www.rfc-editor.org/rfc/rfc7677>
@@ -29,6 +32,8 @@
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc7677::auth_scram_sha_256::{ImapAuthScramSha256, ImapAuthScramSha256Options},
 //! };
+//! use io_sasl::{rfc5801::SaslGs2ChannelBinding, rfc5802::SaslScramCreds};
+//! use secrecy::SecretString;
 //!
 //! // Ready stream needed (TCP-connected, TLS-negotiated)
 //! let mut stream = TcpStream::connect("localhost:143").unwrap();
@@ -36,8 +41,16 @@
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
+//! // NOTE: a real client draws its nonce from a cryptographic source.
+//! let creds = SaslScramCreds {
+//!     username: "alice".into(),
+//!     password: SecretString::from("secret"),
+//!     nonce: b"fyko+d2lbbFgONRv9qkxdawL".to_vec(),
+//!     channel_binding: SaslGs2ChannelBinding::Unsupported,
+//! };
+//!
 //! let opts = ImapAuthScramSha256Options::default();
-//! let mut coroutine = ImapAuthScramSha256::new("alice", "secret", opts);
+//! let mut coroutine = ImapAuthScramSha256::new(creds, opts);
 //! let mut arg = None;
 //!
 //! let capability = loop {
@@ -79,13 +92,10 @@ use imap_codec::{
 };
 use io_sasl::{
     coroutine::*,
-    rfc5801::SaslGs2ChannelBinding,
     rfc5802::{SaslScramCreds, SaslScramError},
     rfc7677::scram_sha_256::SaslScramSha256,
 };
 use log::{debug, trace};
-use rand::{RngExt, distr::Alphanumeric};
-use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
@@ -160,32 +170,27 @@ pub struct ImapAuthScramSha256 {
 }
 
 impl ImapAuthScramSha256 {
-    /// Builds a SASL SCRAM-SHA-256 coroutine authenticating `user` with
-    /// `password`.
+    /// Builds a SASL SCRAM-SHA-256 coroutine from `creds`.
     ///
-    /// The client nonce is generated here and handed to the mechanism,
-    /// which computes everything derived from it. Depending on
-    /// `opts.initial_request`, the client-first-message goes inline
-    /// with the AUTHENTICATE command (SASL-IR) or is uploaded after the
-    /// server challenge.
-    pub fn new(
-        user: impl AsRef<str>,
-        password: impl AsRef<str>,
-        opts: ImapAuthScramSha256Options,
-    ) -> Self {
-        let mechanism = SaslScramSha256::new(SaslScramCreds {
-            username: user.as_ref().to_string(),
-            password: SecretString::from(password.as_ref().to_string()),
-            nonce: generate_nonce(),
-            // NOTE: this crate never asks its TLS session what it
-            // exported, so an exchange it drives is never bound and
-            // always runs under the plain mechanism name.
-            channel_binding: SaslGs2ChannelBinding::Unsupported,
-        });
-
+    /// The credentials carry the client nonce, which must be printable
+    /// ASCII without commas and which RFC 5802 wants drawn from at
+    /// least 18 bytes of cryptographic randomness. It is an input
+    /// rather than something drawn here, an I/O-free coroutine having
+    /// no source of randomness, and it makes the exchange
+    /// deterministically testable.
+    ///
+    /// They also carry the channel binding, which decides whether the
+    /// exchange announces `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`. This
+    /// crate never asks a TLS session what it exported, so a caller
+    /// wanting a bound exchange extracts the material itself.
+    ///
+    /// Depending on `opts.initial_request`, the client-first-message
+    /// goes inline with the AUTHENTICATE command (SASL-IR) or is
+    /// uploaded after the server challenge.
+    pub fn new(creds: SaslScramCreds, opts: ImapAuthScramSha256Options) -> Self {
         Self {
             state: State::Start,
-            mechanism,
+            mechanism: SaslScramSha256::new(creds),
             observed: Vec::new(),
             opts,
         }
@@ -477,10 +482,6 @@ impl fmt::Display for State {
     }
 }
 
-fn generate_nonce() -> Vec<u8> {
-    rand::rng().sample_iter(&Alphanumeric).take(24).collect()
-}
-
 fn extract_challenge(cr: CommandContinuationRequest<'static>) -> Vec<u8> {
     match cr {
         CommandContinuationRequest::Basic(basic) => basic.text().to_string().into_bytes(),
@@ -496,11 +497,24 @@ mod tests {
 
     use base64::{Engine, engine::general_purpose::STANDARD};
     use hmac::{Hmac, KeyInit, Mac};
+    use io_sasl::rfc5801::SaslGs2ChannelBinding;
+    use secrecy::SecretString;
     use sha2::Sha256;
 
     use crate::rfc7677::auth_scram_sha_256::*;
 
     type HmacSha256 = Hmac<Sha256>;
+
+    const NONCE: &[u8] = b"fyko+d2lbbFgONRv9qkxdawL";
+
+    fn creds() -> SaslScramCreds {
+        SaslScramCreds {
+            username: "alice".to_string(),
+            password: SecretString::from("secret"),
+            nonce: NONCE.to_vec(),
+            channel_binding: SaslGs2ChannelBinding::Unsupported,
+        }
+    }
 
     #[test]
     fn ir_success_returns_ok() {
@@ -509,7 +523,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -547,7 +561,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -578,7 +592,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -601,7 +615,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -633,7 +647,7 @@ mod tests {
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options::default();
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);
@@ -679,7 +693,7 @@ mod tests {
     #[test]
     fn non_ir_server_error_returns_mechanism_error() {
         let opts = ImapAuthScramSha256Options::default();
-        let mut auth = ImapAuthScramSha256::new("alice", "secret", opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         let bytes = expect_wants_write(&mut auth, &mut frag, None);

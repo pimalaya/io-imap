@@ -8,7 +8,8 @@
 use std::{env, error::Error};
 
 use io_imap::{client::ImapClientStd, session::ImapSessionOpenOptions};
-use pimalaya_stream::{sasl::Sasl, tls::Tls};
+use io_sasl::mechanism::Sasl;
+use pimalaya_stream::tls::Tls;
 use url::Url;
 
 fn main() -> Result<(), Box<dyn Error>> {

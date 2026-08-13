@@ -54,8 +54,8 @@ use imap_codec::{
         response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
+use io_sasl::mechanism::SaslMechanism;
 use log::trace;
-use pimalaya_stream::sasl::SaslMechanism;
 use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, send::*};

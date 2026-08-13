@@ -31,7 +31,7 @@ use io_imap::{
         response::Capability,
     },
 };
-use pimalaya_stream::sasl::{Sasl, SaslPlain};
+use io_sasl::{mechanism::Sasl, rfc4616::plain::SaslPlainCreds};
 use rustls::{ClientConfig, pki_types::ServerName};
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::{
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sasl = env::var("LOGIN")
         .ok()
         .zip(env::var("PASSWORD").ok())
-        .map(|(authcid, passwd)| SaslPlain {
+        .map(|(authcid, passwd)| SaslPlainCreds {
             authzid: None,
             authcid,
             passwd: passwd.into(),

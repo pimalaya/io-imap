@@ -44,11 +44,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` now wraps io-sasl's SCRAM-SHA-256 mechanism. **Breaking.**
 
-  RFC 5802 leaves this crate entirely: the salted password, the client proof, the parsing of the server messages and the verification of the server signature are the mechanism's. `ImapAuthScramSha256Error` keeps its framing variants and replaces the eleven RFC 5802 ones with a single `Mechanism`. The client nonce is still generated here, `rand` being the only thing an I/O-free mechanism cannot bring, and handed over with the credentials.
+  RFC 5802 leaves this crate entirely: the salted password, the client proof, the parsing of the server messages and the verification of the server signature are the mechanism's. `ImapAuthScramSha256Error` keeps its framing variants and replaces the eleven RFC 5802 ones with a single `Mechanism`.
+
+- `ImapAuthScramSha256::new` takes a single `SaslScramCreds` in place of the user and password pair, and draws no randomness. **Breaking.**
+
+  The credentials carry the client nonce, so the coroutine is free of randomness as well as of I/O, and they carry the channel binding, which decides whether the exchange announces `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`: a caller extracting binding material from its TLS session no longer has it dropped on the floor. `ImapClientStd::connect` draws a nonce for SCRAM credentials that carry none, an empty nonce being no nonce at all as far as RFC 5802 is concerned, so `rand` now lives in the std client rather than in the coroutine core.
 
   **This fixes a defect.** A server ending the exchange with a tagged `OK` in place of its server-final-message was reported as a success, with the server signature never verified, which is mutual authentication skipped by omission. The mechanism now refuses it with `ServerSignatureNotVerified`.
 
 - Moved `hmac`, `pbkdf2` and `sha2` to dev-dependencies, the SCRAM crypto now living in io-sasl. The `scram` cargo feature keeps `rand` and enables `io-sasl/scram`.
+
+- Took the SASL vocabulary from io-sasl: `ImapSessionOpen`, `ImapClientStd::connect` and `rfc3501::capability::available_auth_mechanisms` now speak `io_sasl::mechanism::Sasl` and `io_sasl::mechanism::SaslMechanism` rather than the pimalaya-stream ones. **Breaking.**
+
+  The credential structs gained their `Creds` suffix (`SaslPlainCreds`, `SaslLoginCreds`, ...). io-sasl computes more mechanisms than this crate frames, so `ImapSessionOpenError` gained `UnsupportedMechanism`, naming what it was handed rather than skipping it silently; `ScramSha256NotEnabled` is gone, a build without the `scram` feature having no SCRAM credentials to be handed in the first place.
+
+- Made pimalaya-stream an optional dependency, enabled by the TLS provider features.
+
+  Nothing outside the std client reaches for it now that the SASL vocabulary comes from io-sasl, so the `#![no_std]` claim of the coroutine core is true: it depends on io-sasl and imap-codec, and on nothing else of ours.
 
 - Moved the command methods off `ImapClientStd` and onto the `ImapClient` trait. **Breaking.**
 

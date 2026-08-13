@@ -625,7 +625,7 @@ dependencies = [
 [[package]]
 name = "io-sasl"
 version = "0.1.0"
-source = "git+https://github.com/pimalaya/io-sasl#a2963f184eb0a809d2afd4b45b364598842338bd"
+source = "git+https://github.com/pimalaya/io-sasl#ec6eacff769f17592acc5d7f0d6841617e8a7a39"
 dependencies = [
  "base64 0.23.1",
  "hmac",
@@ -912,9 +912,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pimalaya-stream"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6f95d38d529870b6ef4ca97d17a3abd371505d0e5c4337e97200d00b4c72ce2"
+version = "0.2.0"
+source = "git+https://github.com/pimalaya/stream#e8c95ea9da7ca5d8390c3861271caa8e19934d1c"
 dependencies = [
  "anyhow",
  "io-proxy",

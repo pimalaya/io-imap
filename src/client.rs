@@ -43,19 +43,9 @@ use imap_codec::{
         status::{StatusDataItem, StatusDataItemName},
     },
 };
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-use pimalaya_stream::{sasl::Sasl, std::stream::StreamStd, tls::Tls};
+#[cfg(feature = "scram")]
+use io_sasl::rfc5802::SaslScramCreds;
 use thiserror::Error;
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-use url::Url;
 
 #[cfg(feature = "scram")]
 use crate::rfc7677::auth_scram_sha_256::*;
@@ -78,6 +68,13 @@ use crate::{
     session::*,
     watch::*,
 };
+
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+mod connect;
 
 /// Failure causes returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
@@ -491,13 +488,17 @@ imap_client_commands! {
     }
 
     /// SASL `AUTHENTICATE SCRAM-SHA-256`.
+    ///
+    /// The credentials carry the client nonce, which RFC 5802 wants
+    /// drawn from at least 18 bytes of cryptographic randomness, and the
+    /// channel binding deciding whether the exchange announces
+    /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
     #[cfg(feature = "scram")]
     fn auth_scram_sha256(
-        user: &str,
-        password: &str,
+        creds: SaslScramCreds,
         opts: ImapAuthScramSha256Options,
     ) -> Vec<Capability<'static>> {
-        ImapAuthScramSha256::new(user, password, opts)
+        ImapAuthScramSha256::new(creds, opts)
     }
 
     /// `LOGOUT`; ends the session.
@@ -1125,82 +1126,6 @@ impl Drop for ImapMailboxWatchStream {
     }
 }
 
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-impl ImapClientStd {
-    /// End-to-end connect: TCP/TLS, optional STARTTLS, greeting,
-    /// optional SASL.
-    ///
-    /// `imap://` is plain TCP (143), `imaps://` is implicit TLS (993),
-    /// `unix://` is a local socket. `opts.starttls = true` is only valid
-    /// on a cleartext transport. Pass `None` as `sasl` to skip auth.
-    ///
-    /// Every protocol decision belongs to [`ImapSessionOpen`]; this
-    /// method only answers its transport requests with
-    /// [`StreamStd`]. A caller on another runtime pumps the same
-    /// coroutine with its own sockets.
-    pub fn connect(
-        url: &Url,
-        tls: &Tls,
-        sasl: Option<impl Into<Sasl>>,
-        opts: ImapSessionOpenOptions,
-    ) -> Result<(Self, Vec<Capability<'static>>), ImapClientError> {
-        let transport = ImapSessionTransport::from_url(url)?;
-        let mut session = ImapSessionOpen::new(transport, sasl, opts);
-        let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
-        let mut stream: Option<StreamStd> = None;
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut arg: Option<&[u8]> = None;
-
-        // NOTE: the state machine always asks for a connect before any
-        // read, write or upgrade, so the stream is open by the time
-        // those arrive.
-        let missing = || io::Error::other("IMAP session yielded I/O before connecting");
-
-        loop {
-            match session.resume(&mut fragmentizer, arg.take()) {
-                ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
-                ImapCoroutineState::Complete(Ok(data)) => {
-                    let stream = stream.ok_or_else(missing)?;
-                    let mut client = Self::new(stream);
-                    client.fragmentizer = fragmentizer;
-                    client.pre_authenticated = data.pre_authenticated;
-                    return Ok((client, data.capability));
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTcpConnect {
-                    host,
-                    port,
-                }) => {
-                    stream = Some(StreamStd::connect_tcp(host, port)?);
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsConnect {
-                    host,
-                    port,
-                }) => {
-                    stream = Some(StreamStd::connect_tls(host, port, tls)?);
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsUnixConnect(path)) => {
-                    stream = Some(StreamStd::connect_unix(path)?);
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsUpgrade) => {
-                    let plain = stream.take().ok_or_else(missing)?;
-                    stream = Some(plain.upgrade_tls(tls)?);
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
-                    let n = stream.as_mut().ok_or_else(missing)?.read(&mut buf)?;
-                    arg = Some(&buf[..n]);
-                }
-                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => {
-                    stream.as_mut().ok_or_else(missing)?.write_all(&bytes)?;
-                }
-            }
-        }
-    }
-}
-
 /// Blocking stream the client runs over.
 ///
 /// Implemented for the standard [`StreamStd`]; a custom transport (such
@@ -1215,22 +1140,4 @@ pub trait ImapStream: Read + Write + Send + Any {
     /// periodic shutdown-poll wakeup. A transport that cannot honor it
     /// returns `Ok(())` and manages its own read semantics.
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-}
-
-// NOTE: StreamStd only exists once pimalaya-stream has a TLS backend, so
-// the light client (`client` alone, caller-provided transport) must build
-// without this impl.
-#[cfg(any(
-    feature = "rustls-aws",
-    feature = "rustls-ring",
-    feature = "native-tls"
-))]
-impl ImapStream for StreamStd {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        StreamStd::set_read_timeout(self, timeout)
-    }
 }

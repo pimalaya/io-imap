@@ -40,7 +40,7 @@ use io_imap::{
     types::{mailbox::Mailbox, response::Capability},
     watch::*,
 };
-use pimalaya_stream::sasl::{Sasl, SaslPlain};
+use io_sasl::{mechanism::Sasl, rfc4616::plain::SaslPlainCreds};
 use rustls::{ClientConfig, pki_types::ServerName};
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::{
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .install_default()
         .ok();
 
-    let sasl = SaslPlain {
+    let sasl = SaslPlainCreds {
         authzid: None,
         authcid: env::var("LOGIN")?,
         passwd: env::var("PASSWORD")?.into(),
