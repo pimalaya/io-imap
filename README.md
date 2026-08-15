@@ -1,4 +1,4 @@
-# I/O IMAP [![Documentation](https://img.shields.io/docsrs/io-imap?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-imap/latest/io_imap) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
+# I/O IMAP [![Documentation](https://img.shields.io/docsrs/io-imap?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-imap/latest/io_imap) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya) [![Sponsor](https://img.shields.io/badge/sponsor-pink?style=flat&logo=github-sponsors&logoColor=white)](https://pimalaya.org/sponsor/)
 
 IMAP client library for Rust
 
@@ -30,7 +30,7 @@ This library is composed of 3 feature-gated layers:
 - **Streaming upload and download**: message bodies flow straight between the socket and your storage, never held in memory whole.
 - **SASL authentication**: ANONYMOUS, LOGIN, PLAIN, XOAUTH2, OAUTHBEARER and SCRAM-SHA-256 mechanisms, with optional client identification for providers requiring it.
 - **Light client**: a standard, blocking client exposing one method per IMAP command over a stream you opened yourself.
-- Full standard, blocking client with **TLS** support:
+- **Full client** with **TLS** support:
   - [Rustls](https://crates.io/crates/rustls) with ring crypto (requires `rustls-ring` feature, enabled by default)
   - [Rustls](https://crates.io/crates/rustls) with aws crypto (requires `rustls-aws` feature)
   - [Native TLS](https://crates.io/crates/native-tls) (requires `native-tls` feature)
@@ -70,11 +70,11 @@ This library is composed of 3 feature-gated layers:
 
 ## Usage
 
-The whole API is documented on [docs.rs](https://docs.rs/io-imap/latest/io_imap), including runnable snippets for every coroutine and client.
+See documentation at [docs.rs](https://docs.rs/io-imap/latest/io_imap).
 
 ## Examples
 
-Complete runnable programs live in [./examples](./examples); the tests also demonstrate real usage.
+See complete examples at [./examples](./examples).
 
 Have also a look at real-world projects built on top of this library:
 
@@ -108,7 +108,7 @@ Special thanks to the [NLnet foundation](https://nlnet.nl/) and the [European Co
 - 2024 → 2026: [NGI Zero Core](https://nlnet.nl/project/Pimalaya-PIM/)
 - 2026 → 2027: [NGI Zero Commons Fund](https://nlnet.nl/project/Pimalaya-pimdir/)
 
-If you appreciate the project, feel free to donate using one of the following providers:
+This program is part of Pimalaya, free software funded entirely by grants and donations. If you find it useful, consider [sponsoring](https://pimalaya.org/sponsor/) its development:
 
 [![GitHub](https://img.shields.io/badge/-GitHub%20Sponsors-fafbfc?logo=GitHub%20Sponsors)](https://github.com/sponsors/soywod)
 [![Ko-fi](https://img.shields.io/badge/-Ko--fi-ff5e5a?logo=Ko-fi&logoColor=ffffff)](https://ko-fi.com/soywod)

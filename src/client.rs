@@ -783,12 +783,7 @@ impl ImapClient for ImapClientStd {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                    let n = self.stream.read(&mut buf)?;
-                    if n == 0 {
-                        let kind = io::ErrorKind::UnexpectedEof;
-                        let err = io::Error::new(kind, "IMAP server closed the connection");
-                        return Err(err.into());
-                    }
+                    let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
@@ -812,6 +807,24 @@ impl ImapClientStd {
         }
     }
 
+    /// Reads the next bytes of a server response, a closed connection
+    /// being an `UnexpectedEof` failure rather than an empty read.
+    ///
+    /// Mid-response is the wrong place for the peer to hang up: the
+    /// coroutine waiting on those bytes would otherwise be resumed with
+    /// an empty slice forever. Not-ready failures never reach here, the
+    /// stream retrying them under its own strategy.
+    fn read_response(&mut self, buf: &mut [u8]) -> Result<usize, ImapClientError> {
+        match self.stream.read(buf)? {
+            0 => {
+                let kind = io::ErrorKind::UnexpectedEof;
+                let err = io::Error::new(kind, "IMAP server closed the connection");
+                Err(err.into())
+            }
+            n => Ok(n),
+        }
+    }
+
     /// Useful after a STARTTLS upgrade or on reconnection.
     pub fn set_stream<S: ImapStream + 'static>(&mut self, stream: S) {
         self.stream = Box::new(stream);
@@ -832,6 +845,7 @@ impl ImapClientStd {
         let mut stream = self.stream;
 
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.stop_retrying();
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientError>>(256);
         let shutdown_handle = shutdown.clone();
@@ -857,10 +871,13 @@ impl ImapClientStd {
                                 return;
                             }
                             Ok(n) => arg = Some(buf[..n].to_vec()),
-                            // SO_RCVTIMEO wakeup: WouldBlock on Unix,
-                            // TimedOut on Windows. Not a failure; re-check
-                            // shutdown and otherwise resume so the coroutine
-                            // can observe the flag and issue IDLE DONE.
+                            // NOTE: the SO_RCVTIMEO wakeup this loop arms
+                            // on purpose, which is why retries were turned
+                            // off above: here a not-ready stream is not a
+                            // failure but the periodic chance to re-check
+                            // shutdown and otherwise resume, so the
+                            // coroutine can observe the flag and issue
+                            // IDLE DONE.
                             Err(err)
                                 if matches!(
                                     err.kind(),
@@ -921,7 +938,7 @@ impl ImapClientStd {
                 ImapCoroutineState::Complete(Ok(())) => return Ok(()),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
-                    let n = self.stream.read(&mut buf)?;
+                    let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(bytes)) => {
@@ -979,7 +996,7 @@ impl ImapClientStd {
                 ImapCoroutineState::Complete(Ok(())) => return Ok(()),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsRead) => {
-                    let n = self.stream.read(&mut buf)?;
+                    let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsWrite(
@@ -1049,7 +1066,7 @@ impl ImapClientStd {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
-                    let n = self.stream.read(&mut buf)?;
+                    let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
@@ -1128,7 +1145,7 @@ impl Drop for ImapMailboxWatchStream {
 
 /// Blocking stream the client runs over.
 ///
-/// Implemented for the standard [`StreamStd`]; a custom transport (such
+/// Implemented for the standard pimalaya-stream transport; a custom one (such
 /// as a JNI upcall bridge) implements it directly. `as_any_mut`
 /// supports downcasting back to the concrete stream when a caller needs
 /// a type-specific handle (e.g. sirup's socket proxy).
@@ -1140,4 +1157,14 @@ pub trait ImapStream: Read + Write + Send + Any {
     /// periodic shutdown-poll wakeup. A transport that cannot honor it
     /// returns `Ok(())` and manages its own read semantics.
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Hands the failures that only mean "not ready yet" back to the
+    /// caller instead of retrying them, for good.
+    ///
+    /// The mailbox watch worker is what needs it: it arms a read
+    /// timeout precisely to be woken up, and a stream retrying the
+    /// wakeup away would leave the shutdown flag unchecked until the
+    /// server speaks. A transport that never retries has nothing to
+    /// turn off.
+    fn stop_retrying(&mut self) {}
 }

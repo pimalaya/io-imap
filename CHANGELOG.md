@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-15
+
 ### Added
 
 - Added the `session` module, holding `ImapSessionOpen`: a composite coroutine covering everything between an address and an authenticated session, with transport-shaped yields (`WantsTcpConnect`, `WantsTlsConnect`, `WantsUnixConnect`, `WantsTlsUpgrade`) alongside the usual reads and writes.
@@ -21,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Forces the RFC 4959 SASL-IR initial response on or off for every SASL mechanism: `Some(true)` always inlines it with `AUTHENTICATE`, `Some(false)` waits for the server's continuation request, and `None` follows the advertised `SASL-IR` capability. Coremail (126.com, 163.com) advertises `SASL-IR` yet answers the inline form with a tagged `BAD`, which no capability inspection can predict.
 
 - Added the `url` cargo feature, gating `session::ImapSessionTransport::from_url`. The three TLS features enable it. A consumer that brings its own TLS can parse IMAP URLs without pulling in the std client.
+
+- Added `client::ImapStream::stop_retrying`, telling a transport to hand back the failures that only mean "not ready yet" instead of retrying them.
+
+  The mailbox watch worker is what needs it: it arms a read timeout precisely to be woken up, and pimalaya-stream now retries such a wakeup away by default, which would leave the shutdown flag unchecked until the server next spoke. The method is provided and empty, so a transport that never retries inherits it and a custom one overrides it.
 
 ### Changed
 
@@ -72,13 +78,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Replaced the trailing `ImapClientStd::connect` parameters with `session::ImapSessionOpenOptions`. **Breaking.**
 
-  `connect(url, tls, starttls, sasl, auto_id)` becomes `connect(url, tls, sasl, opts)`, where `opts` carries `starttls`, `auto_id` and the new `sasl_ir`. The method is now a pump over `ImapSessionOpen` that answers its transport yields with `StreamStd`, and holds no protocol decision of its own. `ImapSessionOpenOptions::default()` reproduces the previous behaviour.
+  `connect(url, tls, starttls, sasl, auto_id)` becomes `connect(url, tls, sasl, opts)`, where `opts` carries `starttls`, `auto_id` and the new `sasl_ir`. The method is now a pump over `ImapSessionOpen` that answers its transport yields with a pimalaya-stream `Stream`, and holds no protocol decision of its own. `ImapSessionOpenOptions::default()` reproduces the previous behaviour.
+
+- The std client runs on pimalaya-stream 0.3, and `client::ImapStream` is implemented for its renamed `stream::Stream`. **Breaking.**
+
+  The transport crate renamed `StreamStd` to `stream::Stream` and moved its constructors onto per-transport options structs, which is what this crate now calls. It also arms a socket read deadline of its own at connect time, one minute by default, so a server going silent on a healthy connection ends the exchange instead of blocking forever.
 
 - `ImapClient::greeting` returns the whole `ImapGreetingOk` rather than just its capability list. **Breaking.** Callers append `.capability`. The greeting also reports `pre_authenticated`, which the old signature discarded.
 
 - Moved `default_alpn` and `default_port` into the `session` module, next to the scheme table they belong to, and re-exported them from `client` so existing call sites keep working. They no longer require the `client` feature.
 
+- Raised the minimum supported Rust version from 1.87 to 1.88, following pimalaya-stream.
+
 ### Fixed
+
+- A stream reporting it is not ready no longer kills the exchange. **Behaviour change.**
+
+  `EAGAIN` is not supposed to reach a blocking socket, yet macOS callers saw one surface mid-exchange and end the command with a bare `Resource temporarily unavailable (os error 35)`, the more readily the longer the exchange ran: on a slow `AUTHENTICATE` against a 260k-message Gmail mailbox, or midway through the chunked `FETCH` a `SORT` fallback runs (himalaya#731, himalaya#732). The fix landed in pimalaya-stream, whose `Read` and `Write` now retry such a failure for a minute before giving up, so every protocol crate inherits it rather than each carrying its own loop. This crate only says where the policy does not apply: the mailbox watch worker turns retries off, its read-timeout wakeup being a shutdown poll rather than a failure.
+
+- A connection closed mid-response during the handshake or a streamed `FETCH` or `APPEND` now fails with `UnexpectedEof` instead of spinning. Only `ImapClient::run` checked for the empty read; the other loops resumed their coroutine with an empty slice, which asked for another read, forever.
 
 - `ImapSessionOpen` refuses the TLS upgrade when the server appends bytes to its `STARTTLS` tagged response, instead of discarding them. **Behaviour change.**
 
@@ -285,7 +303,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Compiles the underlying TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.4.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.5.0..HEAD
+[0.5.0]: https://github.com/pimalaya/io-imap/compare/v0.4.0..v0.5.0
 [0.4.0]: https://github.com/pimalaya/io-imap/compare/v0.3.1..v0.4.0
 [0.3.1]: https://github.com/pimalaya/io-imap/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/pimalaya/io-imap/compare/v0.2.0..v0.3.0

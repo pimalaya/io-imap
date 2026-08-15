@@ -29,7 +29,10 @@ use io_imap::{
         sequence::{SeqOrUid, SequenceSet},
     },
 };
-use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
+use pimalaya_stream::{
+    stream::{Stream, TcpConnectOptions, TlsConnectOptions},
+    tls::Tls,
+};
 
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
@@ -46,14 +49,19 @@ const SUBJECT: &[u8] = b"io-imap integration test";
 /// ```
 pub fn run_imaps(host: &str, port: u16, username: &str, password: &str) {
     let _ = env_logger::try_init();
-    let stream = StreamStd::connect_tls(host, port, &Tls::default()).expect("TLS connect");
+    let opts = TlsConnectOptions {
+        tls: Tls::default(),
+        ..Default::default()
+    };
+    let stream = Stream::connect_tls(host, port, opts).expect("TLS connect");
     run(stream, username, password)
 }
 
 /// Plain-TCP variant of [`run_imaps`]. Same coroutine flow, no TLS.
 pub fn run_imap(host: &str, port: u16, username: &str, password: &str) {
     let _ = env_logger::try_init();
-    let stream = StreamStd::connect_tcp(host, port).expect("TCP connect");
+    let opts = TcpConnectOptions::default();
+    let stream = Stream::connect_tcp(host, port, opts).expect("TCP connect");
     run(stream, username, password)
 }
 

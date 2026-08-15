@@ -17,7 +17,11 @@ use imap_codec::{fragmentizer::Fragmentizer, imap_types::response::Capability};
 use io_sasl::mechanism::Sasl;
 #[cfg(feature = "scram")]
 use io_sasl::rfc5802::SaslScramCreds;
-use pimalaya_stream::{std::stream::StreamStd, tls::Tls};
+use pimalaya_stream::{
+    retry::Retry,
+    stream::{Stream, TcpConnectOptions, TlsConnectOptions, UnixConnectOptions},
+    tls::Tls,
+};
 #[cfg(feature = "scram")]
 use rand::{RngExt, distr::Alphanumeric};
 use url::Url;
@@ -30,13 +34,17 @@ use crate::{
     session::*,
 };
 
-impl ImapStream for StreamStd {
+impl ImapStream for Stream {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        StreamStd::set_read_timeout(self, timeout)
+        Stream::set_read_timeout(self, timeout)
+    }
+
+    fn stop_retrying(&mut self) {
+        self.retry = Retry::Never;
     }
 }
 
@@ -53,9 +61,9 @@ impl ImapClientStd {
     /// concerned; a caller wanting its own passes it in the credentials.
     ///
     /// Every protocol decision belongs to [`ImapSessionOpen`]; this
-    /// method only answers its transport requests with
-    /// [`StreamStd`]. A caller on another runtime pumps the same
-    /// coroutine with its own sockets.
+    /// method only answers its transport requests with [`Stream`]. A
+    /// caller on another runtime pumps the same coroutine with its own
+    /// sockets.
     pub fn connect(
         url: &Url,
         tls: &Tls,
@@ -66,7 +74,7 @@ impl ImapClientStd {
         let sasl = sasl.map(Into::into).map(with_client_nonce);
         let mut session = ImapSessionOpen::new(transport, sasl, opts);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
-        let mut stream: Option<StreamStd> = None;
+        let mut stream: Option<Stream> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
 
@@ -89,27 +97,44 @@ impl ImapClientStd {
                     host,
                     port,
                 }) => {
-                    stream = Some(StreamStd::connect_tcp(host, port)?);
+                    let opts = TcpConnectOptions::default();
+                    stream = Some(Stream::connect_tcp(host, port, opts)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsConnect {
                     host,
                     port,
                 }) => {
-                    stream = Some(StreamStd::connect_tls(host, port, tls)?);
+                    let opts = TlsConnectOptions {
+                        tls: tls.clone(),
+                        ..Default::default()
+                    };
+
+                    stream = Some(Stream::connect_tls(host, port, opts)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsUnixConnect(path)) => {
-                    stream = Some(StreamStd::connect_unix(path)?);
+                    let opts = UnixConnectOptions::default();
+                    stream = Some(Stream::connect_unix(path, opts)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsUpgrade) => {
                     let plain = stream.take().ok_or_else(missing)?;
                     stream = Some(plain.upgrade_tls(tls)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
-                    let n = stream.as_mut().ok_or_else(missing)?.read(&mut buf)?;
+                    let stream = stream.as_mut().ok_or_else(missing)?;
+                    let n = match stream.read(&mut buf)? {
+                        0 => {
+                            let kind = io::ErrorKind::UnexpectedEof;
+                            let err = "IMAP server closed the connection";
+                            return Err(io::Error::new(kind, err).into());
+                        }
+                        n => n,
+                    };
+
                     arg = Some(&buf[..n]);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => {
-                    stream.as_mut().ok_or_else(missing)?.write_all(&bytes)?;
+                    let stream = stream.as_mut().ok_or_else(missing)?;
+                    stream.write_all(&bytes)?;
                 }
             }
         }
