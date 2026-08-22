@@ -833,14 +833,15 @@ impl ImapClientStd {
     /// Consumes the client into a background watcher.
     ///
     /// Drop the returned stream (or call its `close`) to wind down.
-    /// Errors when `capability` lacks QRESYNC.
+    /// `capability` selects the QRESYNC path or the whole-mailbox
+    /// fallback.
     pub fn watch_mailbox(
         self,
         mailbox: Mailbox<'static>,
         capability: &[Capability<'static>],
     ) -> Result<ImapMailboxWatchStream, ImapClientError> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone())?;
+        let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone());
         let mut fragmentizer = self.fragmentizer;
         let mut stream = self.stream;
 

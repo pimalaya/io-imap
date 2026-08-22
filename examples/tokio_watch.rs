@@ -188,7 +188,7 @@ impl TokioSession {
         // watcher leave IDLE with a DONE and return once the server has
         // acknowledged, which is what leaves the connection reusable.
         let flag = Arc::new(AtomicBool::new(false));
-        let mut watcher = ImapMailboxWatch::new(&self.capability, mailbox, flag.clone())?;
+        let mut watcher = ImapMailboxWatch::new(&self.capability, mailbox, flag.clone());
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<Vec<u8>> = None;
 

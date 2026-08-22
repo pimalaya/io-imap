@@ -102,8 +102,11 @@
 //! [`watch`] provides `ImapMailboxWatch`, a composite coroutine
 //! chaining ENABLE QRESYNC, SELECT (CONDSTORE), a FETCH baseline seed,
 //! then an IDLE wake-loop with SELECT (QRESYNC) delta pulls, emitting
-//! UID-keyed added/changed/removed events. The connection is dedicated;
-//! a shared `AtomicBool` winds it down cleanly.
+//! UID-keyed added/changed/removed events. Against a server without
+//! QRESYNC it re-reads the whole mailbox on each wake and diffs the
+//! same baseline locally, so the events are the same and only the cost
+//! differs. The connection is dedicated; a shared `AtomicBool` winds it
+//! down cleanly.
 //!
 //! ## The clients
 //!

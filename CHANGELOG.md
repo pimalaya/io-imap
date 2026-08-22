@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `watch::ImapMailboxWatch` no longer requires QRESYNC. **Breaking.**
+
+  The capability list now selects a path instead of gating the watch: with QRESYNC nothing changes, and without it the watcher opens a plain EXAMINE, seeds the same `FETCH 1:* (UID FLAGS)` baseline, and re-reads the whole mailbox on every IDLE wake, diffing it against that baseline to emit the same UID-keyed events. A server that cannot report what changed is answered by asking it everything, the way `SORT` already falls back to `SEARCH` plus a local sort. The events are identical; the cost scales with the mailbox rather than with the change.
+
+  `ImapMailboxWatch::new` returns `Self` rather than `Result<Self, _>`, and `ImapMailboxWatchError::QresyncUnsupported` is gone, since nothing rejects a server any more.
+
+### Fixed
+
+- The mailbox watch now ends with the new `ImapMailboxWatchError::UidValidityChanged` when the watched mailbox is recreated under the same name, instead of emitting deltas keyed on UIDs that mean something else. Both paths re-EXAMINE before resyncing, so the check runs on every wake.
+
 ## [0.5.0] - 2026-08-15
 
 ### Added

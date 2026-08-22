@@ -1,5 +1,6 @@
 //! IMAP single-mailbox watcher: IDLE (RFC 2177) for the wake signal,
-//! EXAMINE (QRESYNC) (RFC 7162) for UID-keyed deltas.
+//! EXAMINE (QRESYNC) (RFC 7162) for UID-keyed deltas, with a client-side
+//! fallback for servers that do not advertise QRESYNC.
 //!
 //! The mailbox is opened with EXAMINE, not SELECT, so the session is
 //! **read-only**: the watcher never writes (no flag changes, no expunge),
@@ -11,6 +12,20 @@
 //! EXAMINE (CONDSTORE) → FETCH 1:* (UID FLAGS) [seed shadow]
 //!     → IDLE → EXAMINE (QRESYNC) → emit deltas → IDLE → ...
 //! ```
+//!
+//! Without QRESYNC the server cannot report what changed, so each wake
+//! re-reads the whole mailbox and the deltas are diffed locally against
+//! the same shadow. The emitted events are identical; only the cost
+//! differs, and it scales with the mailbox rather than with the change.
+//!
+//! ```text
+//! EXAMINE → FETCH 1:* (UID FLAGS) [seed shadow]
+//!     → IDLE → EXAMINE → FETCH 1:* (UID FLAGS) → diff → emit deltas → IDLE → ...
+//! ```
+//!
+//! Both paths re-EXAMINE before resyncing, so a UIDVALIDITY change ends
+//! the watch rather than keying deltas on UIDs that now mean something
+//! else. The caller reconnects and rebaselines.
 //!
 //! Connection is dedicated. Flip the shared [`AtomicBool`] to wind
 //! down cleanly.
@@ -38,11 +53,12 @@
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut buf = [0u8; 4096];
 //!
+//! // The server's advertised capabilities select the path: QRESYNC
+//! // here, the whole-mailbox fallback when it is absent.
 //! let capability = [Capability::QResync];
 //! let mailbox = "INBOX".try_into().unwrap();
 //! let shutdown = Arc::new(AtomicBool::new(false));
-//! let mut coroutine =
-//!     ImapMailboxWatch::new(&capability, mailbox, shutdown.clone()).unwrap();
+//! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone());
 //! let mut arg = None;
 //!
 //! loop {
@@ -141,17 +157,23 @@ pub enum ImapMailboxWatchEvent {
 /// Failure causes during the mailbox watch flow.
 #[derive(Debug, Error)]
 pub enum ImapMailboxWatchError {
-    /// The capability list given to `new` lacks QRESYNC.
-    #[error("IMAP server does not advertise QRESYNC")]
-    QresyncUnsupported,
     /// The EXAMINE response carried no UIDVALIDITY, so deltas cannot be
     /// keyed safely.
     #[error("IMAP server did not return UIDVALIDITY in EXAMINE response")]
     MissingUidValidity,
     /// The EXAMINE response carried no HIGHESTMODSEQ, so there is no
-    /// resync point.
+    /// QRESYNC resync point.
     #[error("IMAP server did not return HIGHESTMODSEQ in EXAMINE response")]
     MissingHighestModSeq,
+    /// The mailbox was recreated under the same name, so every known UID
+    /// now means something else and the watch cannot continue.
+    #[error("IMAP mailbox UIDVALIDITY changed from {known} to {seen}")]
+    UidValidityChanged {
+        /// The UIDVALIDITY the shadow was keyed on.
+        known: NonZeroU32,
+        /// The UIDVALIDITY the server reports now.
+        seen: NonZeroU32,
+    },
     /// The baseline `1:*` sequence set failed to parse.
     #[error("Invalid `1:*` sequence set: {0}")]
     InvalidSequenceSet(String),
@@ -187,13 +209,16 @@ enum State {
     BeginIdle,
     Idle(ImapIdle),
     ExamineQresync(ImapMailboxExamine),
+    ExamineResync(ImapMailboxExamine),
+    FetchResync(ImapMessageFetch),
     EmitDeltas,
     Terminal,
 }
 
-/// I/O-free IDLE+QRESYNC mailbox watcher.
+/// I/O-free IDLE mailbox watcher, QRESYNC-driven or whole-mailbox.
 pub struct ImapMailboxWatch {
     state: State,
+    qresync: bool,
     shutdown: Arc<AtomicBool>,
     idle_done: Arc<AtomicBool>,
     idle_saw_data: bool,
@@ -205,29 +230,40 @@ pub struct ImapMailboxWatch {
 }
 
 impl ImapMailboxWatch {
-    /// Errors with `QresyncUnsupported` when `capability` lacks QRESYNC.
+    /// Builds a watcher for `mailbox`, picking its path from
+    /// `capability`: QRESYNC when the server advertises it, the
+    /// whole-mailbox fallback otherwise.
     pub fn new(
         capability: &[Capability<'static>],
         mailbox: Mailbox<'static>,
         shutdown: Arc<AtomicBool>,
-    ) -> Result<Self, ImapMailboxWatchError> {
-        if !capability.contains(&Capability::QResync) {
-            return Err(ImapMailboxWatchError::QresyncUnsupported);
-        }
+    ) -> Self {
+        let qresync = capability.contains(&Capability::QResync);
 
-        // NOTE: RFC 7162 §3.1: QRESYNC implies CONDSTORE, but pass
-        // both since some servers only echo CONDSTORE in ENABLED.
-        let condstore = CapabilityEnable::CondStore;
-        // NOTE: QRESYNC is not in the typed enum, route via Atom.
-        let qresync = CapabilityEnable::from(
-            Atom::try_from("QRESYNC").expect("`QRESYNC` is a syntactically valid IMAP atom"),
-        );
-        let capabilities =
-            Vec1::try_from(vec![condstore, qresync]).expect("two capabilities is non-empty");
-        let enable = ImapExtensionEnable::new(capabilities);
+        let state = if qresync {
+            // NOTE: RFC 7162 §3.1: QRESYNC implies CONDSTORE, but pass
+            // both since some servers only echo CONDSTORE in ENABLED.
+            let condstore = CapabilityEnable::CondStore;
+            // NOTE: QRESYNC is not in the typed enum, route via Atom.
+            let qresync = CapabilityEnable::from(
+                Atom::try_from("QRESYNC").expect("`QRESYNC` is a syntactically valid IMAP atom"),
+            );
+            let capabilities =
+                Vec1::try_from(vec![condstore, qresync]).expect("two capabilities is non-empty");
 
-        Ok(Self {
-            state: State::EnableQresync(enable),
+            State::EnableQresync(ImapExtensionEnable::new(capabilities))
+        } else {
+            debug!("qresync unsupported, watching the whole mailbox");
+
+            State::ExamineInitial(ImapMailboxExamine::new(
+                mailbox.clone(),
+                ImapMailboxExamineOptions::default(),
+            ))
+        };
+
+        Self {
+            state,
+            qresync,
             shutdown,
             idle_done: Arc::new(AtomicBool::new(false)),
             idle_saw_data: false,
@@ -236,7 +272,88 @@ impl ImapMailboxWatch {
             highest_mod_seq: 0,
             shadow: BTreeMap::new(),
             pending: VecDeque::new(),
-        })
+        }
+    }
+
+    /// Refuses a resync keyed on UIDs the server no longer means.
+    fn check_uid_validity(
+        &self,
+        data: &ImapMailboxSelectData,
+    ) -> Result<(), ImapMailboxWatchError> {
+        let (Some(known), Some(seen)) = (self.uid_validity, data.uid_validity) else {
+            return Ok(());
+        };
+
+        if known != seen {
+            return Err(ImapMailboxWatchError::UidValidityChanged { known, seen });
+        }
+
+        Ok(())
+    }
+
+    /// Queues the flag events between two states of one message, and
+    /// nothing when they agree.
+    fn push_flag_deltas(
+        &mut self,
+        uid: NonZeroU32,
+        old_flags: &[Flag<'static>],
+        new_flags: &[Flag<'static>],
+    ) {
+        let added: Vec<Flag<'static>> = new_flags
+            .iter()
+            .filter(|f| !old_flags.contains(f))
+            .cloned()
+            .collect();
+        let removed: Vec<Flag<'static>> = old_flags
+            .iter()
+            .filter(|f| !new_flags.contains(f))
+            .cloned()
+            .collect();
+
+        if !added.is_empty() {
+            self.pending
+                .push_back(ImapMailboxWatchEvent::FlagsAdded { uid, flags: added });
+        }
+
+        if !removed.is_empty() {
+            self.pending.push_back(ImapMailboxWatchEvent::FlagsRemoved {
+                uid,
+                flags: removed,
+            });
+        }
+    }
+
+    /// Diffs a whole-mailbox snapshot against the shadow, the fallback
+    /// counterpart of [`Self::compute_deltas`]: absence is what reports
+    /// a vanished message, since no untagged VANISHED arrives.
+    fn compute_snapshot_deltas(
+        &mut self,
+        snapshot: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>>,
+    ) {
+        let vanished: Vec<NonZeroU32> = self
+            .shadow
+            .keys()
+            .filter(|uid| !snapshot.contains_key(uid))
+            .copied()
+            .collect();
+
+        for uid in vanished {
+            self.shadow.remove(&uid);
+            self.pending
+                .push_back(ImapMailboxWatchEvent::EnvelopeRemoved { uid });
+        }
+
+        for (uid, items) in snapshot {
+            let (_uid, new_flags) = extract_uid_flags(&items);
+
+            match self.shadow.insert(uid, new_flags.clone()) {
+                None => {
+                    self.pending
+                        .push_back(ImapMailboxWatchEvent::EnvelopeAdded { uid, items });
+                }
+                Some(old_flags) => self.push_flag_deltas(uid, &old_flags, &new_flags),
+            }
+        }
     }
 
     fn compute_deltas(&mut self, data: &ImapMailboxSelectData) {
@@ -255,41 +372,36 @@ impl ImapMailboxWatch {
                 continue;
             };
 
-            match self.shadow.get(&uid).cloned() {
+            match self.shadow.insert(uid, new_flags.clone()) {
                 None => {
-                    self.shadow.insert(uid, new_flags);
                     self.pending
                         .push_back(ImapMailboxWatchEvent::EnvelopeAdded {
                             uid,
                             items: items_vec,
                         });
                 }
-                Some(old_flags) => {
-                    let added: Vec<Flag<'static>> = new_flags
-                        .iter()
-                        .filter(|f| !old_flags.contains(f))
-                        .cloned()
-                        .collect();
-                    let removed: Vec<Flag<'static>> = old_flags
-                        .iter()
-                        .filter(|f| !new_flags.contains(f))
-                        .cloned()
-                        .collect();
-                    self.shadow.insert(uid, new_flags);
-                    if !added.is_empty() {
-                        self.pending
-                            .push_back(ImapMailboxWatchEvent::FlagsAdded { uid, flags: added });
-                    }
-                    if !removed.is_empty() {
-                        self.pending.push_back(ImapMailboxWatchEvent::FlagsRemoved {
-                            uid,
-                            flags: removed,
-                        });
-                    }
-                }
+                Some(old_flags) => self.push_flag_deltas(uid, &old_flags, &new_flags),
             }
         }
     }
+}
+
+/// Builds the `FETCH 1:* (UID FLAGS)` that seeds the shadow and, on the
+/// fallback path, re-reads it on every wake.
+fn fetch_uid_flags() -> Result<ImapMessageFetch, ImapMailboxWatchError> {
+    let sequence_set: SequenceSet = "1:*"
+        .try_into()
+        .map_err(|_| ImapMailboxWatchError::InvalidSequenceSet("1:*".into()))?;
+    let item_names = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+        MessageDataItemName::Uid,
+        MessageDataItemName::Flags,
+    ]);
+
+    Ok(ImapMessageFetch::new(
+        sequence_set,
+        item_names,
+        ImapMessageFetchOptions::default(),
+    ))
 }
 
 impl ImapCoroutine for ImapMailboxWatch {
@@ -353,36 +465,28 @@ impl ImapCoroutine for ImapMailboxWatch {
                                     ImapMailboxWatchError::MissingUidValidity,
                                 ));
                             };
-                            let Some(highest_mod_seq) = data.highest_mod_seq else {
-                                return ImapCoroutineState::Complete(Err(
-                                    ImapMailboxWatchError::MissingHighestModSeq,
-                                ));
-                            };
 
                             self.uid_validity = Some(uid_validity);
-                            self.highest_mod_seq = highest_mod_seq;
-                            debug!("examined mailbox with condstore");
                             trace!("uid_validity: {uid_validity}");
-                            trace!("highest_mod_seq: {highest_mod_seq}");
 
-                            let sequence_set: SequenceSet = match "1:*".try_into() {
-                                Ok(s) => s,
-                                Err(_) => {
+                            if self.qresync {
+                                let Some(highest_mod_seq) = data.highest_mod_seq else {
                                     return ImapCoroutineState::Complete(Err(
-                                        ImapMailboxWatchError::InvalidSequenceSet("1:*".into()),
+                                        ImapMailboxWatchError::MissingHighestModSeq,
                                     ));
-                                }
+                                };
+
+                                self.highest_mod_seq = highest_mod_seq;
+                                debug!("examined mailbox with condstore");
+                                trace!("highest_mod_seq: {highest_mod_seq}");
+                            } else {
+                                debug!("examined mailbox");
+                            }
+
+                            let fetch = match fetch_uid_flags() {
+                                Ok(fetch) => fetch,
+                                Err(err) => return ImapCoroutineState::Complete(Err(err)),
                             };
-                            let item_names =
-                                MacroOrMessageDataItemNames::MessageDataItemNames(vec![
-                                    MessageDataItemName::Uid,
-                                    MessageDataItemName::Flags,
-                                ]);
-                            let fetch = ImapMessageFetch::new(
-                                sequence_set,
-                                item_names,
-                                ImapMessageFetchOptions::default(),
-                            );
                             self.state = State::FetchBaseline(fetch);
                         }
                         ImapCoroutineState::Complete(Err(err)) => {
@@ -452,21 +556,29 @@ impl ImapCoroutine for ImapMailboxWatch {
                         }
 
                         if self.idle_saw_data {
-                            // NOTE: uid_validity is set by ExamineInitial.
-                            let uid_validity = self.uid_validity.unwrap();
-                            let modseq = NonZeroU64::new(self.highest_mod_seq)
-                                .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
-                            let parameters = vec![SelectParameter::QResync {
-                                uid_validity,
-                                mod_sequence_value: modseq,
-                                known_uids: None,
-                                seq_match_data: None,
-                            }];
-                            let examine = ImapMailboxExamine::new(
-                                self.mailbox.clone(),
-                                ImapMailboxExamineOptions { parameters },
-                            );
-                            self.state = State::ExamineQresync(examine);
+                            if self.qresync {
+                                // NOTE: uid_validity is set by ExamineInitial.
+                                let uid_validity = self.uid_validity.unwrap();
+                                let modseq = NonZeroU64::new(self.highest_mod_seq)
+                                    .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
+                                let parameters = vec![SelectParameter::QResync {
+                                    uid_validity,
+                                    mod_sequence_value: modseq,
+                                    known_uids: None,
+                                    seq_match_data: None,
+                                }];
+                                let examine = ImapMailboxExamine::new(
+                                    self.mailbox.clone(),
+                                    ImapMailboxExamineOptions { parameters },
+                                );
+                                self.state = State::ExamineQresync(examine);
+                            } else {
+                                let examine = ImapMailboxExamine::new(
+                                    self.mailbox.clone(),
+                                    ImapMailboxExamineOptions::default(),
+                                );
+                                self.state = State::ExamineResync(examine);
+                            }
                         } else {
                             debug!("idle timed out with no data, restarting");
                             self.state = State::BeginIdle;
@@ -490,6 +602,10 @@ impl ImapCoroutine for ImapMailboxWatch {
                             ));
                         }
                         ImapCoroutineState::Complete(Ok(data)) => {
+                            if let Err(err) = self.check_uid_validity(&data) {
+                                return ImapCoroutineState::Complete(Err(err));
+                            }
+
                             self.compute_deltas(&data);
                             if let Some(new_modseq) = data.highest_mod_seq {
                                 self.highest_mod_seq = new_modseq;
@@ -501,6 +617,66 @@ impl ImapCoroutine for ImapMailboxWatch {
                         }
                     }
                 }
+
+                State::ExamineResync(mut examine) => {
+                    match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::ExamineResync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                            self.state = State::ExamineResync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
+                                bytes,
+                            ));
+                        }
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            if let Err(err) = self.check_uid_validity(&data) {
+                                return ImapCoroutineState::Complete(Err(err));
+                            }
+
+                            let fetch = match fetch_uid_flags() {
+                                Ok(fetch) => fetch,
+                                Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                            };
+                            self.state = State::FetchResync(fetch);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+
+                State::FetchResync(mut fetch) => match fetch.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                        self.state = State::FetchResync(fetch);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
+                    }
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                        self.state = State::FetchResync(fetch);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(
+                            bytes,
+                        ));
+                    }
+                    ImapCoroutineState::Complete(Ok(data)) => {
+                        let mut snapshot = BTreeMap::new();
+
+                        for (_seq, items) in data {
+                            let items_vec = items.into_inner();
+                            if let (Some(uid), _flags) = extract_uid_flags(&items_vec) {
+                                snapshot.insert(uid, items_vec);
+                            }
+                        }
+
+                        debug!("re-read the whole mailbox");
+                        trace!("uids: {}", snapshot.len());
+                        self.compute_snapshot_deltas(snapshot);
+                        self.state = State::EmitDeltas;
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
 
                 State::EmitDeltas => {
                     if let Some(event) = self.pending.pop_front() {
@@ -542,4 +718,211 @@ fn extract_uid_flags(
         }
     }
     (uid, flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use alloc::{borrow::ToOwned, format, string::ToString};
+
+    use crate::watch::*;
+
+    const UID_VALIDITY: u32 = 1700;
+
+    /// One scripted exchange: the fragment the next written command
+    /// must contain, then the replies to feed it, `{tag}` standing for
+    /// the tag the watcher chose.
+    type Step<'a> = (&'a str, &'a [&'a str]);
+
+    fn watcher(capability: &[Capability<'static>]) -> (ImapMailboxWatch, Fragmentizer) {
+        let watch = ImapMailboxWatch::new(
+            capability,
+            "INBOX".try_into().expect("valid mailbox"),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        (watch, Fragmentizer::new(50 * 1024 * 1024))
+    }
+
+    fn first_word(line: &str) -> &str {
+        line.split_whitespace()
+            .next()
+            .expect("first whitespace-separated token")
+    }
+
+    /// Plays `steps` against the watcher and collects what it emitted,
+    /// stopping at the first command the script does not answer.
+    fn drive(
+        cor: &mut ImapMailboxWatch,
+        frag: &mut Fragmentizer,
+        steps: &[Step],
+    ) -> Result<Vec<ImapMailboxWatchEvent>, ImapMailboxWatchError> {
+        let mut events = Vec::new();
+        let mut replies: VecDeque<String> = VecDeque::new();
+        let mut tag = String::new();
+        let mut next = 0;
+        let mut arg: Option<Vec<u8>> = None;
+
+        loop {
+            match cor.resume(frag, arg.take().as_deref()) {
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
+                    let line = str::from_utf8(&bytes).expect("utf8 command").to_string();
+
+                    let Some((expected, scripted)) = steps.get(next) else {
+                        return Ok(events);
+                    };
+
+                    assert!(line.contains(expected), "expected {expected}, wrote {line}");
+                    next += 1;
+
+                    // NOTE: DONE closes the IDLE the server still owes a
+                    // tagged reply to, so it carries no tag of its own.
+                    if !line.starts_with("DONE") {
+                        tag = first_word(&line).to_owned();
+                    }
+
+                    replies.extend(scripted.iter().map(|reply| reply.replace("{tag}", &tag)));
+                }
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
+                    let reply = replies
+                        .pop_front()
+                        .expect("the script owes a reply to every read");
+                    arg = Some(reply.into_bytes());
+                }
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(event)) => {
+                    events.push(event);
+                }
+                ImapCoroutineState::Complete(Ok(())) => panic!("the watch stopped early"),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err),
+            }
+        }
+    }
+
+    /// The very first command the watcher writes, which is what its
+    /// path shows.
+    fn first_command(cor: &mut ImapMailboxWatch, frag: &mut Fragmentizer) -> String {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
+                str::from_utf8(&bytes).expect("utf8 command").to_string()
+            }
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    /// The EXAMINE reply of a mailbox that has never been recreated.
+    fn examined(uid_validity: u32) -> String {
+        format!(
+            "* 2 EXISTS\r\n\
+             * OK [UIDVALIDITY {uid_validity}] uid validity\r\n\
+             {{tag}} OK [READ-ONLY] EXAMINE completed\r\n",
+        )
+    }
+
+    /// A `FETCH 1:* (UID FLAGS)` reply, one message per UID and flags
+    /// pair.
+    fn fetched(messages: &[(u32, &str)]) -> String {
+        let mut reply = String::new();
+
+        for (seq, (uid, flags)) in messages.iter().enumerate() {
+            reply.push_str(&format!(
+                "* {} FETCH (UID {uid} FLAGS ({flags}))\r\n",
+                seq + 1
+            ));
+        }
+
+        reply.push_str("{tag} OK FETCH completed\r\n");
+        reply
+    }
+
+    #[test]
+    fn qresync_capability_enables_it_first() {
+        let (mut watch, mut frag) = watcher(&[Capability::QResync]);
+        let line = first_command(&mut watch, &mut frag);
+
+        assert!(line.contains("ENABLE"), "wrote {line}");
+    }
+
+    #[test]
+    fn missing_qresync_examines_straight_away() {
+        let (mut watch, mut frag) = watcher(&[]);
+        let line = first_command(&mut watch, &mut frag);
+
+        assert!(line.contains("EXAMINE INBOX"), "wrote {line}");
+        assert!(!line.contains("ENABLE"), "wrote {line}");
+        assert!(!line.contains("CONDSTORE"), "wrote {line}");
+    }
+
+    #[test]
+    fn fallback_diffs_the_whole_mailbox_on_every_wake() {
+        let (mut watch, mut frag) = watcher(&[]);
+        let baseline = fetched(&[(1, ""), (2, "")]);
+        let resynced = fetched(&[(2, "\\Seen"), (3, "")]);
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&baseline]),
+            ("IDLE", &["+ idling\r\n", "* 3 EXISTS\r\n"]),
+            ("DONE", &["{tag} OK IDLE terminated\r\n"]),
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert_eq!(3, events.len(), "got {events:?}");
+
+        // NOTE: no VANISHED arrives without QRESYNC, so a UID missing
+        // from the snapshot is what reports the removal.
+        let ImapMailboxWatchEvent::EnvelopeRemoved { uid } = &events[0] else {
+            panic!("expected EnvelopeRemoved, got {:?}", events[0]);
+        };
+        assert_eq!(1, uid.get());
+
+        let ImapMailboxWatchEvent::FlagsAdded { uid, flags } = &events[1] else {
+            panic!("expected FlagsAdded, got {:?}", events[1]);
+        };
+        assert_eq!(2, uid.get());
+        assert_eq!(&vec![Flag::Seen], flags);
+
+        let ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } = &events[2] else {
+            panic!("expected EnvelopeAdded, got {:?}", events[2]);
+        };
+        assert_eq!(3, uid.get());
+    }
+
+    #[test]
+    fn fallback_reports_nothing_when_the_mailbox_is_unchanged() {
+        let (mut watch, mut frag) = watcher(&[]);
+        let snapshot = fetched(&[(1, "\\Seen")]);
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&snapshot]),
+            ("IDLE", &["+ idling\r\n", "* 1 EXISTS\r\n"]),
+            ("DONE", &["{tag} OK IDLE terminated\r\n"]),
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&snapshot]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(events.is_empty(), "got {events:?}");
+    }
+
+    #[test]
+    fn a_recreated_mailbox_ends_the_watch() {
+        let (mut watch, mut frag) = watcher(&[]);
+        let baseline = fetched(&[(1, "")]);
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&baseline]),
+            ("IDLE", &["+ idling\r\n", "* 1 EXPUNGE\r\n"]),
+            ("DONE", &["{tag} OK IDLE terminated\r\n"]),
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY + 1)]),
+        ];
+
+        let err = drive(&mut watch, &mut frag, steps).expect_err("uid validity changed");
+        let ImapMailboxWatchError::UidValidityChanged { known, seen } = err else {
+            panic!("expected UidValidityChanged, got {err:?}");
+        };
+        assert_eq!(UID_VALIDITY, known.get());
+        assert_eq!(UID_VALIDITY + 1, seen.get());
+    }
 }
