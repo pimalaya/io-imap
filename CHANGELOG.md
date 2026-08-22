@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `watch::ImapMailboxWatchOptions::idle_timeout` and its `client::ImapMailboxWatchStreamOptions` counterpart set how long an IDLE is held before it is re-issued.
+
+  It was `ImapIdleOptions`' default, 29 seconds, with no way through the watch to say otherwise: short enough to survive a NAT middle-box that drops a quiet connection, and around 120 re-IDLE round trips an hour per watched mailbox. A caller that knows its server holds a connection open asks less often, up to the 29 minutes RFC 2177 §3 allows. `None` keeps the old behaviour.
+
 - `watch::ImapMailboxWatch` can poll instead of holding IDLE, selected by the new `ImapMailboxWatchOptions` its constructor now takes. **Breaking.**
 
   A polling watch yields the new `ImapMailboxWatchYield::WantsWait` and re-reads the mailbox on the resume that follows, so how long it waits, and therefore how quickly it notices a change, belongs to whoever drives it: waiting is an effect an I/O-free coroutine cannot perform. `client::ImapMailboxWatchStreamOptions` gained the `poll` interval that selects it, and its worker sleeps that interval in shutdown-poll steps. The answer to a server that accepts IDLE and then never speaks.

@@ -87,6 +87,7 @@ use core::{
     mem,
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 use alloc::{
@@ -198,6 +199,14 @@ pub enum ImapMailboxWatchError {
 /// Options of [`ImapMailboxWatch`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImapMailboxWatchOptions {
+    /// How long an IDLE is held before it is re-issued.
+    ///
+    /// `None` takes io-imap's own default, which re-issues often
+    /// enough to survive a NAT middle-box that drops a quiet
+    /// connection. A server known to hold one open is asked less
+    /// often, up to the 29 minutes RFC 2177 §3 allows. Ignored by a
+    /// polling watch, which holds no IDLE.
+    pub idle_timeout: Option<Duration>,
     /// Wait for the caller between two re-reads instead of holding
     /// IDLE.
     ///
@@ -592,7 +601,10 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                     self.idle_done.store(false, Ordering::SeqCst);
                     self.idle_saw_data = false;
-                    let idle = ImapIdle::new(self.idle_done.clone(), ImapIdleOptions::default());
+                    let opts = ImapIdleOptions {
+                        timeout: self.opts.idle_timeout,
+                    };
+                    let idle = ImapIdle::new(self.idle_done.clone(), opts);
                     self.state = State::Idle(idle);
                 }
 
@@ -971,7 +983,10 @@ mod tests {
     /// caller watch a server whose IDLE cannot be trusted.
     #[test]
     fn a_polling_watch_re_reads_instead_of_idling() {
-        let opts = ImapMailboxWatchOptions { poll: true };
+        let opts = ImapMailboxWatchOptions {
+            poll: true,
+            ..Default::default()
+        };
         let (mut watch, mut frag) = watcher_with(&[], opts);
         let baseline = fetched(&[(1, "")]);
         let resynced = fetched(&[(1, "\\Seen")]);

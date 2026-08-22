@@ -844,6 +844,7 @@ impl ImapClientStd {
     ) -> Result<ImapMailboxWatchStream, ImapClientError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let watch_opts = ImapMailboxWatchOptions {
+            idle_timeout: opts.idle_timeout,
             poll: opts.poll.is_some(),
         };
         let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone(), watch_opts);
@@ -1130,6 +1131,10 @@ pub struct ImapMailboxWatchStreamOptions {
     /// pays a wakeup per interval; the default of five seconds suits a
     /// long-running watch nobody is waiting on.
     pub shutdown_poll: Duration,
+    /// How long an IDLE is held before it is re-issued, `None` taking
+    /// io-imap's own default. Ignored when `poll` selects the polling
+    /// watch, which holds no IDLE.
+    pub idle_timeout: Option<Duration>,
     /// Re-read the mailbox on this interval instead of holding IDLE.
     ///
     /// `None`, the default, holds IDLE and lets the server speak
@@ -1143,6 +1148,7 @@ impl Default for ImapMailboxWatchStreamOptions {
     fn default() -> Self {
         Self {
             shutdown_poll: Duration::from_secs(5),
+            idle_timeout: None,
             poll: None,
         }
     }
