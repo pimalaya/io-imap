@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   `ImapMailboxWatch::new` returns `Self` rather than `Result<Self, _>`, and `ImapMailboxWatchError::QresyncUnsupported` is gone, since nothing rejects a server any more.
 
+- `client::ImapClientStd::watch_mailbox` takes an `ImapMailboxWatchStreamOptions`. **Breaking.**
+
+  Its one field, `shutdown_poll`, is the read deadline the worker arms on the stream, and therefore the worst case for `close` against a silent server: until it expires, the worker is blocked in a read and cannot see the shutdown flag. It used to be five seconds with no way to say otherwise, which is a long Ctrl+C for a daemon watching on someone's desktop. The default is unchanged, so a caller passing `Default::default()` keeps the old behaviour.
+
 ### Fixed
 
 - The mailbox watch now ends with the new `ImapMailboxWatchError::UidValidityChanged` when the watched mailbox is recreated under the same name, instead of emitting deltas keyed on UIDs that mean something else. Both paths re-EXAMINE before resyncing, so the check runs on every wake.

@@ -834,18 +834,20 @@ impl ImapClientStd {
     ///
     /// Drop the returned stream (or call its `close`) to wind down.
     /// `capability` selects the QRESYNC path or the whole-mailbox
-    /// fallback.
+    /// fallback, and `opts.shutdown_poll` how long winding down may
+    /// take.
     pub fn watch_mailbox(
         self,
         mailbox: Mailbox<'static>,
         capability: &[Capability<'static>],
+        opts: ImapMailboxWatchStreamOptions,
     ) -> Result<ImapMailboxWatchStream, ImapClientError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone());
         let mut fragmentizer = self.fragmentizer;
         let mut stream = self.stream;
 
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(opts.shutdown_poll))?;
         stream.stop_retrying();
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientError>>(256);
@@ -1090,6 +1092,29 @@ impl fmt::Debug for ImapClientStd {
         f.debug_struct("ImapClientStd")
             .field("fragmentizer", &self.fragmentizer)
             .finish_non_exhaustive()
+    }
+}
+
+/// Options of [`ImapClientStd::watch_mailbox`].
+#[derive(Clone, Copy, Debug)]
+pub struct ImapMailboxWatchStreamOptions {
+    /// How long the worker may sit in a read before it looks at the
+    /// shutdown flag again.
+    ///
+    /// It is the read deadline armed on the stream, so it is also the
+    /// worst case for [`ImapMailboxWatchStream::close`] against a
+    /// silent server: the worker is blocked in a read until then. A
+    /// caller that wants a prompt Ctrl+C picks a second or less and
+    /// pays a wakeup per interval; the default of five seconds suits a
+    /// long-running watch nobody is waiting on.
+    pub shutdown_poll: Duration,
+}
+
+impl Default for ImapMailboxWatchStreamOptions {
+    fn default() -> Self {
+        Self {
+            shutdown_poll: Duration::from_secs(5),
+        }
     }
 }
 
