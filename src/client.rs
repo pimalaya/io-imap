@@ -843,7 +843,10 @@ impl ImapClientStd {
         opts: ImapMailboxWatchStreamOptions,
     ) -> Result<ImapMailboxWatchStream, ImapClientError> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone());
+        let watch_opts = ImapMailboxWatchOptions {
+            poll: opts.poll.is_some(),
+        };
+        let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone(), watch_opts);
         let mut fragmentizer = self.fragmentizer;
         let mut stream = self.stream;
 
@@ -903,6 +906,25 @@ impl ImapClientStd {
                             tx.send(Err(err.into())).ok();
                             return;
                         }
+                        arg = None;
+                    }
+                    // NOTE: only a polling watch asks to wait, and it
+                    // is slept here in shutdown-poll steps so closing
+                    // the stream does not have to outwait the whole
+                    // interval.
+                    ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWait) => {
+                        let mut left = opts.poll.unwrap_or_default();
+
+                        while left > Duration::ZERO {
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
+
+                            let step = left.min(opts.shutdown_poll);
+                            thread::sleep(step);
+                            left -= step;
+                        }
+
                         arg = None;
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
@@ -1108,12 +1130,20 @@ pub struct ImapMailboxWatchStreamOptions {
     /// pays a wakeup per interval; the default of five seconds suits a
     /// long-running watch nobody is waiting on.
     pub shutdown_poll: Duration,
+    /// Re-read the mailbox on this interval instead of holding IDLE.
+    ///
+    /// `None`, the default, holds IDLE and lets the server speak
+    /// first, which is what a server offering it deserves. A value
+    /// picks the polling watch and sets how long it waits between two
+    /// re-reads, for a server whose IDLE cannot be trusted.
+    pub poll: Option<Duration>,
 }
 
 impl Default for ImapMailboxWatchStreamOptions {
     fn default() -> Self {
         Self {
             shutdown_poll: Duration::from_secs(5),
+            poll: None,
         }
     }
 }

@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `watch::ImapMailboxWatch` can poll instead of holding IDLE, selected by the new `ImapMailboxWatchOptions` its constructor now takes. **Breaking.**
+
+  A polling watch yields the new `ImapMailboxWatchYield::WantsWait` and re-reads the mailbox on the resume that follows, so how long it waits, and therefore how quickly it notices a change, belongs to whoever drives it: waiting is an effect an I/O-free coroutine cannot perform. `client::ImapMailboxWatchStreamOptions` gained the `poll` interval that selects it, and its worker sleeps that interval in shutdown-poll steps. The answer to a server that accepts IDLE and then never speaks.
+
 - `watch::ImapMailboxWatch` no longer requires QRESYNC. **Breaking.**
 
   The capability list now selects a path instead of gating the watch: with QRESYNC nothing changes, and without it the watcher opens a plain EXAMINE, seeds the same `FETCH 1:* (UID FLAGS)` baseline, and re-reads the whole mailbox on every IDLE wake, diffing it against that baseline to emit the same UID-keyed events. A server that cannot report what changed is answered by asking it everything, the way `SORT` already falls back to `SEARCH` plus a local sort. The events are identical; the cost scales with the mailbox rather than with the change.

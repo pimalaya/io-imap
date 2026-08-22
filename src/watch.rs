@@ -58,7 +58,8 @@
 //! let capability = [Capability::QResync];
 //! let mailbox = "INBOX".try_into().unwrap();
 //! let shutdown = Arc::new(AtomicBool::new(false));
-//! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone());
+//! let opts = Default::default();
+//! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone(), opts);
 //! let mut arg = None;
 //!
 //! loop {
@@ -69,6 +70,9 @@
 //!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
+//!         }
+//!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWait) => {
+//!             // Only a polling watch asks; sleep as long as you poll for.
 //!         }
 //!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(event)) => {
 //!             println!("{event:?}");
@@ -191,11 +195,28 @@ pub enum ImapMailboxWatchError {
     Enable(#[from] ImapExtensionEnableError),
 }
 
+/// Options of [`ImapMailboxWatch`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImapMailboxWatchOptions {
+    /// Wait for the caller between two re-reads instead of holding
+    /// IDLE.
+    ///
+    /// A polling watch yields [`ImapMailboxWatchYield::WantsWait`] and
+    /// re-reads on the resume that follows, so how long it waits, and
+    /// therefore how quickly it notices a change, is its driver's to
+    /// decide. Off by default: a server that offers IDLE is better
+    /// asked to speak first.
+    pub poll: bool,
+}
+
 /// Yield variants from the mailbox watcher.
 #[derive(Debug)]
 pub enum ImapMailboxWatchYield {
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
+    /// The caller waits as long as it means to poll for, then resumes
+    /// with no input. Only a polling watch yields this.
+    WantsWait,
     /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
     /// A mailbox change to consume; the watcher keeps running.
@@ -208,6 +229,7 @@ enum State {
     FetchBaseline(ImapMessageFetch),
     BeginIdle,
     Idle(ImapIdle),
+    Waiting,
     ExamineQresync(ImapMailboxExamine),
     ExamineResync(ImapMailboxExamine),
     FetchResync(ImapMessageFetch),
@@ -218,6 +240,7 @@ enum State {
 /// I/O-free IDLE mailbox watcher, QRESYNC-driven or whole-mailbox.
 pub struct ImapMailboxWatch {
     state: State,
+    opts: ImapMailboxWatchOptions,
     qresync: bool,
     shutdown: Arc<AtomicBool>,
     idle_done: Arc<AtomicBool>,
@@ -237,6 +260,7 @@ impl ImapMailboxWatch {
         capability: &[Capability<'static>],
         mailbox: Mailbox<'static>,
         shutdown: Arc<AtomicBool>,
+        opts: ImapMailboxWatchOptions,
     ) -> Self {
         let qresync = capability.contains(&Capability::QResync);
 
@@ -263,6 +287,7 @@ impl ImapMailboxWatch {
 
         Self {
             state,
+            opts,
             qresync,
             shutdown,
             idle_done: Arc::new(AtomicBool::new(false)),
@@ -273,6 +298,35 @@ impl ImapMailboxWatch {
             shadow: BTreeMap::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    /// The re-read that follows a wake, whichever way the watch was
+    /// woken: QRESYNC when the server can name what changed, a plain
+    /// EXAMINE when the whole mailbox has to be read again.
+    fn resync(&self) -> State {
+        if !self.qresync {
+            let examine =
+                ImapMailboxExamine::new(self.mailbox.clone(), ImapMailboxExamineOptions::default());
+
+            return State::ExamineResync(examine);
+        }
+
+        // NOTE: uid_validity is set by ExamineInitial.
+        let uid_validity = self.uid_validity.unwrap();
+        let modseq = NonZeroU64::new(self.highest_mod_seq)
+            .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
+        let parameters = vec![SelectParameter::QResync {
+            uid_validity,
+            mod_sequence_value: modseq,
+            known_uids: None,
+            seq_match_data: None,
+        }];
+        let examine = ImapMailboxExamine::new(
+            self.mailbox.clone(),
+            ImapMailboxExamineOptions { parameters },
+        );
+
+        State::ExamineQresync(examine)
     }
 
     /// Refuses a resync keyed on UIDs the server no longer means.
@@ -527,10 +581,27 @@ impl ImapCoroutine for ImapMailboxWatch {
                         return ImapCoroutineState::Complete(Ok(()));
                     }
 
+                    // NOTE: waiting is an effect, so a polling watch
+                    // hands the wait back to its driver rather than
+                    // holding IDLE. How long to wait is the driver's,
+                    // which is why nothing here names a duration.
+                    if self.opts.poll {
+                        self.state = State::Waiting;
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWait);
+                    }
+
                     self.idle_done.store(false, Ordering::SeqCst);
                     self.idle_saw_data = false;
                     let idle = ImapIdle::new(self.idle_done.clone(), ImapIdleOptions::default());
                     self.state = State::Idle(idle);
+                }
+
+                State::Waiting => {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        return ImapCoroutineState::Complete(Ok(()));
+                    }
+
+                    self.state = self.resync();
                 }
 
                 State::Idle(mut idle) => match idle.resume(fragmentizer, arg.take()) {
@@ -556,29 +627,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                         }
 
                         if self.idle_saw_data {
-                            if self.qresync {
-                                // NOTE: uid_validity is set by ExamineInitial.
-                                let uid_validity = self.uid_validity.unwrap();
-                                let modseq = NonZeroU64::new(self.highest_mod_seq)
-                                    .unwrap_or_else(|| NonZeroU64::new(1).expect("1 is non-zero"));
-                                let parameters = vec![SelectParameter::QResync {
-                                    uid_validity,
-                                    mod_sequence_value: modseq,
-                                    known_uids: None,
-                                    seq_match_data: None,
-                                }];
-                                let examine = ImapMailboxExamine::new(
-                                    self.mailbox.clone(),
-                                    ImapMailboxExamineOptions { parameters },
-                                );
-                                self.state = State::ExamineQresync(examine);
-                            } else {
-                                let examine = ImapMailboxExamine::new(
-                                    self.mailbox.clone(),
-                                    ImapMailboxExamineOptions::default(),
-                                );
-                                self.state = State::ExamineResync(examine);
-                            }
+                            self.state = self.resync();
                         } else {
                             debug!("idle timed out with no data, restarting");
                             self.state = State::BeginIdle;
@@ -736,10 +785,18 @@ mod tests {
     type Step<'a> = (&'a str, &'a [&'a str]);
 
     fn watcher(capability: &[Capability<'static>]) -> (ImapMailboxWatch, Fragmentizer) {
+        watcher_with(capability, ImapMailboxWatchOptions::default())
+    }
+
+    fn watcher_with(
+        capability: &[Capability<'static>],
+        opts: ImapMailboxWatchOptions,
+    ) -> (ImapMailboxWatch, Fragmentizer) {
         let watch = ImapMailboxWatch::new(
             capability,
             "INBOX".try_into().expect("valid mailbox"),
             Arc::new(AtomicBool::new(false)),
+            opts,
         );
 
         (watch, Fragmentizer::new(50 * 1024 * 1024))
@@ -793,6 +850,9 @@ mod tests {
                 ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(event)) => {
                     events.push(event);
                 }
+                // NOTE: the driver is what waits, and a test has
+                // nothing to wait for.
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWait) => {}
                 ImapCoroutineState::Complete(Ok(())) => panic!("the watch stopped early"),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err),
             }
@@ -904,6 +964,32 @@ mod tests {
 
         let events = drive(&mut watch, &mut frag, steps).expect("watch running");
         assert!(events.is_empty(), "got {events:?}");
+    }
+
+    /// A polling watch never sends IDLE: it asks its driver to wait
+    /// and re-reads on the resume that follows, which is what lets a
+    /// caller watch a server whose IDLE cannot be trusted.
+    #[test]
+    fn a_polling_watch_re_reads_instead_of_idling() {
+        let opts = ImapMailboxWatchOptions { poll: true };
+        let (mut watch, mut frag) = watcher_with(&[], opts);
+        let baseline = fetched(&[(1, "")]);
+        let resynced = fetched(&[(1, "\\Seen")]);
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&baseline]),
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("FETCH 1:* (UID FLAGS)", &[&resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+
+        assert_eq!(1, events.len(), "got {events:?}");
+        let ImapMailboxWatchEvent::FlagsAdded { uid, flags } = &events[0] else {
+            panic!("expected FlagsAdded, got {:?}", events[0]);
+        };
+        assert_eq!(1, uid.get());
+        assert_eq!(&vec![Flag::Seen], flags);
     }
 
     #[test]
