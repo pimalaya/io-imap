@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `rfc3501::search::ImapMessageSearch` sends `CHARSET UTF-8`, as SORT and THREAD already did.
+
+  Without it, servers such as Gmail answer non-ASCII criteria with `BAD`. The charset was lost when imap-client became io-imap ([#3](https://github.com/pimalaya/io-imap/issues/3)).
+
 ## [0.6.0] - 2026-08-22
 
 ### Changed

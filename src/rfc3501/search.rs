@@ -52,7 +52,7 @@ use imap_codec::{
     fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::{TagGenerator, Vec1},
+        core::{Charset, TagGenerator, Vec1},
         response::{Data, StatusKind, Tagged},
         search::SearchKey,
     },
@@ -96,11 +96,14 @@ pub struct ImapMessageSearch {
 
 impl ImapMessageSearch {
     /// Builds a SEARCH coroutine matching messages against `criteria`.
+    ///
+    /// The command always carries `CHARSET UTF-8`, as SORT and THREAD
+    /// do: without it, servers such as Gmail reject non-ASCII criteria.
     pub fn new(criteria: Vec1<SearchKey<'static>>, opts: ImapMessageSearchOptions) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
             body: CommandBody::Search {
-                charset: None,
+                charset: Some(Charset::try_from("UTF-8").expect("UTF-8 is a valid charset")),
                 criteria,
                 uid: opts.uid,
             },
@@ -192,7 +195,7 @@ mod tests {
         let bytes = expect_wants_write(&mut search, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
-        assert!(line.contains("SEARCH "));
+        assert!(line.contains("SEARCH CHARSET UTF-8 "));
 
         expect_wants_read(&mut search, &mut frag);
 
@@ -210,7 +213,7 @@ mod tests {
 
         let bytes = expect_wants_write(&mut search, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
-        assert!(line.contains("UID SEARCH "));
+        assert!(line.contains("UID SEARCH CHARSET UTF-8 "));
     }
 
     #[test]
