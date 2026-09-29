@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `ImapClientStdConnectOptions`, whose `proxy` field tunnels the connection through a SOCKS5 or HTTP proxy.
+
+### Changed
+
+- **BREAKING**: `ImapClientStd::connect` takes `(url, opts)`, the TLS configuration, the SASL mechanism and the session options moving into `ImapClientStdConnectOptions`.
+
 ## [0.6.1] - 2026-09-26
 
 ### Fixed

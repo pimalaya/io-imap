@@ -76,6 +76,14 @@ use crate::{
 ))]
 mod connect;
 
+#[cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+#[doc(inline)]
+pub use connect::ImapClientStdConnectOptions;
+
 /// Failure causes returned by [`ImapClientStd`].
 #[derive(Debug, Error)]
 pub enum ImapClientError {

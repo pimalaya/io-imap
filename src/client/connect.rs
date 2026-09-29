@@ -18,6 +18,7 @@ use io_sasl::mechanism::Sasl;
 #[cfg(feature = "scram")]
 use io_sasl::rfc5802::SaslScramCreds;
 use pimalaya_stream::{
+    proxy::Proxy,
     retry::Retry,
     stream::{Stream, TcpConnectOptions, TlsConnectOptions, UnixConnectOptions},
     tls::Tls,
@@ -48,17 +49,39 @@ impl ImapStream for Stream {
     }
 }
 
+/// Optional settings for [`ImapClientStd::connect`].
+///
+/// The default uses the TLS backend default, resolves the proxy from
+/// the environment, skips authentication and follows the session
+/// defaults.
+#[derive(Clone, Debug, Default)]
+pub struct ImapClientStdConnectOptions {
+    /// How the TLS transports are secured, implicit or via STARTTLS.
+    pub tls: Tls,
+    /// How the TCP and TLS transports reach the server.
+    ///
+    /// [`Proxy::System`] resolves it from the environment,
+    /// [`Proxy::None`] connects directly. A local socket ignores it.
+    pub proxy: Proxy,
+    /// The SASL mechanism to authenticate with, `None` skipping
+    /// authentication.
+    ///
+    /// SCRAM credentials carrying an empty nonce are given one drawn at
+    /// connect time, an empty nonce being no nonce at all as far as RFC
+    /// 5802 is concerned; a caller wanting its own passes it in the
+    /// credentials.
+    pub sasl: Option<Sasl>,
+    /// The protocol options handed to [`ImapSessionOpen`].
+    pub session: ImapSessionOpenOptions,
+}
+
 impl ImapClientStd {
     /// End-to-end connect: TCP/TLS, optional STARTTLS, greeting,
     /// optional SASL.
     ///
     /// `imap://` is plain TCP (143), `imaps://` is implicit TLS (993),
-    /// `unix://` is a local socket. `opts.starttls = true` is only valid
-    /// on a cleartext transport. Pass `None` as `sasl` to skip auth.
-    ///
-    /// SCRAM credentials carrying an empty nonce are given one drawn
-    /// here, an empty nonce being no nonce at all as far as RFC 5802 is
-    /// concerned; a caller wanting its own passes it in the credentials.
+    /// `unix://` is a local socket. `opts.session.starttls = true` is
+    /// only valid on a cleartext transport.
     ///
     /// Every protocol decision belongs to [`ImapSessionOpen`]; this
     /// method only answers its transport requests with [`Stream`]. A
@@ -66,13 +89,18 @@ impl ImapClientStd {
     /// sockets.
     pub fn connect(
         url: &Url,
-        tls: &Tls,
-        sasl: Option<impl Into<Sasl>>,
-        opts: ImapSessionOpenOptions,
+        opts: ImapClientStdConnectOptions,
     ) -> Result<(Self, Vec<Capability<'static>>), ImapClientError> {
+        let ImapClientStdConnectOptions {
+            tls,
+            proxy,
+            sasl,
+            session,
+        } = opts;
+
         let transport = ImapSessionTransport::from_url(url)?;
-        let sasl = sasl.map(Into::into).map(with_client_nonce);
-        let mut session = ImapSessionOpen::new(transport, sasl, opts);
+        let sasl = sasl.map(with_client_nonce);
+        let mut session = ImapSessionOpen::new(transport, sasl, session);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
         let mut stream: Option<Stream> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
@@ -97,7 +125,11 @@ impl ImapClientStd {
                     host,
                     port,
                 }) => {
-                    let opts = TcpConnectOptions::default();
+                    let opts = TcpConnectOptions {
+                        proxy: proxy.clone(),
+                        ..Default::default()
+                    };
+
                     stream = Some(Stream::connect_tcp(host, port, opts)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsConnect {
@@ -106,6 +138,7 @@ impl ImapClientStd {
                 }) => {
                     let opts = TlsConnectOptions {
                         tls: tls.clone(),
+                        proxy: proxy.clone(),
                         ..Default::default()
                     };
 
@@ -117,7 +150,7 @@ impl ImapClientStd {
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsUpgrade) => {
                     let plain = stream.take().ok_or_else(missing)?;
-                    stream = Some(plain.upgrade_tls(tls)?);
+                    stream = Some(plain.upgrade_tls(&tls)?);
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
                     let stream = stream.as_mut().ok_or_else(missing)?;
