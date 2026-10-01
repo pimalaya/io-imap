@@ -49,6 +49,7 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
+    encode::Encoder,
     fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
@@ -97,17 +98,28 @@ pub struct ImapMessageSearch {
 impl ImapMessageSearch {
     /// Builds a SEARCH coroutine matching messages against `criteria`.
     ///
-    /// The command always carries `CHARSET UTF-8`, as SORT and THREAD
-    /// do: without it, servers such as Gmail reject non-ASCII criteria.
+    /// The command carries `CHARSET UTF-8` only when the criteria hold
+    /// non-ASCII bytes. RFC 3501 section 6.4.4 makes US-ASCII the default
+    /// every server supports, and servers disagree beyond it: Gmail
+    /// rejects non-ASCII criteria without the charset, Outlook rejects
+    /// the charset itself.
     pub fn new(criteria: Vec1<SearchKey<'static>>, opts: ImapMessageSearchOptions) -> Self {
-        let command = Command {
+        let mut command = Command {
             tag: TagGenerator::new().generate(),
             body: CommandBody::Search {
-                charset: Some(Charset::try_from("UTF-8").expect("UTF-8 is a valid charset")),
+                charset: None,
                 criteria,
                 uid: opts.uid,
             },
         };
+
+        let ascii = CommandCodec::new().encode(&command).dump().is_ascii();
+
+        if let CommandBody::Search { charset, .. } = &mut command.body
+            && !ascii
+        {
+            *charset = Some(Charset::try_from("UTF-8").expect("UTF-8 is a valid charset"));
+        }
 
         trace!("send IMAP command {command:?}");
 
@@ -180,6 +192,7 @@ mod tests {
     use core::str;
 
     use alloc::{borrow::ToOwned, format, vec, vec::Vec};
+    use imap_codec::imap_types::core::AString;
 
     use crate::rfc3501::search::*;
 
@@ -195,7 +208,7 @@ mod tests {
         let bytes = expect_wants_write(&mut search, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
-        assert!(line.contains("SEARCH CHARSET UTF-8 "));
+        assert!(line.contains(" SEARCH ALL\r\n"));
 
         expect_wants_read(&mut search, &mut frag);
 
@@ -213,7 +226,19 @@ mod tests {
 
         let bytes = expect_wants_write(&mut search, &mut frag, None);
         let line = str::from_utf8(&bytes).expect("utf8 command");
-        assert!(line.contains("UID SEARCH CHARSET UTF-8 "));
+        assert!(line.contains(" UID SEARCH ALL\r\n"));
+    }
+
+    #[test]
+    fn non_ascii_criteria_send_charset_utf8() {
+        let from = AString::try_from("билеты").expect("valid astring");
+        let criteria = Vec1::from(SearchKey::From(from));
+        let mut search = ImapMessageSearch::new(criteria, ImapMessageSearchOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write(&mut search, &mut frag, None);
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        assert!(line.contains(" SEARCH CHARSET UTF-8 FROM "));
     }
 
     #[test]

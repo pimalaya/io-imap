@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `rfc3501::search::ImapMessageSearch` sends `CHARSET UTF-8` only when its criteria hold non-ASCII bytes, and no charset otherwise.
+
+  Always sending it broke Outlook, which rejects the UTF-8 charset with `NO`, for every search including ASCII ones ([pimalaya/himalaya#769](https://github.com/pimalaya/himalaya/issues/769)). US-ASCII is the default RFC 3501 requires every server to support; Gmail still gets the charset its non-ASCII criteria need. The SORT fallback inherits the fix.
+
 ## [0.7.0] - 2026-09-29
 
 ### Added
