@@ -19,10 +19,8 @@
 #          plain (useTls = false, tlsImplicit = false) so the test can
 #          talk to it without TLS
 #        - x:Imap/set       set allowPlainTextAuth = true
-#        - x:Action/set     trigger ReloadSettings
-#   5. Restart the container so the now-plain listener rebinds. The
-#      ReloadSettings action persists the config but doesn't
-#      re-open sockets.
+#   5. Restart the container so the settings apply and the now-plain
+#      listener rebinds.
 #
 # Host port mapping:
 #   8080 → admin HTTP (JMAP + webadmin at /admin)
@@ -84,7 +82,8 @@ imaps_id=$(curl -fsS -u "admin:${ADMIN_PASS}" \
     jq -r '.methodResponses[0][1].ids[0]')
 
 # Batch: create domain + user + flip IMAPS listener to plain + allow
-# clear-text auth + reload.
+# clear-text auth. No ReloadSettings: the restart below applies it all,
+# and the bundled spam DNSBL rules fail its validation since v0.16.
 curl -fsS -u "admin:${ADMIN_PASS}" \
     -H 'Content-Type: application/json' \
     -d "{
@@ -112,11 +111,7 @@ curl -fsS -u "admin:${ADMIN_PASS}" \
         [\"x:Imap/set\",
           {\"accountId\":\"$acc\",\"update\":{
             \"singleton\":{\"allowPlainTextAuth\":true}
-          }},\"3\"],
-        [\"x:Action/set\",
-          {\"accountId\":\"$acc\",\"create\":{
-            \"r1\":{\"@type\":\"ReloadSettings\"}
-          }},\"4\"]
+          }},\"3\"]
       ]
     }" \
     "http://localhost:${ADMIN_PORT}/jmap/" |

@@ -60,10 +60,14 @@ required-features = ["rustls-ring"]
 [dev-dependencies]
 env_logger = "0.11"
 hmac = "0.13"
+io-oauth = { version = "0.3", default-features = false, features = ["jwt-bearer", "rustls-ring"] }
+io-sasl = { version = "0.1", default-features = false }
 pbkdf2 = { version = "0.13", features = ["hmac"] }
 sha2 = "0.11"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-platform-verifier = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"
 url = "2"

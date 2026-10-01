@@ -1,38 +1,61 @@
 //! Shared helpers for provider integration tests.
 //!
-//! Each test runs the raw coroutine loop against a live IMAP
-//! server using blocking [`Read`]/[`Write`] on the underlying stream.
+//! Two flows run against a live IMAP server. [`run_imaps`] and
+//! [`run_imap`] drive the raw coroutine loop over blocking
+//! [`Read`]/[`Write`]; [`run_client`] drives [`ImapClientStd`], from
+//! [`ImapClientStd::connect`] through every command the server
+//! advertises, and tears down what it created.
 //!
 //! Each integration test compiles this module on its own and only
-//! exercises one transport helper, so the other ends up flagged as
-//! dead code; suppress the noise at the module level.
+//! exercises some of these helpers, so the rest end up flagged as dead
+//! code; suppress the noise at the module level.
 
 #![allow(dead_code)]
 
 use std::{
     io::{Read, Write},
     num::NonZeroU32,
+    panic::{self, AssertUnwindSafe},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use io_imap::{
+    client::{
+        ImapClient, ImapClientStd, ImapClientStdConnectOptions, ImapMailboxWatchStreamOptions,
+    },
     codec::fragmentizer::Fragmentizer,
     coroutine::*,
-    rfc3501::{append::*, fetch::*, fetch_stream::*, greeting::*, login::*, logout::*, select::*},
-    rfc5256::sort::*,
+    rfc2971::id::*,
+    rfc3501::{
+        append::*, copy::*, fetch::*, fetch_stream::*, greeting::*, login::*, logout::*, search::*,
+        select::*, store::*,
+    },
+    rfc5256::{sort::*, thread::*},
+    rfc6851::r#move::*,
     types::{
         core::Vec1,
-        extensions::sort::{SortCriterion, SortKey},
+        extensions::{
+            enable::CapabilityEnable,
+            sort::{SortCriterion, SortKey},
+            thread::ThreadingAlgorithm,
+        },
         fetch::{MacroOrMessageDataItemNames, MessageDataItemName},
-        flag::Flag,
+        flag::{Flag, StoreType},
+        mailbox::{ListMailbox, Mailbox},
         response::Capability,
         search::SearchKey,
         sequence::{SeqOrUid, SequenceSet},
+        status::StatusDataItemName,
     },
+    watch::*,
 };
+use io_sasl::mechanism::Sasl;
 use pimalaya_stream::{
     stream::{Stream, TcpConnectOptions, TlsConnectOptions},
     tls::Tls,
 };
+use url::Url;
 
 const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
@@ -318,5 +341,417 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
                 arg = None;
             }
         }
+    }
+}
+
+/// A shared end-to-end flow over [`ImapClientStd`], the client layer
+/// consumers use.
+///
+/// [`ImapClientStd::connect`] opens the session (TLS, greeting, SASL),
+/// then one connection drives the command surface while a second one
+/// holds a watch on the test mailbox:
+///
+/// ```text
+/// CONNECT → CAPABILITY → NOOP → RAW → ID → ENABLE → LIST → LSUB
+///   → CREATE ×2 → RENAME → SUBSCRIBE → LSUB → UNSUBSCRIBE → STATUS
+///   ┌ guarded by with_cleanup ───────────────────────────────────┐
+///   │ → APPEND → APPEND (stream) → watch (IDLE) sees an APPEND   │
+///   │ → EXAMINE → UNSELECT → SELECT → CHECK → SEARCH → FETCH     │
+///   │ → FETCH body (stream) → FETCH bodies (stream) → SORT       │
+///   │ → THREAD → STORE → COPY → MOVE → UID EXPUNGE → EXPUNGE     │
+///   │ → CLOSE                                                    │
+///   └────────────────────────────────────────────────────────────┘
+///   → teardown: messages to \Trash and purged there, mailboxes
+///     deleted, LOGOUT
+/// ```
+///
+/// Extensions the server does not advertise (ENABLE, UNSELECT, SORT,
+/// THREAD, MOVE, UIDPLUS) are skipped rather than failed.
+pub fn run_client(url: &str, sasl: Sasl) {
+    let _ = env_logger::try_init();
+    let url = Url::parse(url).expect("parse IMAP URL");
+
+    let (mut client, capabilities) = connect(&url, &sasl);
+    assert!(!capabilities.is_empty(), "no capability after connect");
+
+    let capabilities = client.capability().expect("CAPABILITY");
+    let has = |capability: Capability<'static>| capabilities.contains(&capability);
+
+    client.noop().expect("NOOP");
+
+    let raw = client.raw(b"raw1 NOOP\r\n").expect("RAW");
+    assert!(raw.contains("raw1 OK"), "RAW missed its tagged OK: {raw}");
+
+    client.id(ImapServerIdOptions::default()).expect("ID");
+
+    if has(Capability::Enable) {
+        let condstore = Vec1::from(CapabilityEnable::CondStore);
+        client.enable(condstore).expect("ENABLE");
+    }
+
+    let all = || ListMailbox::try_from("*").unwrap();
+    let listing = client.list(mailbox("INBOX"), all()).expect("LIST");
+    assert!(!listing.is_empty(), "LIST returned no mailbox");
+    client.lsub(mailbox("INBOX"), all()).expect("LSUB");
+
+    let trash = listing
+        .iter()
+        .find(|(_, _, attributes)| {
+            attributes
+                .iter()
+                .any(|attribute| attribute.to_string().eq_ignore_ascii_case("\\Trash"))
+        })
+        .map(|(mailbox, _, _)| mailbox.clone());
+
+    let name = format!("io-imap-test-{}", unique_suffix());
+    let created = format!("{name}-created");
+    let renamed = format!("{name}-renamed");
+    let copied = format!("{name}-copied");
+
+    // --- CREATE, RENAME, SUBSCRIBE ---
+
+    client.create(mailbox(&created)).expect("CREATE");
+    client.create(mailbox(&copied)).expect("CREATE copy target");
+
+    // NOTE: from here on the account holds real mailboxes, so every
+    // exit path has to remove them. See with_cleanup.
+    with_cleanup(
+        &mut client,
+        |client| {
+            client
+                .rename(mailbox(&created), mailbox(&renamed))
+                .expect("RENAME");
+            client_body(client, &url, &sasl, &capabilities, &renamed, &copied);
+        },
+        |client| {
+            // NOTE: the body may have failed mid-command, leaving the
+            // connection unusable, so the teardown opens its own.
+            let _ = client.logout();
+            let (mut client, _) = connect(&url, &sasl);
+
+            for name in [&created, &renamed, &copied] {
+                purge(&mut client, name, trash.as_ref());
+            }
+
+            client.logout().expect("LOGOUT");
+        },
+    );
+}
+
+/// The body of [`run_client`], everything that runs once the test
+/// mailboxes exist. Split out so [`with_cleanup`] can own the teardown.
+fn client_body(
+    client: &mut ImapClientStd,
+    url: &Url,
+    sasl: &Sasl,
+    capabilities: &[Capability<'static>],
+    name: &str,
+    copied: &str,
+) {
+    let has = |capability: Capability<'static>| capabilities.contains(&capability);
+
+    client.subscribe(mailbox(name)).expect("SUBSCRIBE");
+    let subscribed = client
+        .lsub(mailbox(""), ListMailbox::try_from(name.to_owned()).unwrap())
+        .expect("LSUB");
+    assert!(!subscribed.is_empty(), "LSUB misses the subscribed {name}");
+    client.unsubscribe(mailbox(name)).expect("UNSUBSCRIBE");
+
+    let items = [StatusDataItemName::Messages, StatusDataItemName::UidNext];
+    let status = client
+        .status(mailbox(name), items.to_vec().into())
+        .expect("STATUS");
+    assert!(!status.is_empty(), "STATUS returned no item");
+
+    // --- APPEND, buffered and streamed ---
+
+    let opts = ImapMessageAppendOptions {
+        flags: vec![Flag::Seen],
+        ..Default::default()
+    };
+    client
+        .append(mailbox(name), &build_message("buffered"), opts.clone())
+        .expect("APPEND");
+
+    let message = build_message("streamed");
+    client
+        .append_stream(mailbox(name), message.as_slice(), message.len(), opts)
+        .expect("APPEND (stream)");
+
+    // --- watch (IDLE) on a second connection sees a third APPEND ---
+
+    let (watcher, _) = connect(url, sasl);
+    let watch_opts = ImapMailboxWatchStreamOptions {
+        shutdown_poll: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let watch = watcher
+        .watch_mailbox(mailbox(name), capabilities, watch_opts)
+        .expect("watch mailbox");
+
+    // NOTE: give the watcher time to select and enter IDLE, so the
+    // APPEND below arrives as an unsolicited EXISTS.
+    thread::sleep(Duration::from_secs(3));
+
+    client
+        .append(mailbox(name), &build_message("watched"), Default::default())
+        .expect("APPEND (watched)");
+
+    let event = watch
+        .recv_timeout(Duration::from_secs(30))
+        .expect("watch event before the deadline")
+        .expect("watch event");
+    assert!(
+        matches!(event, ImapMailboxWatchEvent::EnvelopeAdded { .. }),
+        "unexpected watch event {event:?}"
+    );
+    watch.close().expect("close watch");
+
+    // --- EXAMINE, UNSELECT, SELECT, CHECK ---
+
+    let examined = client
+        .examine(mailbox(name), Default::default())
+        .expect("EXAMINE");
+    assert_eq!(examined.exists, Some(3), "EXAMINE count mismatch");
+
+    if has(Capability::Unselect) {
+        client.unselect().expect("UNSELECT");
+    }
+
+    client
+        .select(mailbox(name), Default::default())
+        .expect("SELECT");
+    client.check().expect("CHECK");
+
+    // --- SEARCH, FETCH, streamed FETCHes, SORT, THREAD ---
+
+    let uid = ImapMessageSearchOptions { uid: true };
+    let all = || Vec1::from(SearchKey::All);
+    let uids = client.search(all(), uid.clone()).expect("UID SEARCH");
+    assert_eq!(uids.len(), 3, "UID SEARCH count mismatch");
+    let every = SequenceSet::try_from(uids.as_slice()).unwrap();
+
+    let envelope =
+        MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::Envelope]);
+    let fetch_opts = ImapMessageFetchOptions {
+        uid: true,
+        ..Default::default()
+    };
+    let fetched = client
+        .fetch(every.clone(), envelope, fetch_opts)
+        .expect("UID FETCH");
+    assert_eq!(fetched.len(), 3, "UID FETCH count mismatch");
+
+    let mut body = Vec::new();
+    client
+        .fetch_body_stream(uids[0], true, &mut body)
+        .expect("FETCH body (stream)");
+    assert!(
+        body.windows(SUBJECT.len()).any(|window| window == SUBJECT),
+        "streamed body missing the subject"
+    );
+
+    let mut bodies = 0;
+    client
+        .fetch_bodies_stream(
+            every.clone(),
+            true,
+            |_| Ok(Vec::new()),
+            |_, body| {
+                assert!(!body.is_empty(), "streamed batch body is empty");
+                bodies += 1;
+                Ok(())
+            },
+        )
+        .expect("FETCH bodies (stream)");
+    assert_eq!(bodies, 3, "streamed batch count mismatch");
+
+    let by_date = Vec1::from(SortCriterion {
+        reverse: true,
+        key: SortKey::Date,
+    });
+    let sort_opts = ImapMessageSortOptions {
+        uid: true,
+        fallback: !capabilities
+            .iter()
+            .any(|capability| matches!(capability, Capability::Sort(_))),
+    };
+    let sorted = client.sort(by_date, all(), sort_opts).expect("SORT");
+    assert_eq!(sorted.len(), 3, "SORT count mismatch");
+
+    if capabilities
+        .iter()
+        .any(|capability| matches!(capability, Capability::Thread(_)))
+    {
+        let thread_opts = ImapMessageThreadOptions { uid: true };
+        client
+            .thread(ThreadingAlgorithm::OrderedSubject, all(), thread_opts)
+            .expect("THREAD");
+    }
+
+    // --- STORE, COPY, MOVE, EXPUNGE ---
+
+    let store_opts = ImapMessageStoreOptions { uid: true };
+    client
+        .store(
+            every.clone(),
+            StoreType::Add,
+            vec![Flag::Flagged],
+            store_opts.clone(),
+        )
+        .expect("UID STORE");
+
+    // NOTE: the FETCH echo of a STORE is only a SHOULD (RFC 3501 section
+    // 6.4.6), and Gmail skips it at times, so the flags are read back.
+    let flagged = client
+        .search(Vec1::from(SearchKey::Flagged), uid.clone())
+        .expect("UID SEARCH FLAGGED");
+    assert_eq!(flagged.len(), 3, "UID STORE did not flag every message");
+
+    let first = SequenceSet::from(uids[0]);
+    let second = SequenceSet::from(uids[1]);
+    let third = SequenceSet::from(uids[2]);
+
+    client
+        .copy(first, mailbox(copied), ImapMessageCopyOptions { uid: true })
+        .expect("UID COPY");
+
+    if has(Capability::Move) {
+        client
+            .r#move(
+                second,
+                mailbox(copied),
+                ImapMessageMoveOptions { uid: true },
+            )
+            .expect("UID MOVE");
+    }
+
+    client
+        .store(
+            third.clone(),
+            StoreType::Add,
+            vec![Flag::Deleted],
+            store_opts.clone(),
+        )
+        .expect("UID STORE \\Deleted");
+
+    if has(Capability::UidPlus) {
+        client.uid_expunge(third).expect("UID EXPUNGE");
+    }
+
+    client.expunge().expect("EXPUNGE");
+    client.close().expect("CLOSE");
+}
+
+/// Opens a session on `url`, authenticated with `sasl`.
+fn connect(url: &Url, sasl: &Sasl) -> (ImapClientStd, Vec<Capability<'static>>) {
+    let opts = ImapClientStdConnectOptions {
+        sasl: Some(sasl.clone()),
+        ..Default::default()
+    };
+
+    ImapClientStd::connect(url, opts).expect("connect")
+}
+
+/// Empties and deletes the mailbox `name`, best effort.
+///
+/// A provider mapping mailboxes to labels (Gmail) keeps the messages of
+/// a deleted mailbox, so they are moved to the `\Trash` special-use
+/// mailbox (RFC 6154) when there is one, and expunged from there.
+fn purge(client: &mut ImapClientStd, name: &str, trash: Option<&Mailbox<'static>>) {
+    if client.select(mailbox(name), Default::default()).is_err() {
+        return;
+    }
+
+    let uid = ImapMessageSearchOptions { uid: true };
+    let uids = client
+        .search(Vec1::from(SearchKey::All), uid)
+        .unwrap_or_default();
+
+    if let Ok(set) = SequenceSet::try_from(uids.as_slice()) {
+        let moved = trash.and_then(|trash| {
+            let opts = ImapMessageMoveOptions { uid: true };
+            client.r#move(set.clone(), trash.clone(), opts).ok()
+        });
+
+        match (trash, moved) {
+            (Some(trash), Some(Some((_, _, trashed)))) => {
+                let _ = client.select(trash.clone(), Default::default());
+                expunge(client, &trashed);
+            }
+            _ => {
+                let uids: Vec<u32> = uids.iter().map(|uid| uid.get()).collect();
+                expunge(client, &uids);
+            }
+        }
+    }
+
+    let _ = client.close();
+
+    if let Err(err) = client.delete(mailbox(name)) {
+        eprintln!("WARNING: could not delete mailbox {name}, remove it by hand: {err}");
+    }
+}
+
+/// Flags the given UIDs of the selected mailbox `\Deleted` and expunges
+/// them, best effort.
+fn expunge(client: &mut ImapClientStd, uids: &[u32]) {
+    let Ok(set) = SequenceSet::try_from(uids) else {
+        return;
+    };
+
+    let opts = ImapMessageStoreOptions { uid: true };
+    let _ = client.store(set, StoreType::Add, vec![Flag::Deleted], opts);
+    let _ = client.expunge();
+}
+
+/// Builds a small message carrying [`SUBJECT`].
+fn build_message(part: &str) -> Vec<u8> {
+    format!(
+        "Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
+         From: io-imap <test@pimalaya.org>\r\n\
+         To: io-imap <test@pimalaya.org>\r\n\
+         Subject: io-imap integration test ({part})\r\n\
+         \r\n\
+         Hello from the io-imap integration test.\r\n"
+    )
+    .into_bytes()
+}
+
+/// Parses `name` as a mailbox.
+fn mailbox(name: &str) -> Mailbox<'static> {
+    Mailbox::try_from(name.to_owned()).expect("valid mailbox name")
+}
+
+/// A suffix unique to one run, dating a leftover an aborted run left
+/// behind.
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+/// Runs `body`, then `cleanup` whichever way `body` went, and only then
+/// re-raises a panic `body` may have raised.
+///
+/// These flows run against real accounts, and every step panics on
+/// failure: a cleanup written as the last statements of a flow would be
+/// skipped the moment anything goes wrong. `cleanup` is caught too, so
+/// a teardown that cannot reach the server reports it and never
+/// replaces the failure the run was reporting.
+fn with_cleanup<T, B, C>(state: &mut T, body: B, cleanup: C)
+where
+    B: FnOnce(&mut T),
+    C: FnOnce(&mut T),
+{
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(state)));
+
+    if panic::catch_unwind(AssertUnwindSafe(|| cleanup(state))).is_err() {
+        eprintln!("WARNING: cleanup itself failed, the account may hold leftovers");
+    }
+
+    if let Err(payload) = outcome {
+        panic::resume_unwind(payload);
     }
 }
