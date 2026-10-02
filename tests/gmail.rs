@@ -26,12 +26,19 @@
 //! `IMAP_GOOGLE_SERVICE_ACCOUNT_KEY`, since it comes straight out of a
 //! secret. The subject defaults to `google@pimalaya.org`, the Pimalaya
 //! test user.
+//!
+//! [`oauth_xoauth2_rejected`] needs no credentials: it sends a bogus
+//! token on purpose.
 
 mod common;
 
 use std::{borrow::Cow, env, fs, time::Duration};
 
-use io_imap::client::{ImapClient, ImapClientStd, ImapClientStdConnectOptions};
+use io_imap::{
+    client::{ImapClient, ImapClientError, ImapClientStd, ImapClientStdConnectOptions},
+    sasl::auth_xoauth2::ImapAuthXoauth2Error,
+    session::ImapSessionOpenError,
+};
 use io_oauth::{
     client::Oauth20ClientStd,
     rfc7523::{
@@ -74,6 +81,45 @@ fn oauth_xoauth2() {
     };
 
     run_client("imaps://imap.gmail.com", Sasl::Xoauth2(creds));
+}
+
+/// Rejection test against the Gmail IMAP service, with a bogus SASL
+/// `XOAUTH2` token.
+///
+/// Gmail answers a refused token with a challenge carrying a JSON
+/// error, waits for the empty response, then ends the exchange with a
+/// tagged NO. Exchange Online refuses outright, so only Gmail takes the
+/// client down that branch. The address is made up, so no real account
+/// records a failed sign-in.
+#[test]
+#[ignore = "requires network access and --ignored"]
+fn oauth_xoauth2_rejected() {
+    let _ = env_logger::try_init();
+
+    let creds = SaslXoauth2Creds {
+        username: String::from("io-xoauth2-test-nobody@pimalaya.org"),
+        token: String::from("io-imap-test-not-a-token").into(),
+    };
+    let opts = ImapClientStdConnectOptions {
+        sasl: Some(Sasl::Xoauth2(creds)),
+        ..Default::default()
+    };
+
+    let url = Url::parse("imaps://imap.gmail.com").unwrap();
+
+    let err = match ImapClientStd::connect(&url, opts) {
+        Ok(_) => panic!("Gmail accepted a bogus XOAUTH2 token"),
+        Err(err) => err,
+    };
+
+    let ImapClientError::SessionOpen(ImapSessionOpenError::AuthXoauth2(
+        ImapAuthXoauth2Error::NoWithError { err, .. },
+    )) = err
+    else {
+        panic!("expected a NO carrying the challenge JSON, got {err:?}");
+    };
+
+    assert!(err.contains(r#""status":"400""#), "{err}");
 }
 
 /// Session test against the Gmail IMAP service, authenticated with SASL
