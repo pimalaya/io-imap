@@ -543,9 +543,12 @@ fn client_body(
         flags: vec![Flag::Seen],
         ..Default::default()
     };
-    client
+    let (_, appenduid) = client
         .append(mailbox(name), &build_message("buffered"), opts.clone())
         .expect("APPEND");
+    if has(Capability::UidPlus) {
+        assert!(appenduid.is_some(), "UIDPLUS advertised, no APPENDUID");
+    }
 
     let message = build_message("streamed");
     client
