@@ -118,7 +118,10 @@ fn token() -> String {
         return token;
     }
 
-    if let Ok(key) = env::var("IMAP_GOOGLE_SERVICE_ACCOUNT_KEY") {
+    if let Some(key) = env::var("IMAP_GOOGLE_SERVICE_ACCOUNT_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
         return mint_token(&key);
     }
 

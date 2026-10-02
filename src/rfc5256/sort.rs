@@ -371,10 +371,10 @@ fn fetch_items(
             SortKey::DisplayFrom | SortKey::DisplayTo => None,
         };
 
-        if let Some(item) = item {
-            if !items.contains(&item) {
-                items.push(item);
-            }
+        if let Some(item) = item
+            && !items.contains(&item)
+        {
+            items.push(item);
         }
     }
 
