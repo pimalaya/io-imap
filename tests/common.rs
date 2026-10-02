@@ -28,13 +28,13 @@ use io_imap::{
     coroutine::*,
     rfc2971::id::*,
     rfc3501::{
-        append::*, copy::*, fetch::*, fetch_stream::*, greeting::*, login::*, logout::*, search::*,
-        select::*, store::*,
+        append::*, copy::*, expunge::*, fetch::*, fetch_stream::*, greeting::*, login::*,
+        logout::*, search::*, select::*, store::*,
     },
     rfc5256::{sort::*, thread::*},
     rfc6851::r#move::*,
     types::{
-        core::Vec1,
+        core::{AString, Vec1},
         extensions::{
             enable::CapabilityEnable,
             sort::{SortCriterion, SortKey},
@@ -169,18 +169,25 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     // NOTE: append step.
 
-    let message = b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
-        From: io-imap <test@pimalaya.org>\r\n\
-        To: io-imap <test@pimalaya.org>\r\n\
-        Subject: io-imap integration test\r\n\
-        \r\n\
-        Hello from the io-imap integration test.\r\n";
+    // NOTE: a unique Message-ID keeps runs apart: Fastmail refuses
+    // APPEND once a mailbox holds too many identical messages.
+    let message = format!(
+        "Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
+         Message-ID: <io-imap-{}@pimalaya.org>\r\n\
+         From: io-imap <test@pimalaya.org>\r\n\
+         To: io-imap <test@pimalaya.org>\r\n\
+         Subject: io-imap integration test\r\n\
+         \r\n\
+         Hello from the io-imap integration test.\r\n",
+        unique_suffix(),
+    );
 
     let opts = ImapMessageAppendOptions {
         flags: vec![Flag::Seen],
         ..Default::default()
     };
-    let mut coroutine = ImapMessageAppend::new("INBOX".try_into().unwrap(), message.to_vec(), opts);
+    let mut coroutine =
+        ImapMessageAppend::new("INBOX".try_into().unwrap(), message.into_bytes(), opts);
     let mut arg: Option<&[u8]> = None;
 
     let (exists, appenduid) = loop {
@@ -322,6 +329,73 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         }
     };
     assert!(!ids.is_empty(), "SORT returned no ids after APPEND");
+
+    // NOTE: cleanup step. Sweeps every copy by subject, so leftovers of
+    // aborted runs go too.
+
+    let criteria = Vec1::from(SearchKey::Subject(
+        AString::try_from("io-imap integration test").unwrap(),
+    ));
+    let mut coroutine = ImapMessageSearch::new(criteria, ImapMessageSearchOptions { uid: true });
+    let mut arg: Option<&[u8]> = None;
+
+    let uids = loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Complete(Ok(uids)) => break uids,
+            ImapCoroutineState::Complete(Err(err)) => panic!("UID SEARCH: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                let n = stream.read(&mut buf).expect("search read");
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                stream.write_all(&bytes).expect("search write");
+                arg = None;
+            }
+        }
+    };
+
+    let set =
+        SequenceSet::try_from(uids.as_slice()).expect("UID SEARCH found the appended message");
+    let mut coroutine = ImapMessageStoreSilent::new(
+        set,
+        StoreType::Add,
+        vec![Flag::Deleted],
+        ImapMessageStoreOptions { uid: true },
+    );
+    let mut arg: Option<&[u8]> = None;
+
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Complete(Ok(())) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("UID STORE \\Deleted: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                let n = stream.read(&mut buf).expect("store read");
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                stream.write_all(&bytes).expect("store write");
+                arg = None;
+            }
+        }
+    }
+
+    let mut coroutine = ImapMailboxExpunge::new();
+    let mut arg: Option<&[u8]> = None;
+
+    loop {
+        match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Complete(Ok(_)) => break,
+            ImapCoroutineState::Complete(Err(err)) => panic!("EXPUNGE: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                let n = stream.read(&mut buf).expect("expunge read");
+                arg = Some(&buf[..n]);
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
+                stream.write_all(&bytes).expect("expunge write");
+                arg = None;
+            }
+        }
+    }
 
     // NOTE: logout step.
 
