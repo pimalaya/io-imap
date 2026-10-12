@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`, whose `max_literal_len` (100 MiB by default) and per-UID `sizes` bound the bodies a server may announce, failing with the new `LiteralTooLong` error.
+
+### Changed
+
+- **BREAKING**: `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch::new` takes `(sequence_set, opts)`, the `uid` flag moving into `ImapMessageFetchStreamBatchOptions`.
+
+### Fixed
+
+- Fixed `rfc3501::greeting::ImapGreetingGet` panicking on a greeting carrying a literal, which anyone on the path of a plaintext connection could send. It now fails with `DecodingFailure` on the literal announcement.
+
+- Fixed the batched and single FETCH body streams and `rfc3501::starttls::ImapStartTls` buffering an endless response line without bound and rescanning it on every read. Lines are scanned incrementally and capped (1 MiB, 64 KiB before STARTTLS), failing with the new `LineTooLong` errors.
+
+- Fixed LOGIN, AUTHENTICATE and raw commands logging their arguments at trace level, which leaked passwords and SASL initial responses in debug builds. Authentication commands now log only their tag and name, raw batches only their command count.
+
 ## [0.7.1] - 2026-10-01
 
 ### Fixed

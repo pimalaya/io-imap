@@ -127,7 +127,8 @@ impl ImapLogin {
             tag: TagGenerator::new().generate(),
             body: CommandBody::Login { username, password },
         };
-        trace!("send IMAP command {cmd:?}");
+        // NOTE: never log arguments, they carry credentials.
+        trace!("send IMAP command {} {}", cmd.tag.as_ref(), cmd.body.name());
         let send = ImapSend::new(CommandCodec::new(), cmd);
 
         Ok(Self {

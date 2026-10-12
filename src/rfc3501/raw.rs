@@ -155,11 +155,8 @@ impl ImapRaw {
             return Err(ImapRawError::NoCommand);
         }
 
-        trace!(
-            "build raw batch ({} command(s)): {}",
-            pending.len(),
-            escape_byte_string(&command),
-        );
+        // NOTE: never log the bytes, a raw LOGIN carries credentials.
+        trace!("build raw batch ({} command(s))", pending.len());
 
         Ok(Self {
             command,

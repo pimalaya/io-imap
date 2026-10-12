@@ -1017,7 +1017,11 @@ impl ImapClientStd {
         mut open: impl FnMut(u32) -> io::Result<S>,
         mut done: impl FnMut(u32, S) -> io::Result<()>,
     ) -> Result<(), ImapClientError> {
-        let mut coroutine = ImapMessageFetchStreamBatch::new(sequence_set, uid);
+        let opts = ImapMessageFetchStreamBatchOptions {
+            uid,
+            ..Default::default()
+        };
+        let mut coroutine = ImapMessageFetchStreamBatch::new(sequence_set, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         // The sink of the message currently streaming, opened at MessageStart and

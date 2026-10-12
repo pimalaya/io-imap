@@ -113,6 +113,9 @@ pub enum ImapMessageFetchStreamError {
     /// only plain lines are expected.
     #[error("IMAP FETCH failed: unexpected literal in response trailer")]
     UnexpectedLiteral,
+    /// A response line ran past the given number of octets.
+    #[error("IMAP FETCH failed: response line longer than {0} octets")]
+    LineTooLong(usize),
 }
 
 /// Yield variants from the FETCH body-stream coroutine.
@@ -133,11 +136,15 @@ pub enum ImapMessageFetchStreamYield {
     },
 }
 
+/// Longest response line accepted around the body, in octets.
+const MAX_LINE_LEN: usize = 1024 * 1024;
+
 /// I/O-free IMAP FETCH coroutine streaming one message body.
 pub struct ImapMessageFetchStream {
     state: State,
     command: Option<Vec<u8>>,
     pending: Vec<u8>,
+    scanned: usize,
     remaining: u32,
     stream_pending: bool,
     codec: ResponseCodec,
@@ -171,6 +178,7 @@ impl ImapMessageFetchStream {
             state: State::SendCommand,
             command: Some(command),
             pending: Vec::new(),
+            scanned: 0,
             remaining: 0,
             stream_pending: false,
             codec: ResponseCodec::new(),
@@ -207,13 +215,15 @@ impl ImapCoroutine for ImapMessageFetchStream {
                     }
 
                     loop {
-                        let Some(nl) = self.pending.iter().position(|&b| b == b'\n') else {
-                            return ImapCoroutineState::Yielded(
-                                ImapMessageFetchStreamYield::WantsRead,
-                            );
+                        let line = match self.next_line() {
+                            Ok(Some(line)) => line,
+                            Ok(None) => {
+                                return ImapCoroutineState::Yielded(
+                                    ImapMessageFetchStreamYield::WantsRead,
+                                );
+                            }
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
                         };
-
-                        let line: Vec<u8> = self.pending.drain(..=nl).collect();
                         fragmentizer.enqueue_bytes(&line);
 
                         match fragmentizer.progress() {
@@ -286,13 +296,15 @@ impl ImapCoroutine for ImapMessageFetchStream {
                     }
 
                     loop {
-                        let Some(nl) = self.pending.iter().position(|&b| b == b'\n') else {
-                            return ImapCoroutineState::Yielded(
-                                ImapMessageFetchStreamYield::WantsRead,
-                            );
+                        let line = match self.next_line() {
+                            Ok(Some(line)) => line,
+                            Ok(None) => {
+                                return ImapCoroutineState::Yielded(
+                                    ImapMessageFetchStreamYield::WantsRead,
+                                );
+                            }
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
                         };
-
-                        let line: Vec<u8> = self.pending.drain(..=nl).collect();
                         fragmentizer.enqueue_bytes(&line);
 
                         match fragmentizer.progress() {
@@ -323,6 +335,34 @@ impl ImapCoroutine for ImapMessageFetchStream {
 }
 
 impl ImapMessageFetchStream {
+    /// Takes the next complete line off the pending octets, `None` when
+    /// more must be read.
+    ///
+    /// Only the octets not yet scanned are searched, and a line is capped,
+    /// so an endless line costs neither quadratic time nor unbounded memory.
+    fn next_line(&mut self) -> Result<Option<Vec<u8>>, ImapMessageFetchStreamError> {
+        let unscanned = &self.pending[self.scanned..];
+
+        let Some(pos) = unscanned.iter().position(|&b| b == b'\n') else {
+            self.scanned = self.pending.len();
+
+            if self.scanned > MAX_LINE_LEN {
+                return Err(ImapMessageFetchStreamError::LineTooLong(MAX_LINE_LEN));
+            }
+
+            return Ok(None);
+        };
+
+        let nl = self.scanned + pos;
+        self.scanned = 0;
+
+        if nl >= MAX_LINE_LEN {
+            return Err(ImapMessageFetchStreamError::LineTooLong(MAX_LINE_LEN));
+        }
+
+        Ok(Some(self.pending.drain(..=nl).collect()))
+    }
+
     /// Decodes the completed message in `fragmentizer`.
     ///
     /// Returns `Some` for a terminal tagged status or BYE; `None` for
@@ -496,6 +536,47 @@ mod tests {
         // NOTE: socket EOF mid-body: the caller signals a short read.
         let err = expect_complete_err(&mut cor, &mut frag, Some(&[]));
         assert!(matches!(err, ImapMessageFetchStreamError::ShortBody));
+    }
+
+    #[test]
+    fn endless_line_fails_past_the_cap() {
+        let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let chunk = [b'x'; 64 * 1024];
+
+        let _ = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_read(&mut cor, &mut frag, None);
+
+        for _ in 0..MAX_LINE_LEN / chunk.len() {
+            expect_wants_read(&mut cor, &mut frag, Some(&chunk));
+        }
+
+        let err = expect_complete_err(&mut cor, &mut frag, Some(&chunk));
+        assert!(matches!(
+            err,
+            ImapMessageFetchStreamError::LineTooLong(MAX_LINE_LEN)
+        ));
+    }
+
+    #[test]
+    fn line_split_across_reads_is_found() {
+        let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        let tag = first_word(str::from_utf8(&cmd).expect("utf8 command")).to_owned();
+
+        expect_wants_read(&mut cor, &mut frag, None);
+        expect_wants_read(&mut cor, &mut frag, Some(b"* 1 FETCH (BO"));
+
+        let chunk = expect_body_chunk(&mut cor, &mut frag, Some(b"DY[] {2}\r\nhi"));
+        assert_eq!(chunk, b"hi");
+
+        expect_wants_read(&mut cor, &mut frag, None);
+        expect_wants_read(&mut cor, &mut frag, Some(b")\r\n"));
+
+        let reply = format!("{tag} OK done\r\n");
+        expect_complete_ok(&mut cor, &mut frag, Some(reply.as_bytes()));
     }
 
     fn expect_wants_write(

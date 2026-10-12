@@ -160,6 +160,18 @@ impl ImapCoroutine for ImapGreetingGet {
                     }
                 },
                 State::Deserialize => match fragmentizer.progress() {
+                    // NOTE: greetings never carry literals, and a greeting
+                    // may come in plaintext from anyone on the path: fail
+                    // on the announcement rather than wait for its octets.
+                    Some(FragmentInfo::Line {
+                        announcement: Some(_),
+                        ..
+                    })
+                    | Some(FragmentInfo::Literal { .. }) => {
+                        let bytes = Secret::new(fragmentizer.message_bytes().into());
+                        let err = ImapGreetingGetError::DecodingFailure(bytes);
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
                     Some(info @ FragmentInfo::Line { .. }) => {
                         let bytes = fragmentizer.fragment_bytes(info);
                         trace!("read greeting line: {}", escape_byte_string(bytes));
@@ -210,8 +222,6 @@ impl ImapCoroutine for ImapGreetingGet {
                             }
                         }
                     }
-                    // NOTE: greetings never carry literals.
-                    Some(FragmentInfo::Literal { .. }) => unreachable!(),
                     None => {
                         self.state = State::Read;
                     }
@@ -311,6 +321,28 @@ mod tests {
 
         let err = expect_complete_err(&mut greeting, &mut frag, b"");
         assert!(matches!(err, ImapGreetingGetError::Eof));
+    }
+
+    #[test]
+    fn literal_returns_decoding_failure() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let err = expect_complete_err(&mut greeting, &mut frag, b"* OK {3}\r\nabc\r\n");
+        assert!(matches!(err, ImapGreetingGetError::DecodingFailure(_)));
+    }
+
+    #[test]
+    fn literal_announcement_fails_before_its_octets() {
+        let mut greeting = ImapGreetingGet::new(ImapGreetingGetOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut greeting, &mut frag);
+
+        let err = expect_complete_err(&mut greeting, &mut frag, b"* OK {4294967295}\r\n");
+        assert!(matches!(err, ImapGreetingGetError::DecodingFailure(_)));
     }
 
     fn expect_wants_read(cor: &mut ImapGreetingGet, frag: &mut Fragmentizer) {

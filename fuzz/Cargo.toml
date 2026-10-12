@@ -1,0 +1,33 @@
+[package]
+name = "io-imap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+io-imap = { path = "..", default-features = false }
+libfuzzer-sys = "0.4"
+
+# imap-codec 2.0.0-alpha.9 needs the alloc feature of nom without asking
+# for it, which abnf-core 0.6.1 no longer pulls in.
+nom = { version = "7", default-features = false, features = ["alloc"] }
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_batch"
+path = "fuzz_targets/stream_batch.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent package so `cargo fuzz` builds this crate standalone.
+[workspace]

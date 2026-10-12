@@ -20,9 +20,9 @@
 //! fails with [`UidMissing`](ImapMessageFetchStreamBatchError::UidMissing) so the
 //! caller can fall back to per-message fetches rather than misroute a body.
 
-use core::{fmt, num::NonZeroU32};
+use core::fmt;
 
-use alloc::{string::String, string::ToString, vec, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, string::ToString, vec, vec::Vec};
 
 use imap_codec::{
     CommandCodec, ResponseCodec,
@@ -65,7 +65,51 @@ pub enum ImapMessageFetchStreamBatchError {
     /// fetches rather than risk misrouting.
     #[error("IMAP batched FETCH failed: FETCH body line without a parseable UID")]
     UidMissing,
+    /// A response line ran past the given number of octets.
+    #[error("IMAP batched FETCH failed: response line longer than {0} octets")]
+    LineTooLong(usize),
+    /// A body announced more octets than its declared size or the
+    /// [`max_literal_len`](ImapMessageFetchStreamBatchOptions::max_literal_len).
+    #[error("IMAP batched FETCH failed: body of UID {uid} announces {len} octets, over {max}")]
+    LiteralTooLong {
+        /// The UID of the message whose body is too long.
+        uid: u32,
+        /// The announced body length.
+        len: u32,
+        /// The largest length accepted for this body.
+        max: u32,
+    },
 }
+
+/// Options for [`ImapMessageFetchStreamBatch::new`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapMessageFetchStreamBatchOptions {
+    /// Sends `UID FETCH` instead of `FETCH`.
+    pub uid: bool,
+    /// Largest body accepted, in octets.
+    pub max_literal_len: u32,
+    /// Body sizes declared per UID, e.g. from `RFC822.SIZE`.
+    ///
+    /// A body announcing more octets than its declared size fails, so a
+    /// caller facing servers that miscount pads these sizes.
+    pub sizes: BTreeMap<u32, u32>,
+}
+
+impl Default for ImapMessageFetchStreamBatchOptions {
+    fn default() -> Self {
+        Self {
+            uid: false,
+            max_literal_len: DEFAULT_MAX_LITERAL_LEN,
+            sizes: BTreeMap::new(),
+        }
+    }
+}
+
+/// Default [`ImapMessageFetchStreamBatchOptions::max_literal_len`], in octets.
+pub const DEFAULT_MAX_LITERAL_LEN: u32 = 100 * 1024 * 1024;
+
+/// Longest response line accepted around the bodies, in octets.
+const MAX_LINE_LEN: usize = 1024 * 1024;
 
 /// Yield variants from the batched FETCH body-stream coroutine.
 #[derive(Debug)]
@@ -101,15 +145,18 @@ pub struct ImapMessageFetchStreamBatch {
     state: State,
     command: Option<Vec<u8>>,
     pending: Vec<u8>,
+    scanned: usize,
     remaining: u32,
     stream_pending: bool,
     codec: ResponseCodec,
+    max_literal_len: u32,
+    sizes: BTreeMap<u32, u32>,
 }
 
 impl ImapMessageFetchStreamBatch {
     /// Builds a coroutine streaming the `BODY.PEEK[]` of every message in
-    /// `sequence_set`; when `uid` is `true`, sends `UID FETCH`.
-    pub fn new(sequence_set: SequenceSet, uid: bool) -> Self {
+    /// `sequence_set`.
+    pub fn new(sequence_set: SequenceSet, opts: ImapMessageFetchStreamBatchOptions) -> Self {
         let command = Command {
             tag: TagGenerator::new().generate(),
             body: CommandBody::Fetch {
@@ -124,7 +171,7 @@ impl ImapMessageFetchStreamBatch {
                         peek: true,
                     },
                 ]),
-                uid,
+                uid: opts.uid,
                 modifiers: Vec::new(),
             },
         };
@@ -137,9 +184,12 @@ impl ImapMessageFetchStreamBatch {
             state: State::SendCommand,
             command: Some(command),
             pending: Vec::new(),
+            scanned: 0,
             remaining: 0,
             stream_pending: false,
             codec: ResponseCodec::new(),
+            max_literal_len: opts.max_literal_len,
+            sizes: opts.sizes,
         }
     }
 }
@@ -175,13 +225,15 @@ impl ImapCoroutine for ImapMessageFetchStreamBatch {
                     }
 
                     loop {
-                        let Some(nl) = self.pending.iter().position(|&b| b == b'\n') else {
-                            return ImapCoroutineState::Yielded(
-                                ImapMessageFetchStreamBatchYield::WantsRead,
-                            );
+                        let line = match self.next_line() {
+                            Ok(Some(line)) => line,
+                            Ok(None) => {
+                                return ImapCoroutineState::Yielded(
+                                    ImapMessageFetchStreamBatchYield::WantsRead,
+                                );
+                            }
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
                         };
-
-                        let line: Vec<u8> = self.pending.drain(..=nl).collect();
                         fragmentizer.enqueue_bytes(&line);
 
                         match fragmentizer.progress() {
@@ -196,6 +248,21 @@ impl ImapCoroutine for ImapMessageFetchStreamBatch {
                                         ImapMessageFetchStreamBatchError::UidMissing,
                                     ));
                                 };
+
+                                let max = match self.sizes.get(&uid) {
+                                    Some(&size) => size.min(self.max_literal_len),
+                                    None => self.max_literal_len,
+                                };
+
+                                if announcement.length > max {
+                                    let err = ImapMessageFetchStreamBatchError::LiteralTooLong {
+                                        uid,
+                                        len: announcement.length,
+                                        max,
+                                    };
+                                    return ImapCoroutineState::Complete(Err(err));
+                                }
+
                                 self.remaining = announcement.length;
                                 self.state = State::Stream;
                                 debug!("{}", self.state);
@@ -261,6 +328,34 @@ impl ImapCoroutine for ImapMessageFetchStreamBatch {
 }
 
 impl ImapMessageFetchStreamBatch {
+    /// Takes the next complete line off the pending octets, `None` when
+    /// more must be read.
+    ///
+    /// Only the octets not yet scanned are searched, and a line is capped,
+    /// so an endless line costs neither quadratic time nor unbounded memory.
+    fn next_line(&mut self) -> Result<Option<Vec<u8>>, ImapMessageFetchStreamBatchError> {
+        let unscanned = &self.pending[self.scanned..];
+
+        let Some(pos) = unscanned.iter().position(|&b| b == b'\n') else {
+            self.scanned = self.pending.len();
+
+            if self.scanned > MAX_LINE_LEN {
+                return Err(ImapMessageFetchStreamBatchError::LineTooLong(MAX_LINE_LEN));
+            }
+
+            return Ok(None);
+        };
+
+        let nl = self.scanned + pos;
+        self.scanned = 0;
+
+        if nl >= MAX_LINE_LEN {
+            return Err(ImapMessageFetchStreamBatchError::LineTooLong(MAX_LINE_LEN));
+        }
+
+        Ok(Some(self.pending.drain(..=nl).collect()))
+    }
+
     /// Decodes the completed line in `fragmentizer`. Returns `Some` for a terminal
     /// tagged status or BYE; `None` for undecodable or untagged lines to skip (the
     /// literal-closing `)`, stray untagged data).
@@ -320,13 +415,6 @@ fn parse_uid(line: &[u8]) -> Option<u32> {
     None
 }
 
-/// A convenience over [`ImapMessageFetchStreamBatch::new`] taking a single UID —
-/// unused by the batch driver but handy in tests.
-#[allow(dead_code)]
-fn single(uid: NonZeroU32) -> ImapMessageFetchStreamBatch {
-    ImapMessageFetchStreamBatch::new(SequenceSet::from(uid), true)
-}
-
 #[derive(Clone, Copy)]
 enum State {
     SendCommand,
@@ -356,7 +444,7 @@ mod tests {
     /// pairs. Panics on any error.
     fn run_ok(cmd_set: &str, reply_after_tag: impl Fn(&str) -> String) -> Vec<(u32, Vec<u8>)> {
         let set: SequenceSet = cmd_set.try_into().unwrap();
-        let mut cor = ImapMessageFetchStreamBatch::new(set, true);
+        let mut cor = ImapMessageFetchStreamBatch::new(set, uid_opts());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         // First resume writes the command; capture its tag.
@@ -421,7 +509,7 @@ mod tests {
     #[test]
     fn command_requests_uid_and_body_peek() {
         let set: SequenceSet = "1,2,3".try_into().unwrap();
-        let mut cor = ImapMessageFetchStreamBatch::new(set, true);
+        let mut cor = ImapMessageFetchStreamBatch::new(set, uid_opts());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
         let cmd = match cor.resume(&mut frag, None) {
             ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsWrite(b)) => b,
@@ -484,7 +572,7 @@ mod tests {
     #[test]
     fn tagged_no_is_an_error() {
         let set: SequenceSet = "1".try_into().unwrap();
-        let mut cor = ImapMessageFetchStreamBatch::new(set, true);
+        let mut cor = ImapMessageFetchStreamBatch::new(set, uid_opts());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
         let cmd = match cor.resume(&mut frag, None) {
             ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsWrite(b)) => b,
@@ -515,7 +603,7 @@ mod tests {
         // A body FETCH line whose UID we cannot parse must error (so the caller
         // falls back to per-message) rather than misroute the body.
         let set: SequenceSet = "1".try_into().unwrap();
-        let mut cor = ImapMessageFetchStreamBatch::new(set, true);
+        let mut cor = ImapMessageFetchStreamBatch::new(set, uid_opts());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
         let _ = cor.resume(&mut frag, None); // WantsWrite
         let _ = cor.resume(&mut frag, None); // WantsRead
@@ -536,5 +624,109 @@ mod tests {
         assert_eq!(parse_uid(b"* 1 FETCH (BODY[] {2}\r\n"), None);
         // A "UID"-like substring in a word must not match (word boundary).
         assert_eq!(parse_uid(b"* 1 FETCH (XUID 9 BODY[] {2}\r\n"), None);
+    }
+
+    #[test]
+    fn line_split_across_reads_is_found() {
+        let chunks: [&[u8]; 3] = [
+            b"* 1 FETCH (UID 10 BO",
+            b"DY[] {2}",
+            b"\r\nhi)\r\nA1 OK done\r\n",
+        ];
+        let bodies = run(uid_opts(), &chunks).unwrap();
+        assert_eq!(bodies, vec![(10, b"hi".to_vec())]);
+    }
+
+    #[test]
+    fn endless_line_fails_past_the_cap() {
+        let chunk = [b'x'; 64 * 1024];
+        let chunks = vec![&chunk[..]; MAX_LINE_LEN / chunk.len() + 2];
+        let err = run(uid_opts(), &chunks).unwrap_err();
+        assert!(matches!(
+            err,
+            ImapMessageFetchStreamBatchError::LineTooLong(MAX_LINE_LEN)
+        ));
+    }
+
+    #[test]
+    fn long_line_in_one_read_fails() {
+        let mut line = vec![b'x'; MAX_LINE_LEN + 1];
+        line.extend_from_slice(b"\r\n");
+        let err = run(uid_opts(), &[&line]).unwrap_err();
+        assert!(matches!(
+            err,
+            ImapMessageFetchStreamBatchError::LineTooLong(MAX_LINE_LEN)
+        ));
+    }
+
+    #[test]
+    fn literal_over_max_fails() {
+        let opts = ImapMessageFetchStreamBatchOptions {
+            max_literal_len: 4,
+            ..uid_opts()
+        };
+        let chunks: [&[u8]; 1] = [b"* 1 FETCH (UID 10 BODY[] {5}\r\nhello)\r\nA1 OK done\r\n"];
+        let err = run(opts, &chunks).unwrap_err();
+        let ImapMessageFetchStreamBatchError::LiteralTooLong { uid, len, max } = err else {
+            panic!("expected LiteralTooLong, got {err:?}");
+        };
+        assert_eq!((uid, len, max), (10, 5, 4));
+    }
+
+    #[test]
+    fn literal_over_declared_size_fails() {
+        let opts = ImapMessageFetchStreamBatchOptions {
+            sizes: BTreeMap::from([(10, 5), (11, 3)]),
+            ..uid_opts()
+        };
+        let chunks: [&[u8]; 1] = [b"* 1 FETCH (UID 10 BODY[] {5}\r\nhello)\r\n\
+              * 2 FETCH (UID 11 BODY[] {5}\r\nworld)\r\n\
+              A1 OK done\r\n"];
+        let err = run(opts, &chunks).unwrap_err();
+        let ImapMessageFetchStreamBatchError::LiteralTooLong { uid, len, max } = err else {
+            panic!("expected LiteralTooLong, got {err:?}");
+        };
+        assert_eq!((uid, len, max), (11, 5, 3));
+    }
+
+    fn uid_opts() -> ImapMessageFetchStreamBatchOptions {
+        ImapMessageFetchStreamBatchOptions {
+            uid: true,
+            ..Default::default()
+        }
+    }
+
+    /// Drives the coroutine over `chunks`, one per read, collecting
+    /// `(uid, body)` pairs.
+    fn run(
+        opts: ImapMessageFetchStreamBatchOptions,
+        chunks: &[&[u8]],
+    ) -> Result<Vec<(u32, Vec<u8>)>, ImapMessageFetchStreamBatchError> {
+        let set: SequenceSet = "1:*".try_into().unwrap();
+        let mut cor = ImapMessageFetchStreamBatch::new(set, opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let mut chunks = chunks.iter();
+        let mut out = Vec::new();
+        let mut arg: Option<&[u8]> = None;
+
+        loop {
+            match cor.resume(&mut frag, arg.take()) {
+                ImapCoroutineState::Complete(Ok(())) => return Ok(out),
+                ImapCoroutineState::Complete(Err(err)) => return Err(err),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsRead) => {
+                    arg = Some(chunks.next().copied().unwrap_or(&[]));
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::MessageStart {
+                    uid,
+                }) => out.push((uid, Vec::new())),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::BodyChunk(b)) => {
+                    out.last_mut().unwrap().1.extend_from_slice(&b);
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsStream {
+                    ..
+                }) => arg = Some(&[]),
+                ImapCoroutineState::Yielded(_) => {}
+            }
+        }
     }
 }

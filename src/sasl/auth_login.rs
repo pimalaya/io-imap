@@ -271,7 +271,8 @@ impl ImapCoroutine for ImapAuthLogin {
                         initial_response,
                     };
                     let cmd = Command { tag, body };
-                    trace!("send IMAP command {cmd:?}");
+                    // NOTE: never log arguments, they carry credentials.
+                    trace!("send IMAP command {} {}", cmd.tag.as_ref(), cmd.body.name());
 
                     self.state = State::Send {
                         send: ImapSend::new(CommandCodec::new(), cmd),
