@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed LOGIN, AUTHENTICATE and raw commands logging their arguments at trace level, which leaked passwords and SASL initial responses in debug builds. Authentication commands now log only their tag and name, raw batches only their command count.
 
+- Fixed `rfc3501::copy::ImapMessageCopy` and `rfc6851::r#move::ImapMessageMove` reporting no COPYUID when the server sends one with a UIDVALIDITY of `0`, such as Mailo's `OK [COPYUID 0 1582 22704]`, which RFC 4315 forbids and imap-codec leaves unparsed. That code is now read with its UID sets, the UIDVALIDITY returned as `0`; any other deviation from the grammar still gives no COPYUID ([pimalaya/himalaya#781](https://github.com/pimalaya/himalaya/issues/781)).
+
 ## [0.7.1] - 2026-10-01
 
 ### Fixed

@@ -54,7 +54,7 @@ use imap_codec::{
         command::{Command, CommandBody},
         core::TagGenerator,
         mailbox::Mailbox,
-        response::{Code, StatusKind, Tagged},
+        response::{StatusKind, Tagged},
         sequence::SequenceSet,
     },
 };
@@ -65,7 +65,7 @@ use crate::{
     coroutine::*,
     imap_try,
     rfc3501::{
-        copy::{ImapCopyUid, uid_set_to_vec},
+        copy::{ImapCopyUid, copyuid_from_code},
         mailbox::encode_inplace,
     },
     send::*,
@@ -180,23 +180,6 @@ impl ImapCoroutine for ImapMessageMove {
     }
 }
 
-/// Extracts the `(uid_validity, source, destination)` COPYUID triple
-/// from a response code, whether it rode the tagged or an untagged OK.
-fn copyuid_from_code(code: Option<Code<'static>>) -> ImapCopyUid {
-    match code {
-        Some(Code::CopyUid {
-            uid_validity,
-            source,
-            destination,
-        }) => Some((
-            uid_validity.get(),
-            uid_set_to_vec(source),
-            uid_set_to_vec(destination),
-        )),
-        _ => None,
-    }
-}
-
 enum State {
     Send(ImapSend<CommandCodec>),
 }
@@ -270,6 +253,47 @@ mod tests {
         assert_eq!(1700, uid_validity);
         assert_eq!(vec![1, 2, 3], source);
         assert_eq!(vec![10, 11, 12], destination);
+    }
+
+    #[test]
+    fn success_with_uidvalidity_zero_returns_uids() {
+        // NOTE: Mailo-style UIDVALIDITY 0 (pimalaya/himalaya#781), which
+        // the strict grammar rejects, in either placement.
+        for (reply, copyuid) in [
+            (
+                "* OK [COPYUID 0 1582 22704] Completed\r\n\
+                 * 1 EXPUNGE\r\n\
+                 {tag} OK UID MOVE done\r\n",
+                Some((0, vec![1582], vec![22704])),
+            ),
+            (
+                "* 1 EXPUNGE\r\n\
+                 {tag} OK [COPYUID 0 1582 22704] UID MOVE done\r\n",
+                Some((0, vec![1582], vec![22704])),
+            ),
+            (
+                "* OK [COPYUID 0 1582 *] Completed\r\n\
+                 * 1 EXPUNGE\r\n\
+                 {tag} OK UID MOVE done\r\n",
+                None,
+            ),
+        ] {
+            let mut mov = ImapMessageMove::new(
+                "1582".try_into().expect("valid sequence set"),
+                "Archive".try_into().expect("valid mailbox"),
+                ImapMessageMoveOptions { uid: true },
+            );
+            let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+            let bytes = expect_wants_write(&mut mov, &mut frag, None);
+            let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+            expect_wants_read(&mut mov, &mut frag);
+
+            let reply = reply.replace("{tag}", &tag);
+            let got = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes());
+            assert_eq!(copyuid, got, "{reply:?}");
+        }
     }
 
     #[test]
