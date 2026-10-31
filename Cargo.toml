@@ -73,6 +73,7 @@ tokio-rustls = "0.26"
 url = "2"
 
 [dependencies]
+pin-project-lite = "0.2"
 anyhow = { version = "1", optional = true }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }

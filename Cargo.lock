@@ -680,6 +680,7 @@ dependencies = [
  "log",
  "pbkdf2",
  "pimalaya-stream",
+ "pin-project-lite",
  "rand",
  "rustls",
  "rustls-platform-verifier",
