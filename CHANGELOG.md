@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed `rfc3501::copy::ImapMessageCopy` and `rfc6851::r#move::ImapMessageMove` reporting no COPYUID when the server sends one with a UIDVALIDITY of `0`, such as Mailo's `OK [COPYUID 0 1582 22704]`, which RFC 4315 forbids and imap-codec leaves unparsed. That code is now read with its UID sets, the UIDVALIDITY returned as `0`; any other deviation from the grammar still gives no COPYUID ([pimalaya/himalaya#781](https://github.com/pimalaya/himalaya/issues/781)).
 
+- Fixed `client::ImapClientAsync::login` failing to compile on rustc 1.88 to 1.91, the declared minimum included, with E0308 (one type is more general than the other). Its default body now boxes the future instead of awaiting in an async block.
+
 ## [0.7.1] - 2026-10-01
 
 ### Fixed

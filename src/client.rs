@@ -386,7 +386,14 @@ macro_rules! imap_client_commands {
                 opts: ImapLoginOptions,
             ) -> impl Future<Output = Result<Vec<Capability<'static>>, ImapClientError>> + Send
             {
-                async move { self.run(ImapLogin::new(user, password, opts)?).await }
+                // Boxed rather than an async block, which rustc before 1.92
+                // rejects with E0308 (one type is more general than the other).
+                let fut: core::pin::Pin<alloc::boxed::Box<dyn Future<Output = _> + Send + '_>> =
+                    match ImapLogin::new(user, password, opts) {
+                        Ok(login) => alloc::boxed::Box::pin(self.run(login)),
+                        Err(err) => alloc::boxed::Box::pin(core::future::ready(Err(err.into()))),
+                    };
+                fut
             }
 
             /// Sends one or more caller-tagged command lines
