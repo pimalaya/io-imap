@@ -246,33 +246,6 @@ pub enum ImapClientError {
     Transport(Box<dyn core::error::Error + Send + Sync>),
 }
 
-pin_project_lite::pin_project! {
-    #[project = ImapLoginFutureProj]
-    enum ImapLoginFuture<F> {
-        Fut { #[pin] fut: F },
-        Err { err: Option<ImapClientError> },
-    }
-}
-
-impl<F> Future for ImapLoginFuture<F>
-where
-    F: Future<Output = Result<Vec<Capability<'static>>, ImapClientError>>,
-{
-    type Output = Result<Vec<Capability<'static>>, ImapClientError>;
-
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        match self.project() {
-            ImapLoginFutureProj::Fut { fut } => fut.poll(cx),
-            ImapLoginFutureProj::Err { err } => {
-                core::task::Poll::Ready(Err(err.take().expect("polled after completion")))
-            }
-        }
-    }
-}
-
 /// Emits the [`ImapClient`] and [`ImapClientAsync`] command surfaces
 /// from a single list of delegations.
 ///
@@ -413,14 +386,14 @@ macro_rules! imap_client_commands {
                 opts: ImapLoginOptions,
             ) -> impl Future<Output = Result<Vec<Capability<'static>>, ImapClientError>> + Send
             {
-                match ImapLogin::new(user, password, opts) {
-                    Ok(login) => ImapLoginFuture::Fut {
-                        fut: self.run(login),
-                    },
-                    Err(err) => ImapLoginFuture::Err {
-                        err: Some(err.into()),
-                    },
-                }
+                // Boxed rather than an async block, which rustc before 1.92
+                // rejects with E0308 (one type is more general than the other).
+                let fut: core::pin::Pin<alloc::boxed::Box<dyn Future<Output = _> + Send + '_>> =
+                    match ImapLogin::new(user, password, opts) {
+                        Ok(login) => alloc::boxed::Box::pin(self.run(login)),
+                        Err(err) => alloc::boxed::Box::pin(core::future::ready(Err(err.into()))),
+                    };
+                fut
             }
 
             /// Sends one or more caller-tagged command lines
