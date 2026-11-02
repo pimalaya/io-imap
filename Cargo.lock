@@ -678,6 +678,7 @@ dependencies = [
  "io-oauth",
  "io-sasl",
  "log",
+ "nom",
  "pbkdf2",
  "pimalaya-stream",
  "rand",

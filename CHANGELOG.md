@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed the build against abnf-core 0.6.1, which no longer enables nom's default features: imap-codec 2.0.0-alpha.9 relies on nom's `alloc` parsers without requesting them, so io-imap now depends on nom with `alloc` itself, until an imap-codec release declares it.
+
 - Fixed `rfc3501::greeting::ImapGreetingGet` panicking on a greeting carrying a literal, which anyone on the path of a plaintext connection could send. It now fails with `DecodingFailure` on the literal announcement.
 
 - Fixed the batched and single FETCH body streams and `rfc3501::starttls::ImapStartTls` buffering an endless response line without bound and rescanning it on every read. Lines are scanned incrementally and capped (1 MiB, 64 KiB before STARTTLS), failing with the new `LineTooLong` errors.

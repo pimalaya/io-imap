@@ -77,6 +77,10 @@ anyhow = { version = "1", optional = true }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 imap-codec = { version = "2.0.0-alpha.8", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls", "tag_generator"] }
+# NOTE: imap-codec 2.0.0-alpha.9 uses nom's alloc parsers without asking for
+# the feature, which abnf-core 0.6.1 no longer turns on for it. Never imported,
+# this entry restores the feature until imap-codec releases its own fix.
+nom = { version = "7", default-features = false, features = ["alloc"] }
 io-sasl = { version = "0.1", default-features = false }
 log = "0.4"
 pimalaya-stream = { version = "0.3", default-features = false, optional = true }
