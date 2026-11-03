@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs = {
-      url = "github:nixos/nixpkgs/nixos-25.11";
+      url = "github:nixos/nixpkgs/nixos-26.05";
     };
     fenix = {
       url = "github:nix-community/fenix/monthly";
@@ -24,9 +24,6 @@
         shell = ./shell.nix;
       };
 
-      # The fuzz targets need a nightly toolchain and cargo-fuzz, which
-      # the standard shell does not carry. Exposing them as a second
-      # devShell keeps the nixpkgs and fenix pinned by this flake.
       fuzzShell = system: {
         fuzz = import ./fuzz/shell.nix {
           inherit (inputs) nixpkgs;

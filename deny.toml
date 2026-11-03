@@ -13,10 +13,7 @@ ignore = [
 ]
 
 [sources]
-allow-git = [
-  # "https://github.com/pimalaya/stream",
-  "https://github.com/soywod/imap-codec",
-]
+allow-org.github = ["pimalaya"]
 unknown-git = "deny"
 unknown-registry = "deny"
 
