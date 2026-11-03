@@ -11,7 +11,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     rfc2177::idle::{ImapIdle, ImapIdleOptions, ImapIdleYield},
 //! };
@@ -26,9 +26,15 @@
 //! let mut coroutine =
 //!     ImapIdle::new(shutdown.clone(), ImapIdleOptions::default());
 //! let mut arg = None;
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapIdleYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
+//!         }
 //!         ImapCoroutineState::Yielded(ImapIdleYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
 //!         }
@@ -61,8 +67,7 @@ use imap_codec::{
     fragmentizer::{DecodeMessageError, FragmentInfo, Fragmentizer},
     imap_types::{
         IntoStatic,
-        command::{Command, CommandBody},
-        core::TagGenerator,
+        command::CommandBody,
         extensions::idle::IdleDone,
         response::{Bye, Data, Response, Status, StatusBody, StatusKind, Tagged},
         secret::Secret,
@@ -130,6 +135,8 @@ pub struct ImapIdleEvent {
 /// Yield variants from the IDLE coroutine.
 #[derive(Debug)]
 pub enum ImapIdleYield {
+    /// The caller resumes with the tag of the next command.
+    WantsTag,
     /// The caller reads bytes from the stream and resumes with them.
     WantsRead,
     /// The caller writes the given bytes to the stream and resumes.
@@ -141,6 +148,7 @@ pub enum ImapIdleYield {
 impl From<ImapYield> for ImapIdleYield {
     fn from(y: ImapYield) -> Self {
         match y {
+            ImapYield::WantsTag => ImapIdleYield::WantsTag,
             ImapYield::WantsRead => ImapIdleYield::WantsRead,
             ImapYield::WantsWrite(bytes) => ImapIdleYield::WantsWrite(bytes),
         }
@@ -157,7 +165,6 @@ pub struct ImapIdleOptions {
 
 /// I/O-free IMAP IDLE coroutine yielding mailbox change events.
 pub struct ImapIdle {
-    tag: TagGenerator,
     state: State,
     wants_read: bool,
     codec: ResponseCodec,
@@ -178,19 +185,13 @@ impl ImapIdle {
     /// Flip `done` to `true` to wind down with a clean DONE; `opts`
     /// tunes the refresh interval.
     pub fn new(done: Arc<AtomicBool>, opts: ImapIdleOptions) -> Self {
-        let mut tag = TagGenerator::new();
+        let body = CommandBody::Idle;
 
-        let command = Command {
-            tag: tag.generate(),
-            body: CommandBody::Idle,
-        };
+        trace!("send IMAP command {body:?}");
 
-        trace!("send IMAP command {command:?}");
-
-        let state = State::Idle(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Idle(ImapSend::command(body));
 
         Self {
-            tag,
             state,
             wants_read: false,
             codec: ResponseCodec::new(),
@@ -385,11 +386,7 @@ impl ImapCoroutine for ImapIdle {
                     return match body.kind {
                         StatusKind::Ok if timed_out => {
                             trace!("reached timeout, starting a new IDLE command");
-                            let command = Command {
-                                tag: self.tag.generate(),
-                                body: CommandBody::Idle,
-                            };
-                            let send = ImapSend::new(CommandCodec::new(), command);
+                            let send = ImapSend::command(CommandBody::Idle);
                             self.state = State::Idle(send);
                             debug!("{}", self.state);
                             continue;
@@ -438,7 +435,8 @@ mod tests {
         let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_tag(&mut idle, &mut frag);
+        let bytes = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.trim_end().ends_with("IDLE"));
@@ -462,7 +460,8 @@ mod tests {
         let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
         expect_wants_read(&mut idle, &mut frag);
         expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
 
@@ -477,7 +476,8 @@ mod tests {
         let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
         expect_wants_read(&mut idle, &mut frag);
 
         let event = expect_event(&mut idle, &mut frag, b"+ idling\r\n* 10 EXISTS\r\n");
@@ -490,7 +490,8 @@ mod tests {
         let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_tag(&mut idle, &mut frag);
+        let bytes = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut idle, &mut frag);
@@ -509,7 +510,8 @@ mod tests {
         let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_tag(&mut idle, &mut frag);
+        let bytes = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut idle, &mut frag);
@@ -525,6 +527,13 @@ mod tests {
             panic!("expected ImapIdleError::No, got {err:?}");
         };
         assert_eq!(text, "IDLE aborted");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapIdle, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapIdleYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

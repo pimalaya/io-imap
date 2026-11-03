@@ -9,7 +9,10 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::{fragmentizer::Fragmentizer, imap_types::core::Vec1},
+//!     codec::{
+//!         fragmentizer::Fragmentizer,
+//!         imap_types::core::{TagGenerator, Vec1},
+//!     },
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc5161::enable::ImapExtensionEnable,
 //!     types::extensions::enable::CapabilityEnable,
@@ -24,12 +27,18 @@
 //! let capabilities =
 //!     Vec1::try_from(vec![CapabilityEnable::CondStore]).unwrap();
 //! let mut coroutine = ImapExtensionEnable::new(capabilities);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let enabled = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -51,8 +60,8 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::{TagGenerator, Vec1},
+        command::CommandBody,
+        core::Vec1,
         extensions::enable::CapabilityEnable,
         response::{Data, StatusKind, Tagged},
     },
@@ -91,14 +100,11 @@ impl ImapExtensionEnable {
     /// Creates a coroutine that ENABLEs the given capabilities and
     /// returns the server's ENABLED list.
     pub fn new(capabilities: Vec1<CapabilityEnable<'static>>) -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Enable { capabilities },
-        };
+        let body = CommandBody::Enable { capabilities };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -179,7 +185,8 @@ mod tests {
         let mut enable = ImapExtensionEnable::new(caps());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        expect_wants_tag(&mut enable, &mut frag);
+        let bytes = expect_wants_write(&mut enable, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("ENABLE CONDSTORE"));
@@ -197,7 +204,8 @@ mod tests {
         let mut enable = ImapExtensionEnable::new(caps());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        expect_wants_tag(&mut enable, &mut frag);
+        let bytes = expect_wants_write(&mut enable, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut enable, &mut frag);
@@ -212,7 +220,8 @@ mod tests {
         let mut enable = ImapExtensionEnable::new(caps());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut enable, &mut frag, None);
+        expect_wants_tag(&mut enable, &mut frag);
+        let bytes = expect_wants_write(&mut enable, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut enable, &mut frag);
@@ -230,7 +239,8 @@ mod tests {
         let mut enable = ImapExtensionEnable::new(caps());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut enable, &mut frag, None);
+        expect_wants_tag(&mut enable, &mut frag);
+        let _ = expect_wants_write(&mut enable, &mut frag, Some(b"A1"));
         expect_wants_read(&mut enable, &mut frag);
 
         let err = expect_complete_err(&mut enable, &mut frag, b"* BYE going down\r\n");
@@ -238,6 +248,13 @@ mod tests {
             panic!("expected ImapExtensionEnableError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapExtensionEnable, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

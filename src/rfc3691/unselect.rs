@@ -9,7 +9,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3691::unselect::ImapMailboxUnselect,
 //! };
@@ -21,12 +21,18 @@
 //! let mut buf = [0u8; 4096];
 //!
 //! let mut coroutine = ImapMailboxUnselect::new();
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -46,8 +52,7 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::TagGenerator,
+        command::CommandBody,
         response::{StatusKind, Tagged},
     },
 };
@@ -85,14 +90,11 @@ impl ImapMailboxUnselect {
     /// Creates a coroutine that UNSELECTs the current mailbox without
     /// expunging its \Deleted messages.
     pub fn new() -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Unselect,
-        };
+        let body = CommandBody::Unselect;
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -168,7 +170,8 @@ mod tests {
         let mut unselect = ImapMailboxUnselect::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut unselect, &mut frag, None);
+        expect_wants_tag(&mut unselect, &mut frag);
+        let bytes = expect_wants_write(&mut unselect, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.trim_end().ends_with("UNSELECT"));
@@ -184,7 +187,8 @@ mod tests {
         let mut unselect = ImapMailboxUnselect::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut unselect, &mut frag, None);
+        expect_wants_tag(&mut unselect, &mut frag);
+        let bytes = expect_wants_write(&mut unselect, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut unselect, &mut frag);
@@ -202,7 +206,8 @@ mod tests {
         let mut unselect = ImapMailboxUnselect::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut unselect, &mut frag, None);
+        expect_wants_tag(&mut unselect, &mut frag);
+        let bytes = expect_wants_write(&mut unselect, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut unselect, &mut frag);
@@ -220,7 +225,8 @@ mod tests {
         let mut unselect = ImapMailboxUnselect::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut unselect, &mut frag, None);
+        expect_wants_tag(&mut unselect, &mut frag);
+        let _ = expect_wants_write(&mut unselect, &mut frag, Some(b"A1"));
         expect_wants_read(&mut unselect, &mut frag);
 
         let err = expect_complete_err(&mut unselect, &mut frag, b"* BYE going down\r\n");
@@ -228,6 +234,13 @@ mod tests {
             panic!("expected ImapMailboxUnselectError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMailboxUnselect, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

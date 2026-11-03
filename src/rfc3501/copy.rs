@@ -9,7 +9,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::copy::{ImapMessageCopy, ImapMessageCopyOptions},
 //! };
@@ -24,12 +24,18 @@
 //! let mailbox = "Archive".try_into().unwrap();
 //! let opts = ImapMessageCopyOptions::default();
 //! let mut coroutine = ImapMessageCopy::new(sequence_set, mailbox, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let copyuid = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -51,8 +57,8 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::{TagGenerator, Vec1},
+        command::CommandBody,
+        core::Vec1,
         extensions::uidplus::{UidElement, UidSet},
         mailbox::Mailbox,
         response::{Code, StatusKind, Tagged},
@@ -112,18 +118,15 @@ impl ImapMessageCopy {
     ) -> Self {
         encode_inplace(&mut mailbox);
 
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Copy {
-                sequence_set,
-                mailbox,
-                uid: opts.uid,
-            },
+        let body = CommandBody::Copy {
+            sequence_set,
+            mailbox,
+            uid: opts.uid,
         };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -312,7 +315,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("COPY 1:3 Archive"));
@@ -337,7 +341,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut copy, &mut frag);
@@ -359,7 +364,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut copy, &mut frag);
@@ -420,7 +426,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         assert!(line.contains("UID COPY 42 Archive"));
     }
@@ -434,7 +441,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut copy, &mut frag);
@@ -453,7 +461,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let bytes = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut copy, &mut frag);
@@ -475,7 +484,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut copy, &mut frag, None);
+        expect_wants_tag(&mut copy, &mut frag);
+        let _ = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
         expect_wants_read(&mut copy, &mut frag);
 
         let err = expect_complete_err(&mut copy, &mut frag, b"* BYE going down\r\n");
@@ -483,6 +493,13 @@ mod tests {
             panic!("expected ImapMessageCopyError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMessageCopy, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

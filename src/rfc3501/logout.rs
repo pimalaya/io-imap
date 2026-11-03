@@ -9,7 +9,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::logout::ImapLogout,
 //! };
@@ -21,12 +21,18 @@
 //! let mut buf = [0u8; 4096];
 //!
 //! let mut coroutine = ImapLogout::new();
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -46,8 +52,7 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::TagGenerator,
+        command::CommandBody,
         response::{StatusKind, Tagged},
     },
 };
@@ -84,14 +89,11 @@ pub struct ImapLogout {
 impl ImapLogout {
     /// Builds a LOGOUT coroutine terminating the session.
     pub fn new() -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Logout,
-        };
+        let body = CommandBody::Logout;
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -165,7 +167,8 @@ mod tests {
         let mut logout = ImapLogout::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        expect_wants_tag(&mut logout, &mut frag);
+        let bytes = expect_wants_write(&mut logout, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.trim_end().ends_with("LOGOUT"));
@@ -181,7 +184,8 @@ mod tests {
         let mut logout = ImapLogout::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        expect_wants_tag(&mut logout, &mut frag);
+        let bytes = expect_wants_write(&mut logout, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut logout, &mut frag);
@@ -196,7 +200,8 @@ mod tests {
         let mut logout = ImapLogout::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut logout, &mut frag, None);
+        expect_wants_tag(&mut logout, &mut frag);
+        let bytes = expect_wants_write(&mut logout, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut logout, &mut frag);
@@ -207,6 +212,13 @@ mod tests {
             panic!("expected ImapLogoutError::Bad, got {err:?}");
         };
         assert_eq!(text, "LOGOUT not allowed");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapLogout, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

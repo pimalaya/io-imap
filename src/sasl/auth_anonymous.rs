@@ -20,7 +20,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     sasl::auth_anonymous::{ImapAuthAnonymous, ImapAuthAnonymousOptions},
 //! };
@@ -34,12 +34,18 @@
 //! let message = Some("trace@example.org");
 //! let opts = ImapAuthAnonymousOptions::default();
 //! let mut coroutine = ImapAuthAnonymous::new(message, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let capability = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -66,8 +72,8 @@ use imap_codec::{
     fragmentizer::Fragmentizer,
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
-        command::{Command, CommandBody},
-        core::{IString, NString, TagGenerator},
+        command::CommandBody,
+        core::{IString, NString},
         response::{
             Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
         },
@@ -237,7 +243,7 @@ impl ImapCoroutine for ImapAuthAnonymous {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
@@ -258,24 +264,22 @@ impl ImapCoroutine for ImapAuthAnonymous {
                         payload => (None, payload),
                     };
 
-                    let tag = TagGenerator::new().generate();
                     let body = CommandBody::Authenticate {
                         // SAFETY: ANONYMOUS is a valid mechanism name.
                         mechanism: AuthMechanism::try_from("ANONYMOUS").unwrap(),
                         initial_response,
                     };
-                    let cmd = Command { tag, body };
                     // NOTE: never log arguments, they carry credentials.
-                    trace!("send IMAP command {} {}", cmd.tag.as_ref(), cmd.body.name());
+                    trace!("send IMAP command {}", body.name());
 
                     self.state = State::Send {
-                        send: ImapSend::new(CommandCodec::new(), cmd),
+                        send: ImapSend::command(body),
                         pending,
                     };
                     debug!("{}", self.state);
                 }
                 State::Send { send, pending } => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                    let out = imap_try!(send, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
                         let err = ImapAuthAnonymousError::Bye(bye.text.to_string());
@@ -349,7 +353,7 @@ impl ImapCoroutine for ImapAuthAnonymous {
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
                 State::Continue(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                    let out = imap_try!(send, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
                         let err = ImapAuthAnonymousError::Bye(bye.text.to_string());
@@ -410,7 +414,7 @@ impl ImapCoroutine for ImapAuthAnonymous {
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
                 State::Capability(capability) => {
-                    self.observed = imap_try!(capability, fragmentizer, arg);
+                    self.observed = imap_try!(capability, fragmentizer, arg.take());
 
                     if let Some(next) = self.wants_id() {
                         self.state = next;
@@ -422,7 +426,7 @@ impl ImapCoroutine for ImapAuthAnonymous {
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
                 State::Id(id) => {
-                    imap_try!(id, fragmentizer, arg);
+                    imap_try!(id, fragmentizer, arg.take());
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
@@ -480,7 +484,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(Some("trace@example.org"), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
         assert!(line.contains("AUTHENTICATE ANONYMOUS "));
@@ -501,7 +506,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
 
         expect_wants_read(&mut auth, &mut frag);
@@ -524,7 +530,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
 
         expect_wants_read(&mut auth, &mut frag);
@@ -547,7 +554,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         expect_wants_read(&mut auth, &mut frag);
 
         // NOTE: a challenge, which ANONYMOUS has nothing left to answer once
@@ -565,7 +573,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(None::<&str>, opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line);
         assert!(line.trim_end().ends_with("AUTHENTICATE ANONYMOUS"));
@@ -587,7 +596,8 @@ mod tests {
         let mut auth = ImapAuthAnonymous::new(Some("trace@example.org"), opts);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut auth, &mut frag, None);
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command"));
 
         expect_wants_read(&mut auth, &mut frag);
@@ -600,6 +610,13 @@ mod tests {
             panic!("expected ImapAuthAnonymousError::No, got {err:?}");
         };
         assert_eq!(text, "anonymous access disabled");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapAuthAnonymous, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

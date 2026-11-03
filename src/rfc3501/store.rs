@@ -12,7 +12,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::store::{ImapMessageStore, ImapMessageStoreOptions},
 //!     types::flag::{Flag, StoreType},
@@ -29,12 +29,18 @@
 //! let flags = vec![Flag::Seen];
 //! let opts = ImapMessageStoreOptions::default();
 //! let mut coroutine = ImapMessageStore::new(sequence_set, kind, flags, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let updated = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -57,7 +63,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::store::{ImapMessageStoreOptions, ImapMessageStoreSilent},
 //!     types::flag::{Flag, StoreType},
@@ -75,12 +81,18 @@
 //! let opts = ImapMessageStoreOptions::default();
 //! let mut coroutine =
 //!     ImapMessageStoreSilent::new(sequence_set, kind, flags, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -100,8 +112,8 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::{TagGenerator, Vec1},
+        command::CommandBody,
+        core::Vec1,
         fetch::MessageDataItem,
         flag::{Flag, StoreResponse, StoreType},
         response::{Data, StatusKind, Tagged},
@@ -154,21 +166,18 @@ impl ImapMessageStore {
         flags: Vec<Flag<'static>>,
         opts: ImapMessageStoreOptions,
     ) -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Store {
-                modifiers: Default::default(),
-                sequence_set,
-                kind,
-                response: StoreResponse::Answer,
-                flags,
-                uid: opts.uid,
-            },
+        let body = CommandBody::Store {
+            modifiers: Default::default(),
+            sequence_set,
+            kind,
+            response: StoreResponse::Answer,
+            flags,
+            uid: opts.uid,
         };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -182,11 +191,11 @@ impl ImapCoroutine for ImapMessageStore {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         match &mut self.state {
             State::Send(send) => {
-                let out = imap_try!(send, fragmentizer, arg);
+                let out = imap_try!(send, fragmentizer, arg.take());
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageStoreError::Bye(bye.text.to_string());
@@ -236,21 +245,18 @@ impl ImapMessageStoreSilent {
         flags: Vec<Flag<'static>>,
         opts: ImapMessageStoreOptions,
     ) -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Store {
-                modifiers: Default::default(),
-                sequence_set,
-                kind,
-                response: StoreResponse::Silent,
-                flags,
-                uid: opts.uid,
-            },
+        let body = CommandBody::Store {
+            modifiers: Default::default(),
+            sequence_set,
+            kind,
+            response: StoreResponse::Silent,
+            flags,
+            uid: opts.uid,
         };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -263,11 +269,11 @@ impl ImapCoroutine for ImapMessageStoreSilent {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         match &mut self.state {
             State::Send(send) => {
-                let out = imap_try!(send, fragmentizer, arg);
+                let out = imap_try!(send, fragmentizer, arg.take());
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageStoreError::Bye(bye.text.to_string());
@@ -329,7 +335,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write_echo(&mut store, &mut frag, None);
+        expect_wants_tag_echo(&mut store, &mut frag);
+        let bytes = expect_wants_write_echo(&mut store, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read_echo(&mut store, &mut frag);
@@ -349,7 +356,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write_echo(&mut store, &mut frag, None);
+        expect_wants_tag_echo(&mut store, &mut frag);
+        let bytes = expect_wants_write_echo(&mut store, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         assert!(line.contains("UID STORE 42 "));
     }
@@ -364,7 +372,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write_silent(&mut store, &mut frag, None);
+        expect_wants_tag_silent(&mut store, &mut frag);
+        let bytes = expect_wants_write_silent(&mut store, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("STORE 1 +FLAGS.SILENT "));
@@ -385,7 +394,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write_echo(&mut store, &mut frag, None);
+        expect_wants_tag_echo(&mut store, &mut frag);
+        let bytes = expect_wants_write_echo(&mut store, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read_echo(&mut store, &mut frag);
@@ -396,6 +406,13 @@ mod tests {
             panic!("expected ImapMessageStoreError::No, got {err:?}");
         };
         assert_eq!(text, "mailbox is read-only");
+    }
+
+    fn expect_wants_tag_echo(cor: &mut ImapMessageStore, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write_echo(
@@ -435,6 +452,13 @@ mod tests {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Err(err)) => err,
             state => panic!("expected Complete(Err), got {state:?}"),
+        }
+    }
+
+    fn expect_wants_tag_silent(cor: &mut ImapMessageStoreSilent, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
         }
     }
 

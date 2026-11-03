@@ -24,7 +24,7 @@ use io_imap::{
     client::{
         ImapClient, ImapClientStd, ImapClientStdConnectOptions, ImapMailboxWatchStreamOptions,
     },
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::*,
     rfc2971::id::*,
     rfc3501::{
@@ -91,6 +91,7 @@ pub fn run_imap(host: &str, port: u16, username: &str, password: &str) {
 fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     let mut buf = [0u8; 16 * 1024];
     let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+    let mut tags = TagGenerator::new();
 
     // NOTE: greeting + capability step.
 
@@ -98,11 +99,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         ensure_capabilities: true,
     });
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(_)) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("GREETING: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("greeting read");
                 arg = Some(&buf[..n]);
@@ -122,11 +128,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     };
     let mut coroutine = ImapLogin::new(username, password, opts).expect("valid credentials");
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     let capabilities = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(capabilities)) => break capabilities,
             ImapCoroutineState::Complete(Err(err)) => panic!("LOGIN: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("login read");
                 arg = Some(&buf[..n]);
@@ -151,11 +162,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         ImapMailboxSelectOptions::default(),
     );
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(_)) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("SELECT: {err:?}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("select read");
                 arg = Some(&buf[..n]);
@@ -189,11 +205,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     let mut coroutine =
         ImapMessageAppend::new("INBOX".try_into().unwrap(), message.into_bytes(), opts);
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     let (exists, appenduid) = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(out)) => break out,
             ImapCoroutineState::Complete(Err(err)) => panic!("APPEND: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("append read");
                 arg = Some(&buf[..n]);
@@ -229,11 +250,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         },
     );
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     let fetched = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(map)) => break map,
             ImapCoroutineState::Complete(Err(err)) => panic!("FETCH: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("fetch read");
                 arg = Some(&buf[..n]);
@@ -255,11 +281,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     let mut chunk = [0u8; 64];
     let mut body: Vec<u8> = Vec::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(())) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("FETCH stream: {err}"),
+            ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
                 let n = stream.read(&mut chunk).expect("fetch stream read");
                 arg = Some(&chunk[..n]);
@@ -313,11 +344,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         },
     );
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     let ids = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(ids)) => break ids,
             ImapCoroutineState::Complete(Err(err)) => panic!("SORT: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("sort read");
                 arg = Some(&buf[..n]);
@@ -338,11 +374,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     ));
     let mut coroutine = ImapMessageSearch::new(criteria, ImapMessageSearchOptions { uid: true });
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     let uids = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(uids)) => break uids,
             ImapCoroutineState::Complete(Err(err)) => panic!("UID SEARCH: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("search read");
                 arg = Some(&buf[..n]);
@@ -363,11 +404,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
         ImapMessageStoreOptions { uid: true },
     );
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(())) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("UID STORE \\Deleted: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("store read");
                 arg = Some(&buf[..n]);
@@ -381,11 +427,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     let mut coroutine = ImapMailboxExpunge::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(_)) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("EXPUNGE: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("expunge read");
                 arg = Some(&buf[..n]);
@@ -401,11 +452,16 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
 
     let mut coroutine = ImapLogout::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tag;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(Ok(())) => break,
             ImapCoroutineState::Complete(Err(err)) => panic!("LOGOUT: {err}"),
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf).expect("logout read");
                 arg = Some(&buf[..n]);

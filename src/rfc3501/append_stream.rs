@@ -17,7 +17,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     rfc3501::{
 //!         append::ImapMessageAppendOptions,
@@ -39,10 +39,16 @@
 //! let opts = ImapMessageAppendOptions::default();
 //! let len = message.len() as u32;
 //! let mut coroutine = ImapMessageAppendStream::new(mailbox, len, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let (exists, appenduid) = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
+//!         }
 //!         ImapCoroutineState::Yielded(
 //!             ImapMessageAppendStreamYield::WantsWrite(bytes),
 //!         ) => {
@@ -76,8 +82,9 @@ use imap_codec::{
     encode::{Encoder, Fragment},
     fragmentizer::Fragmentizer,
     imap_types::{
+        IntoStatic,
         command::{Command, CommandBody},
-        core::{Literal, TagGenerator},
+        core::{Literal, Tag},
         extensions::binary::LiteralOrLiteral8,
         mailbox::Mailbox,
         response::{Code, Data, StatusKind, Tagged},
@@ -123,6 +130,8 @@ pub enum ImapMessageAppendStreamError {
 /// Yield variants from the streaming APPEND coroutine.
 #[derive(Debug)]
 pub enum ImapMessageAppendStreamYield {
+    /// The caller resumes with the tag of the next command.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
@@ -135,6 +144,7 @@ pub enum ImapMessageAppendStreamYield {
 impl From<ImapYield> for ImapMessageAppendStreamYield {
     fn from(yielded: ImapYield) -> Self {
         match yielded {
+            ImapYield::WantsTag => Self::WantsTag,
             ImapYield::WantsRead => Self::WantsRead,
             ImapYield::WantsWrite(bytes) => Self::WantsWrite(bytes),
         }
@@ -144,9 +154,11 @@ impl From<ImapYield> for ImapMessageAppendStreamYield {
 /// I/O-free IMAP APPEND coroutine streaming the message body.
 pub struct ImapMessageAppendStream {
     state: State,
-    header: Option<Vec<u8>>,
+    body: Option<CommandBody<'static>>,
+    len: u32,
+    tag_requested: bool,
     crlf: Option<Vec<u8>>,
-    command: Command<'static>,
+    command: Option<Command<'static>>,
     non_sync: bool,
     stream_pending: bool,
 }
@@ -165,61 +177,22 @@ impl ImapMessageAppendStream {
         // literal, then splice in the real octet count: streaming keeps
         // the message body out of the encoder so it never lands in
         // memory whole.
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Append {
-                mailbox,
-                flags: opts.flags,
-                date: opts.date,
-                message: LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(Vec::new())),
-            },
+        let body = CommandBody::Append {
+            mailbox,
+            flags: opts.flags,
+            date: opts.date,
+            message: LiteralOrLiteral8::Literal(Literal::unvalidated_non_sync(Vec::new())),
         };
 
-        trace!("send IMAP command {command:?}");
-
-        let fragments: Vec<Fragment> = CommandCodec::new().encode(&command).collect();
-
-        // NOTE: the message literal is the last literal fragment: the lines
-        // before it form the request header, the line after it the
-        // command-closing CRLF that follows the streamed body. The empty
-        // literal itself is dropped.
-        let last = fragments
-            .iter()
-            .rposition(|fragment| matches!(fragment, Fragment::Literal { .. }))
-            .expect("APPEND always encodes a message literal");
-
-        let mut header = Vec::new();
-        let mut crlf = Vec::new();
-
-        for (index, fragment) in fragments.into_iter().enumerate() {
-            match fragment {
-                Fragment::Line { data } if index < last => header.extend(data),
-                Fragment::Line { data } => crlf.extend(data),
-                // NOTE: a mailbox literal (rare) precedes the message one and
-                // belongs inline in the header.
-                Fragment::Literal { data, .. } if index < last => header.extend(data),
-                Fragment::Literal { .. } => {}
-            }
-        }
-
-        // NOTE: imap-codec emitted the empty literal header as
-        // `{0+}\r\n`; rewrite it with the real count, synchronising
-        // unless `non_sync` was requested.
-        const EMPTY_LITERAL: &[u8] = b"{0+}\r\n";
-        debug_assert!(header.ends_with(EMPTY_LITERAL));
-        header.truncate(header.len() - EMPTY_LITERAL.len());
-
-        if opts.non_sync {
-            header.extend_from_slice(format!("{{{len}+}}\r\n").as_bytes());
-        } else {
-            header.extend_from_slice(format!("{{{len}}}\r\n").as_bytes());
-        }
+        trace!("send IMAP command {body:?}");
 
         Self {
             state: State::WriteHeader,
-            header: Some(header),
-            crlf: Some(crlf),
-            command,
+            body: Some(body),
+            len,
+            tag_requested: false,
+            crlf: None,
+            command: None,
             non_sync: opts.non_sync,
             stream_pending: false,
         }
@@ -233,12 +206,72 @@ impl ImapCoroutine for ImapMessageAppendStream {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
                 State::WriteHeader => {
-                    let header = self.header.take().expect("header written once");
+                    let tag = match arg {
+                        Some(bytes) => match Tag::try_from(bytes) {
+                            Ok(tag) => tag.into_static(),
+                            Err(err) => {
+                                let err = ImapSendError::InvalidTag(err).into();
+                                return ImapCoroutineState::Complete(Err(err));
+                            }
+                        },
+                        None if self.tag_requested => {
+                            let err = ImapSendError::MissingTag.into();
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+                        None => {
+                            self.tag_requested = true;
+                            let yielded = ImapMessageAppendStreamYield::WantsTag;
+                            return ImapCoroutineState::Yielded(yielded);
+                        }
+                    };
+
+                    let body = self.body.take().expect("command tagged once");
+                    let command = Command { tag, body };
+                    let fragments: Vec<Fragment> = CommandCodec::new().encode(&command).collect();
+
+                    // NOTE: the message literal is the last literal
+                    // fragment: the lines before it form the request
+                    // header, the line after it the command-closing CRLF
+                    // that follows the streamed body. The empty literal
+                    // itself is dropped.
+                    let last = fragments
+                        .iter()
+                        .rposition(|fragment| matches!(fragment, Fragment::Literal { .. }))
+                        .expect("APPEND always encodes a message literal");
+
+                    let mut header = Vec::new();
+                    let mut crlf = Vec::new();
+
+                    for (index, fragment) in fragments.into_iter().enumerate() {
+                        match fragment {
+                            Fragment::Line { data } if index < last => header.extend(data),
+                            Fragment::Line { data } => crlf.extend(data),
+                            // NOTE: a mailbox literal (rare) precedes the
+                            // message one and belongs inline in the header.
+                            Fragment::Literal { data, .. } if index < last => header.extend(data),
+                            Fragment::Literal { .. } => {}
+                        }
+                    }
+
+                    // NOTE: imap-codec emitted the empty literal header as
+                    // `{0+}\r\n`; rewrite it with the real count,
+                    // synchronising unless `non_sync` was requested.
+                    const EMPTY_LITERAL: &[u8] = b"{0+}\r\n";
+                    debug_assert!(header.ends_with(EMPTY_LITERAL));
+                    header.truncate(header.len() - EMPTY_LITERAL.len());
+
+                    let len = self.len;
+
+                    if self.non_sync {
+                        header.extend_from_slice(format!("{{{len}+}}\r\n").as_bytes());
+                    } else {
+                        header.extend_from_slice(format!("{{{len}}}\r\n").as_bytes());
+                    }
 
                     // NOTE: synchronising literals wait for the server
                     // `+` before the body; non-synchronising ones stream
@@ -246,16 +279,19 @@ impl ImapCoroutine for ImapMessageAppendStream {
                     self.state = if self.non_sync {
                         State::Stream
                     } else {
-                        State::Continuation(ImapSend::receive(self.command.clone()))
+                        State::Continuation(ImapSend::receive(command.clone()))
                     };
                     debug!("{}", self.state);
+
+                    self.crlf = Some(crlf);
+                    self.command = Some(command);
 
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         header,
                     ));
                 }
                 State::Continuation(recv) => {
-                    let out = imap_try!(recv, fragmentizer, arg);
+                    let out = imap_try!(recv, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
                         let err = ImapMessageAppendStreamError::Bye(bye.text.to_string());
@@ -296,14 +332,15 @@ impl ImapCoroutine for ImapMessageAppendStream {
                 }
                 State::WriteCrlf => {
                     let crlf = self.crlf.take().expect("crlf written once");
-                    self.state = State::Recv(ImapSend::receive(self.command.clone()));
+                    let command = self.command.take().expect("command tagged once");
+                    self.state = State::Recv(ImapSend::receive(command));
                     debug!("{}", self.state);
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         crlf,
                     ));
                 }
                 State::Recv(recv) => {
-                    let out = imap_try!(recv, fragmentizer, arg);
+                    let out = imap_try!(recv, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
                         let err = ImapMessageAppendStreamError::Bye(bye.text.to_string());
@@ -385,7 +422,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let header = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let header = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&header).expect("utf8 header");
         let tag = first_word(line).to_owned();
         assert!(line.contains("APPEND INBOX"));
@@ -423,7 +461,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let header = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let header = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&header).expect("utf8 header");
         let tag = first_word(line).to_owned();
         assert!(line.ends_with("{15+}\r\n"));
@@ -448,7 +487,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let header = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let header = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&header).expect("utf8 header")).to_owned();
 
         expect_wants_read(&mut append, &mut frag, None);
@@ -470,7 +510,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let _ = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         expect_wants_read(&mut append, &mut frag, None);
         expect_wants_stream(&mut append, &mut frag, Some(b"+ go\r\n"));
 
@@ -488,7 +529,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let _ = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         expect_wants_read(&mut append, &mut frag, None);
         expect_wants_stream(&mut append, &mut frag, Some(b"+ go\r\n"));
         let _ = expect_wants_write(&mut append, &mut frag, None);
@@ -499,6 +541,13 @@ mod tests {
             panic!("expected ImapMessageAppendStreamError::Bye, got {err:?}");
         };
         assert_eq!(text, "shutting down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMessageAppendStream, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

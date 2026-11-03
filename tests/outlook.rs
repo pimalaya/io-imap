@@ -126,11 +126,16 @@ fn oauth_appenduid() {
         let mut coroutine = ImapAppendUid::new(mailbox(), message, Default::default());
         let mut buf = [0u8; 4096];
         let mut arg = None;
+        let mut tag;
 
         let appenduid = loop {
             match coroutine.resume(&mut client.fragmentizer, arg.take()) {
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                     client.stream.write_all(&bytes).expect("write");
+                }
+                ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                    tag = client.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = client.stream.read(&mut buf).expect("read");

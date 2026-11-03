@@ -5,7 +5,7 @@
 //! made.
 
 use io_imap::{
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::*,
     rfc3501::{capability::*, create::*, greeting::*, list::*, noop::*},
     types::mailbox::Mailbox,
@@ -23,10 +23,16 @@ fn run_greeting(
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapGreetingGet::new(ImapGreetingGetOptions::default());
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
@@ -49,11 +55,17 @@ fn run_capability(
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapCapabilityGet::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
@@ -75,11 +87,17 @@ fn run_greeting_with_capability(
         ensure_capabilities: true,
     });
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
@@ -147,11 +165,17 @@ fn noop_ok() {
     let mut fragmentizer = new_fragmentizer();
     let mut coroutine = ImapNoop::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
@@ -178,6 +202,8 @@ fn create_encodes_mailbox_to_modified_utf7() {
 
     let mut written = Vec::new();
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
     let response: &[u8] = b"A001 OK CREATE completed.\r\n";
 
@@ -186,6 +212,10 @@ fn create_encodes_mailbox_to_modified_utf7() {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 written.extend_from_slice(&bytes);
                 arg = None;
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
             }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
@@ -224,11 +254,17 @@ fn list_decodes_mailbox_from_modified_utf7() {
     let response: &[u8] = b"* LIST () \"/\" \"Notes/&BBEEQAQ+BEgENQQ9BEs-\"\r\n\
                             A001 OK LIST completed.\r\n";
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");
@@ -282,11 +318,17 @@ A001 OK [READ-WRITE] INBOX selected. (Success)\r\n";
         ImapMailboxSelectOptions::default(),
     );
     let mut arg: Option<&[u8]> = None;
+    let mut tags = TagGenerator::new();
+    let mut tag;
     let mut fed = false;
 
     let result = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => arg = None,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
+            }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 if fed {
                     arg = Some(b"");

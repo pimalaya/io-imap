@@ -10,7 +10,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::select::{ImapMailboxSelect, ImapMailboxSelectOptions},
 //! };
@@ -24,12 +24,18 @@
 //! let mailbox = "INBOX".try_into().unwrap();
 //! let opts = ImapMailboxSelectOptions::default();
 //! let mut coroutine = ImapMailboxSelect::new(mailbox, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let data = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -51,8 +57,8 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody, SelectParameter},
-        core::{TagGenerator, Vec1},
+        command::{CommandBody, SelectParameter},
+        core::Vec1,
         fetch::MessageDataItem,
         flag::{Flag, FlagPerm},
         mailbox::Mailbox,
@@ -140,17 +146,14 @@ impl ImapMailboxSelect {
     pub fn new(mut mailbox: Mailbox<'static>, opts: ImapMailboxSelectOptions) -> Self {
         encode_inplace(&mut mailbox);
 
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Select {
-                mailbox,
-                parameters: opts.parameters,
-            },
+        let body = CommandBody::Select {
+            mailbox,
+            parameters: opts.parameters,
         };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -267,7 +270,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut select, &mut frag, None);
+        expect_wants_tag(&mut select, &mut frag);
+        let bytes = expect_wants_write(&mut select, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("SELECT INBOX"));
@@ -295,7 +299,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut select, &mut frag, None);
+        expect_wants_tag(&mut select, &mut frag);
+        let bytes = expect_wants_write(&mut select, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut select, &mut frag);
@@ -316,7 +321,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut select, &mut frag, None);
+        expect_wants_tag(&mut select, &mut frag);
+        let _ = expect_wants_write(&mut select, &mut frag, Some(b"A1"));
         expect_wants_read(&mut select, &mut frag);
 
         let err = expect_complete_err(&mut select, &mut frag, b"* BYE going down\r\n");
@@ -324,6 +330,13 @@ mod tests {
             panic!("expected ImapMailboxSelectError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMailboxSelect, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

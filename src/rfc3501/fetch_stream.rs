@@ -39,6 +39,9 @@
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
+//!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
+//!             arg = Some(b"A1");
+//!         }
 //!         ImapCoroutineState::Yielded(
 //!             ImapMessageFetchStreamYield::WantsWrite(bytes),
 //!         ) => {
@@ -78,8 +81,10 @@ use imap_codec::{
     encode::Encoder,
     fragmentizer::{FragmentInfo, Fragmentizer},
     imap_types::{
+        IntoStatic,
         command::{Command, CommandBody},
-        core::TagGenerator,
+        core::Tag,
+        error::ValidationError,
         fetch::{MacroOrMessageDataItemNames, MessageDataItemName},
         response::{Response, Status, StatusKind},
         sequence::{SeqOrUid, SequenceSet},
@@ -105,6 +110,13 @@ pub enum ImapMessageFetchStreamError {
     /// The exchange ended without a tagged response from the server.
     #[error("IMAP FETCH failed: server did not return a tagged response")]
     MissingTagged,
+    /// The caller resumed a `WantsTag` without a tag.
+    #[error("IMAP FETCH failed: missing command tag")]
+    MissingTag,
+    /// The caller resumed a `WantsTag` with bytes that are not a valid
+    /// IMAP tag.
+    #[error("IMAP FETCH failed: invalid command tag")]
+    InvalidTag(#[source] ValidationError),
     /// The socket reached EOF before the declared body octets were all
     /// streamed.
     #[error("IMAP FETCH failed: stream ended before the declared body length")]
@@ -121,6 +133,8 @@ pub enum ImapMessageFetchStreamError {
 /// Yield variants from the FETCH body-stream coroutine.
 #[derive(Debug)]
 pub enum ImapMessageFetchStreamYield {
+    /// The caller resumes with the tag of the FETCH command.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
@@ -142,7 +156,8 @@ const MAX_LINE_LEN: usize = 1024 * 1024;
 /// I/O-free IMAP FETCH coroutine streaming one message body.
 pub struct ImapMessageFetchStream {
     state: State,
-    command: Option<Vec<u8>>,
+    body: Option<CommandBody<'static>>,
+    tag_requested: bool,
     pending: Vec<u8>,
     scanned: usize,
     remaining: u32,
@@ -154,29 +169,25 @@ impl ImapMessageFetchStream {
     /// Builds a FETCH coroutine streaming the `BODY.PEEK[]` of message
     /// `id`; when `uid` is `true`, sends `UID FETCH`.
     pub fn new(id: NonZeroU32, uid: bool) -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Fetch {
-                sequence_set: SequenceSet::from(SeqOrUid::from(id)),
-                macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(vec![
-                    MessageDataItemName::BodyExt {
-                        section: None,
-                        partial: None,
-                        peek: true,
-                    },
-                ]),
-                uid,
-                modifiers: Vec::new(),
-            },
+        let body = CommandBody::Fetch {
+            sequence_set: SequenceSet::from(SeqOrUid::from(id)),
+            macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+                MessageDataItemName::BodyExt {
+                    section: None,
+                    partial: None,
+                    peek: true,
+                },
+            ]),
+            uid,
+            modifiers: Vec::new(),
         };
 
-        trace!("send IMAP command {command:?}");
-
-        let command = CommandCodec::new().encode(&command).dump();
+        trace!("send IMAP command {body:?}");
 
         Self {
             state: State::SendCommand,
-            command: Some(command),
+            body: Some(body),
+            tag_requested: false,
             pending: Vec::new(),
             scanned: 0,
             remaining: 0,
@@ -197,14 +208,34 @@ impl ImapCoroutine for ImapMessageFetchStream {
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match self.state {
-                State::SendCommand => {
-                    let command = self.command.take().expect("command sent once");
-                    self.state = State::Header;
-                    debug!("{}", self.state);
-                    return ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(
-                        command,
-                    ));
-                }
+                State::SendCommand => match arg.take() {
+                    Some(bytes) => {
+                        let tag = match Tag::try_from(bytes) {
+                            Ok(tag) => tag.into_static(),
+                            Err(err) => {
+                                let err = ImapMessageFetchStreamError::InvalidTag(err);
+                                return ImapCoroutineState::Complete(Err(err));
+                            }
+                        };
+
+                        let body = self.body.take().expect("command tagged once");
+                        let command = CommandCodec::new().encode(&Command { tag, body }).dump();
+
+                        self.state = State::Header;
+                        debug!("{}", self.state);
+
+                        let yielded = ImapMessageFetchStreamYield::WantsWrite(command);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    None if self.tag_requested => {
+                        let err = ImapMessageFetchStreamError::MissingTag;
+                        return ImapCoroutineState::Complete(Err(err));
+                    }
+                    None => {
+                        self.tag_requested = true;
+                        return ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag);
+                    }
+                },
                 State::Header => {
                     if let Some(bytes) = arg.take() {
                         if bytes.is_empty() {
@@ -425,7 +456,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&cmd).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("UID FETCH 1 BODY.PEEK[]"));
@@ -447,7 +479,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(9).unwrap(), false);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&cmd).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("FETCH 9 BODY.PEEK[]"));
@@ -472,7 +505,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&cmd).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cor, &mut frag, None);
@@ -496,7 +530,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(7).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&cmd).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cor, &mut frag, None);
@@ -511,7 +546,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(7).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&cmd).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cor, &mut frag, None);
@@ -529,7 +565,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let _ = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         expect_wants_read(&mut cor, &mut frag, None);
         let _ = expect_wants_stream(&mut cor, &mut frag, Some(b"* 1 FETCH (BODY[] {12}\r\n"));
 
@@ -544,7 +581,8 @@ mod tests {
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
         let chunk = [b'x'; 64 * 1024];
 
-        let _ = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let _ = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         expect_wants_read(&mut cor, &mut frag, None);
 
         for _ in 0..MAX_LINE_LEN / chunk.len() {
@@ -563,7 +601,8 @@ mod tests {
         let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), true);
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let cmd = expect_wants_write(&mut cor, &mut frag, None);
+        expect_wants_tag(&mut cor, &mut frag);
+        let cmd = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&cmd).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cor, &mut frag, None);
@@ -577,6 +616,13 @@ mod tests {
 
         let reply = format!("{tag} OK done\r\n");
         expect_complete_ok(&mut cor, &mut frag, Some(reply.as_bytes()));
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMessageFetchStream, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

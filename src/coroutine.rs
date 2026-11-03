@@ -26,8 +26,9 @@ pub trait ImapCoroutine {
     /// The final value produced on completion.
     type Return;
 
-    /// Pass `None` initially or after a `WantsWrite`, `Some(bytes)`
-    /// after a `WantsRead`, `Some(&[])` on EOF.
+    /// Pass `None` initially or after a `WantsWrite`, `Some(tag)` after
+    /// a `WantsTag`, `Some(bytes)` after a `WantsRead`, `Some(&[])` on
+    /// EOF.
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
@@ -39,6 +40,9 @@ pub trait ImapCoroutine {
 /// variants (events, etc.) are needed.
 #[derive(Debug)]
 pub enum ImapYield {
+    /// The caller resumes with the tag of the next command, unique on
+    /// the connection.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.

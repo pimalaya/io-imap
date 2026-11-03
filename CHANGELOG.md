@@ -9,12 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Added
 
 - Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`, whose `max_literal_len` (100 MiB by default) and per-UID `sizes` bound the bodies a server may announce, failing with the new `LiteralTooLong` error.
+- Added `client::ImapClientStd::tags`, the generator answering every `WantsTag` on the connection.
 
 ### Changed
 
 - **BREAKING**: `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch::new` takes `(sequence_set, opts)`, the `uid` flag moving into `ImapMessageFetchStreamBatchOptions`.
 
+- **BREAKING**: Changed every coroutine to ask its caller for command tags through the new `coroutine::ImapYield::WantsTag`.
+
+  Every yield type carries the variant, and a resume loop answers it with the tag bytes. A missing or invalid tag fails with `MissingTag` or `InvalidTag`.
+
 ### Fixed
+
+- Fixed bare builds pulling std through imap-codec's `tag_generator` feature, now enabled by `client` only ([pimalaya/io-imap#4](https://github.com/pimalaya/io-imap/issues/4)).
 
 - Fixed the build against abnf-core 0.6.1, which no longer enables nom's default features that imap-codec 2.0.0-alpha.9 relied on. io-imap now requires imap-codec 2.0.0-alpha.10, which requests nom's `alloc` feature itself.
 

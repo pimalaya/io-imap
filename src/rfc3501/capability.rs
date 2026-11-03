@@ -9,7 +9,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::capability::ImapCapabilityGet,
 //! };
@@ -21,12 +21,18 @@
 //! let mut buf = [0u8; 4096];
 //!
 //! let mut coroutine = ImapCapabilityGet::new();
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let capability = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -49,8 +55,7 @@ use imap_codec::{
     fragmentizer::Fragmentizer,
     imap_types::{
         auth::AuthMechanism,
-        command::{Command, CommandBody},
-        core::TagGenerator,
+        command::CommandBody,
         response::{Capability, Code, Data, StatusBody, StatusKind, Tagged},
     },
 };
@@ -93,14 +98,11 @@ impl ImapCapabilityGet {
     /// Builds a CAPABILITY coroutine requesting the advertised
     /// capability list.
     pub fn new() -> Self {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Capability,
-        };
+        let body = CommandBody::Capability;
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -251,7 +253,8 @@ mod tests {
         let mut cap = ImapCapabilityGet::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_tag(&mut cap, &mut frag);
+        let bytes = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.trim_end().ends_with("CAPABILITY"));
@@ -272,7 +275,8 @@ mod tests {
         let mut cap = ImapCapabilityGet::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_tag(&mut cap, &mut frag);
+        let bytes = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cap, &mut frag);
@@ -287,7 +291,8 @@ mod tests {
         let mut cap = ImapCapabilityGet::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_tag(&mut cap, &mut frag);
+        let bytes = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cap, &mut frag);
@@ -302,7 +307,8 @@ mod tests {
         let mut cap = ImapCapabilityGet::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_tag(&mut cap, &mut frag);
+        let bytes = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut cap, &mut frag);
@@ -320,7 +326,8 @@ mod tests {
         let mut cap = ImapCapabilityGet::new();
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut cap, &mut frag, None);
+        expect_wants_tag(&mut cap, &mut frag);
+        let _ = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
         expect_wants_read(&mut cap, &mut frag);
 
         let err = expect_complete_err(&mut cap, &mut frag, b"* BYE going down\r\n");
@@ -328,6 +335,13 @@ mod tests {
             panic!("expected ImapCapabilityGetError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapCapabilityGet, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

@@ -13,7 +13,10 @@ use alloc::vec::Vec;
 
 use std::io::{self, Read, Write};
 
-use imap_codec::{fragmentizer::Fragmentizer, imap_types::response::Capability};
+use imap_codec::{
+    fragmentizer::Fragmentizer,
+    imap_types::{core::TagGenerator, response::Capability},
+};
 use io_sasl::mechanism::Sasl;
 #[cfg(feature = "scram")]
 use io_sasl::rfc5802::SaslScramCreds;
@@ -102,6 +105,8 @@ impl ImapClientStd {
         let sasl = sasl.map(with_client_nonce);
         let mut session = ImapSessionOpen::new(transport, sasl, session);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+        let mut tags = TagGenerator::new();
+        let mut tag;
         let mut stream: Option<Stream> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
@@ -118,6 +123,7 @@ impl ImapClientStd {
                     let stream = stream.ok_or_else(missing)?;
                     let mut client = Self::new(stream);
                     client.fragmentizer = fragmentizer;
+                    client.tags = tags;
                     client.pre_authenticated = data.pre_authenticated;
                     return Ok((client, data.capability));
                 }
@@ -151,6 +157,10 @@ impl ImapClientStd {
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsUpgrade) => {
                     let plain = stream.take().ok_or_else(missing)?;
                     stream = Some(plain.upgrade_tls(&tls)?);
+                }
+                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag) => {
+                    tag = tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
                     let stream = stream.as_mut().ok_or_else(missing)?;

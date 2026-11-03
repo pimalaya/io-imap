@@ -15,7 +15,10 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::{fragmentizer::Fragmentizer, imap_types::core::Vec1},
+//!     codec::{
+//!         fragmentizer::Fragmentizer,
+//!         imap_types::core::{TagGenerator, Vec1},
+//!     },
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc5256::sort::{ImapMessageSort, ImapMessageSortOptions},
 //!     types::{
@@ -39,12 +42,18 @@
 //! let opts = ImapMessageSortOptions::default();
 //! let mut coroutine =
 //!     ImapMessageSort::new(sort_criteria, search_criteria, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let ids = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -68,8 +77,8 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::{Charset, TagGenerator, Vec1},
+        command::CommandBody,
+        core::{Charset, Vec1},
         extensions::sort::{SortCriterion, SortKey},
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
         response::{Data, StatusKind, Tagged},
@@ -168,19 +177,16 @@ impl ImapMessageSort {
                 ImapMessageSearch::new(search_criteria, ImapMessageSearchOptions { uid: opts.uid });
             State::Search(search)
         } else {
-            let command = Command {
-                tag: TagGenerator::new().generate(),
-                body: CommandBody::Sort {
-                    sort_criteria: sort_criteria.clone(),
-                    charset: Charset::try_from("UTF-8").unwrap(),
-                    search_criteria,
-                    uid: opts.uid,
-                },
+            let body = CommandBody::Sort {
+                sort_criteria: sort_criteria.clone(),
+                charset: Charset::try_from("UTF-8").unwrap(),
+                search_criteria,
+                uid: opts.uid,
             };
 
-            trace!("send IMAP command {command:?}");
+            trace!("send IMAP command {body:?}");
 
-            State::Sort(ImapSend::new(CommandCodec::new(), command))
+            State::Sort(ImapSend::command(body))
         };
 
         Self {
@@ -262,12 +268,12 @@ impl ImapCoroutine for ImapMessageSort {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
                 State::Sort(send) => {
-                    let out = imap_try!(send, fragmentizer, arg);
+                    let out = imap_try!(send, fragmentizer, arg.take());
 
                     if let Some(bye) = out.bye {
                         let err = ImapMessageSortError::Bye(bye.text.to_string());
@@ -305,7 +311,7 @@ impl ImapCoroutine for ImapMessageSort {
                     };
                 }
                 State::Search(search) => {
-                    self.remaining = imap_try!(search, fragmentizer, arg);
+                    self.remaining = imap_try!(search, fragmentizer, arg.take());
 
                     match self.next_fetch() {
                         Ok(Some(fetch)) => {
@@ -317,7 +323,7 @@ impl ImapCoroutine for ImapMessageSort {
                     }
                 }
                 State::Fetch(fetch) => {
-                    let map = imap_try!(fetch, fragmentizer, arg);
+                    let map = imap_try!(fetch, fragmentizer, arg.take());
                     self.fetched.extend(map);
 
                     match self.next_fetch() {
@@ -502,7 +508,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains("SORT "));
@@ -531,7 +538,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         assert!(line.contains("UID SORT "));
     }
@@ -545,7 +553,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         wants_read(&mut sort, &mut frag, None);
@@ -564,7 +573,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         wants_read(&mut sort, &mut frag, None);
@@ -589,7 +599,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let search_tag = first_word(line).to_owned();
         assert!(line.contains("UID SEARCH"));
@@ -597,7 +608,8 @@ mod tests {
         wants_read(&mut sort, &mut frag, None);
 
         let search_reply = format!("* SEARCH 1 2\r\n{search_tag} OK SEARCH completed\r\n");
-        let bytes = wants_write(&mut sort, &mut frag, Some(search_reply.as_bytes()));
+        wants_tag(&mut sort, &mut frag, Some(search_reply.as_bytes()));
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A2"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let fetch_tag = first_word(line).to_owned();
         assert!(line.contains("UID FETCH"));
@@ -634,12 +646,14 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let search_tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
         wants_read(&mut sort, &mut frag, None);
 
         let search_reply = format!("* SEARCH 1 2\r\n{search_tag} OK SEARCH completed\r\n");
-        let bytes = wants_write(&mut sort, &mut frag, Some(search_reply.as_bytes()));
+        wants_tag(&mut sort, &mut frag, Some(search_reply.as_bytes()));
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A2"));
         let fetch_tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
         wants_read(&mut sort, &mut frag, None);
 
@@ -664,7 +678,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = wants_write(&mut sort, &mut frag, None);
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
         let search_tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
         wants_read(&mut sort, &mut frag, None);
 
@@ -698,6 +713,13 @@ mod tests {
 
     fn nz(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).expect("non-zero")
+    }
+
+    fn wants_tag(cor: &mut ImapMessageSort, frag: &mut Fragmentizer, arg: Option<&[u8]>) {
+        match cor.resume(frag, arg) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn wants_write(

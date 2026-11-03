@@ -13,7 +13,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::starttls::ImapStartTls,
 //! };
@@ -25,12 +25,18 @@
 //! let mut buf = [0u8; 4096];
 //!
 //! let mut coroutine = ImapStartTls::new();
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let leftover = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -54,8 +60,10 @@ use imap_codec::{
     encode::{Encoder, Fragment},
     fragmentizer::Fragmentizer,
     imap_types::{
+        IntoStatic,
         command::{Command, CommandBody},
-        core::{Tag, TagGenerator},
+        core::Tag,
+        error::ValidationError,
         utils::escape_byte_string,
     },
 };
@@ -70,6 +78,13 @@ pub enum ImapStartTlsError {
     /// The stream reached EOF during the STARTTLS exchange.
     #[error("IMAP STARTTLS failed: reached unexpected EOF on stream")]
     Eof,
+    /// The caller resumed a `WantsTag` without a tag.
+    #[error("IMAP STARTTLS failed: missing command tag")]
+    MissingTag,
+    /// The caller resumed a `WantsTag` with bytes that are not a valid
+    /// IMAP tag.
+    #[error("IMAP STARTTLS failed: invalid command tag")]
+    InvalidTag(#[source] ValidationError),
     /// A response line ran past the given number of octets.
     #[error("IMAP STARTTLS failed: response line longer than {0} octets")]
     LineTooLong(usize),
@@ -92,10 +107,8 @@ impl ImapStartTls {
     /// Builds a STARTTLS coroutine discarding the plain-text greeting,
     /// requesting the upgrade and returning any leftover bytes.
     pub fn new() -> Self {
-        let tag_bytes = TagGenerator::new().generate().as_ref().as_bytes().to_vec();
-
         Self {
-            tag_bytes,
+            tag_bytes: Vec::new(),
             state: State::DiscardGreeting,
             wants_read: false,
             wants_write: None,
@@ -176,9 +189,26 @@ impl ImapCoroutine for ImapStartTls {
 
                         trace!("discard greeting line: {}", escape_byte_string(&line));
 
+                        self.state = State::Tag;
+                        return ImapCoroutineState::Yielded(ImapYield::WantsTag);
+                    }
+                    None => {
+                        self.wants_read = true;
+                    }
+                },
+                State::Tag => match arg.take() {
+                    Some(bytes) => {
+                        let tag = match Tag::try_from(bytes) {
+                            Ok(tag) => tag.into_static(),
+                            Err(err) => {
+                                let err = ImapStartTlsError::InvalidTag(err);
+                                return ImapCoroutineState::Complete(Err(err));
+                            }
+                        };
+
+                        self.tag_bytes = tag.as_ref().as_bytes().to_vec();
+
                         let encoder = CommandCodec::new();
-                        // NOTE: the tag is always valid.
-                        let tag: Tag = self.tag_bytes.as_slice().try_into().unwrap();
                         let starttls = Command {
                             tag,
                             body: CommandBody::StartTLS,
@@ -194,7 +224,8 @@ impl ImapCoroutine for ImapStartTls {
                         self.state = State::WriteStartTls;
                     }
                     None => {
-                        self.wants_read = true;
+                        let err = ImapStartTlsError::MissingTag;
+                        return ImapCoroutineState::Complete(Err(err));
                     }
                 },
                 State::WriteStartTls => {
@@ -245,6 +276,7 @@ impl ImapCoroutine for ImapStartTls {
 
 enum State {
     DiscardGreeting,
+    Tag,
     WriteStartTls,
     DiscardStartTls,
 }
@@ -253,6 +285,7 @@ impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DiscardGreeting => f.write_str("discard greeting"),
+            Self::Tag => f.write_str("receive tag"),
             Self::WriteStartTls => f.write_str("write starttls"),
             Self::DiscardStartTls => f.write_str("discard starttls response"),
         }
@@ -327,12 +360,35 @@ mod tests {
         assert!(matches!(err, ImapStartTlsError::Eof));
     }
 
+    #[test]
+    fn missing_tag_returns_missing_tag_error() {
+        let mut starttls = ImapStartTls::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_read(&mut starttls, &mut frag, None);
+
+        match starttls.resume(&mut frag, Some(b"* OK ready\r\n")) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
+
+        match starttls.resume(&mut frag, None) {
+            ImapCoroutineState::Complete(Err(ImapStartTlsError::MissingTag)) => {}
+            state => panic!("expected Complete(Err(MissingTag)), got {state:?}"),
+        }
+    }
+
     /// Feeds the greeting, then returns the tag of the written command,
     /// leaving the coroutine waiting for the STARTTLS response.
     fn write_command(cor: &mut ImapStartTls, frag: &mut Fragmentizer) -> String {
         expect_wants_read(cor, frag, None);
 
-        let bytes = match cor.resume(frag, Some(b"* OK ready\r\n")) {
+        match cor.resume(frag, Some(b"* OK ready\r\n")) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
+
+        let bytes = match cor.resume(frag, Some(b"A1")) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => bytes,
             state => panic!("expected WantsWrite, got {state:?}"),
         };

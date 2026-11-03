@@ -9,12 +9,14 @@ use core::mem;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
 use imap_codec::{
-    ResponseCodec,
+    CommandCodec, ResponseCodec,
     encode::{Encoder, Fragment},
     fragmentizer::{DecodeMessageError, FragmentInfo, Fragmentizer},
     imap_types::{
         IntoStatic,
-        core::LiteralMode,
+        command::{Command, CommandBody},
+        core::{LiteralMode, Tag},
+        error::ValidationError,
         response::{Bye, CommandContinuationRequest, Data, Response, Status, StatusBody, Tagged},
         secret::Secret,
         utils::escape_byte_string,
@@ -28,6 +30,13 @@ use crate::coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield};
 /// Failure causes raised by [`ImapSend`].
 #[derive(Clone, Debug, Error)]
 pub enum ImapSendError {
+    /// The caller resumed a `WantsTag` without a tag.
+    #[error("Missing IMAP command tag")]
+    MissingTag,
+    /// The caller resumed a `WantsTag` with bytes that are not a valid
+    /// IMAP tag.
+    #[error("Invalid IMAP command tag")]
+    InvalidTag(#[source] ValidationError),
     /// The stream reached EOF before the tagged response arrived.
     #[error("Reached unexpected EOF on IMAP stream")]
     Eof,
@@ -49,6 +58,8 @@ pub enum ImapSendResult<T: Encoder> {
     /// The exchange completed; carries the boxed output (boxed to keep
     /// the enum small next to the I/O variants).
     Ok(Box<ImapSendOutput<T>>),
+    /// The caller resumes with the tag of the command to send.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
@@ -59,6 +70,7 @@ pub enum ImapSendResult<T: Encoder> {
 
 #[derive(Debug)]
 enum State {
+    Tag,
     Serialize,
     Read,
     Deserialize,
@@ -66,7 +78,10 @@ enum State {
 
 /// I/O-free coroutine sending one IMAP command and parsing its response.
 pub struct ImapSend<T: Encoder> {
+    encoder: T,
     message: Option<T::Message<'static>>,
+    untagged_command: Option<UntaggedCommand<T>>,
+    tag_requested: bool,
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
@@ -88,7 +103,10 @@ impl<T: Encoder> ImapSend<T> {
         let fragments = encoder.encode(&message).collect();
 
         Self {
+            encoder,
             message: Some(message),
+            untagged_command: None,
+            tag_requested: false,
             codec: ResponseCodec::new(),
             state: State::Serialize,
             wants_read: false,
@@ -109,9 +127,15 @@ impl<T: Encoder> ImapSend<T> {
     ///
     /// Used by the streamed APPEND literal; `message` is echoed back
     /// unchanged in the Ok output.
-    pub fn receive(message: T::Message<'static>) -> Self {
+    pub fn receive(message: T::Message<'static>) -> Self
+    where
+        T: Default,
+    {
         Self {
+            encoder: T::default(),
             message: Some(message),
+            untagged_command: None,
+            tag_requested: false,
             codec: ResponseCodec::new(),
             state: State::Read,
             wants_read: false,
@@ -127,8 +151,8 @@ impl<T: Encoder> ImapSend<T> {
         }
     }
 
-    /// Pass `None` initially or after `WantsWrite`, `Some(bytes)`
-    /// after `WantsRead`, `Some(&[])` on EOF.
+    /// Pass `None` initially or after `WantsWrite`, `Some(tag)` after
+    /// `WantsTag`, `Some(bytes)` after `WantsRead`, `Some(&[])` on EOF.
     pub fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
@@ -144,6 +168,33 @@ impl<T: Encoder> ImapSend<T> {
             }
 
             match self.state {
+                State::Tag => match arg.take() {
+                    Some(bytes) => {
+                        let tag = match Tag::try_from(bytes) {
+                            Ok(tag) => tag.into_static(),
+                            Err(err) => return ImapSendResult::Err(ImapSendError::InvalidTag(err)),
+                        };
+
+                        // NOTE: the untagged command always exists in the
+                        // tag state.
+                        let untagged = self.untagged_command.take().unwrap();
+                        let message = (untagged.into_message)(Command {
+                            tag,
+                            body: untagged.body,
+                        });
+
+                        self.fragments = self.encoder.encode(&message).collect();
+                        self.message = Some(message);
+                        self.state = State::Serialize;
+                    }
+                    None if self.tag_requested => {
+                        return ImapSendResult::Err(ImapSendError::MissingTag);
+                    }
+                    None => {
+                        self.tag_requested = true;
+                        return ImapSendResult::WantsTag;
+                    }
+                },
                 State::Serialize => {
                     let mut buf = Vec::new();
 
@@ -274,6 +325,43 @@ impl<T: Encoder> ImapSend<T> {
     }
 }
 
+impl ImapSend<CommandCodec> {
+    /// Builds a send for a command whose tag the caller supplies: the
+    /// first resume yields `WantsTag`, and the command is serialised
+    /// once resumed with the tag.
+    pub fn command(body: CommandBody<'static>) -> Self {
+        Self {
+            encoder: CommandCodec::new(),
+            message: None,
+            untagged_command: Some(UntaggedCommand {
+                body,
+                into_message: |command| command,
+            }),
+            tag_requested: false,
+            codec: ResponseCodec::new(),
+            state: State::Tag,
+            wants_read: false,
+            wants_write: None,
+            fragments: VecDeque::new(),
+            data: Vec::new(),
+            untagged: Vec::new(),
+            tagged: None,
+            bye: None,
+            cr: None,
+            limbo_literal: None,
+            done: false,
+        }
+    }
+}
+
+/// A command body waiting for its tag, with the conversion from the
+/// tagged command to the encoder's message type (the identity for
+/// [`CommandCodec`]).
+struct UntaggedCommand<T: Encoder> {
+    body: CommandBody<'static>,
+    into_message: fn(Command<'static>) -> T::Message<'static>,
+}
+
 /// Successful output of one command exchange: the echoed message plus
 /// everything the server answered before the tagged response.
 #[derive(Debug)]
@@ -304,6 +392,7 @@ impl<T: Encoder> ImapCoroutine for ImapSend<T> {
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         // NOTE: qualified path avoids recursing into this trait impl.
         match ImapSend::<T>::resume(self, fragmentizer, arg) {
+            ImapSendResult::WantsTag => ImapCoroutineState::Yielded(ImapYield::WantsTag),
             ImapSendResult::WantsRead => ImapCoroutineState::Yielded(ImapYield::WantsRead),
             ImapSendResult::WantsWrite(bytes) => {
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes))
@@ -311,5 +400,58 @@ impl<T: Encoder> ImapCoroutine for ImapSend<T> {
             ImapSendResult::Ok(output) => ImapCoroutineState::Complete(Ok(*output)),
             ImapSendResult::Err(err) => ImapCoroutineState::Complete(Err(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str;
+
+    use crate::send::*;
+
+    #[test]
+    fn command_tag_answered_writes_tagged_command() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsTag
+        ));
+
+        let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"A1")) else {
+            panic!("expected WantsWrite");
+        };
+        assert_eq!("A1 NOOP\r\n", str::from_utf8(&bytes).expect("utf8 command"));
+    }
+
+    #[test]
+    fn command_tag_missing_returns_missing_tag_error() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsTag
+        ));
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::Err(ImapSendError::MissingTag)
+        ));
+    }
+
+    #[test]
+    fn command_tag_invalid_returns_invalid_tag_error() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsTag
+        ));
+        assert!(matches!(
+            send.resume(&mut frag, Some(b"A+1")),
+            ImapSendResult::Err(ImapSendError::InvalidTag(_))
+        ));
     }
 }

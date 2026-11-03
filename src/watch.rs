@@ -41,7 +41,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     types::response::Capability,
 //!     watch::{ImapMailboxWatch, ImapMailboxWatchYield},
@@ -60,12 +60,18 @@
 //! let shutdown = Arc::new(AtomicBool::new(false));
 //! let opts = Default::default();
 //! let mut coroutine = ImapMailboxWatch::new(&capability, mailbox, shutdown.clone(), opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -221,6 +227,8 @@ pub struct ImapMailboxWatchOptions {
 /// Yield variants from the mailbox watcher.
 #[derive(Debug)]
 pub enum ImapMailboxWatchYield {
+    /// The caller resumes with the tag of the next command.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller waits as long as it means to poll for, then resumes
@@ -485,6 +493,10 @@ impl ImapCoroutine for ImapMailboxWatch {
 
             match state {
                 State::EnableQresync(mut enable) => match enable.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                        self.state = State::EnableQresync(enable);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                    }
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::EnableQresync(enable);
                         return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -512,6 +524,10 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                 State::ExamineInitial(mut examine) => {
                     match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                            self.state = State::ExamineInitial(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                        }
                         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                             self.state = State::ExamineInitial(examine);
                             return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -559,6 +575,10 @@ impl ImapCoroutine for ImapMailboxWatch {
                 }
 
                 State::FetchBaseline(mut fetch) => match fetch.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                        self.state = State::FetchBaseline(fetch);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                    }
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::FetchBaseline(fetch);
                         return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -623,6 +643,10 @@ impl ImapCoroutine for ImapMailboxWatch {
                         self.idle_done.store(true, Ordering::SeqCst);
                         self.state = State::Idle(idle);
                     }
+                    ImapCoroutineState::Yielded(ImapIdleYield::WantsTag) => {
+                        self.state = State::Idle(idle);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                    }
                     ImapCoroutineState::Yielded(ImapIdleYield::WantsRead) => {
                         self.state = State::Idle(idle);
                         return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -652,6 +676,10 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                 State::ExamineQresync(mut examine) => {
                     match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                            self.state = State::ExamineQresync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                        }
                         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                             self.state = State::ExamineQresync(examine);
                             return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -681,6 +709,10 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                 State::ExamineResync(mut examine) => {
                     match examine.resume(fragmentizer, arg.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                            self.state = State::ExamineResync(examine);
+                            return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                        }
                         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                             self.state = State::ExamineResync(examine);
                             return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -709,6 +741,10 @@ impl ImapCoroutine for ImapMailboxWatch {
                 }
 
                 State::FetchResync(mut fetch) => match fetch.resume(fragmentizer, arg.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                        self.state = State::FetchResync(fetch);
+                        return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag);
+                    }
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::FetchResync(fetch);
                         return ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead);
@@ -831,10 +867,15 @@ mod tests {
         let mut replies: VecDeque<String> = VecDeque::new();
         let mut tag = String::new();
         let mut next = 0;
+        let mut issued = 0;
         let mut arg: Option<Vec<u8>> = None;
 
         loop {
             match cor.resume(frag, arg.take().as_deref()) {
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {
+                    issued += 1;
+                    arg = Some(format!("A{issued}").into_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
                     let line = str::from_utf8(&bytes).expect("utf8 command").to_string();
 
@@ -875,6 +916,11 @@ mod tests {
     /// path shows.
     fn first_command(cor: &mut ImapMailboxWatch, frag: &mut Fragmentizer) -> String {
         match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
+
+        match cor.resume(frag, Some(b"A1")) {
             ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
                 str::from_utf8(&bytes).expect("utf8 command").to_string()
             }

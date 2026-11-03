@@ -25,7 +25,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     session::{ImapSessionOpen, ImapSessionOpenOptions, ImapSessionOpenYield, ImapSessionTransport},
 //! };
@@ -46,6 +46,8 @@
 //! let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
 //! let mut stream: Option<TcpStream> = None;
 //! let mut buf = [0u8; 4096];
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let session = loop {
@@ -55,6 +57,10 @@
 //!         }
 //!         ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => {
 //!             stream.as_mut().unwrap().write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
 //!             let n = stream.as_mut().unwrap().read(&mut buf).unwrap();
@@ -297,6 +303,8 @@ pub enum ImapSessionOpenYield {
     /// coroutine refuses the upgrade itself when the server appended
     /// bytes to its tagged response.
     WantsTlsUpgrade,
+    /// The caller resumes with the tag of the next command.
+    WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
@@ -306,6 +314,7 @@ pub enum ImapSessionOpenYield {
 impl From<ImapYield> for ImapSessionOpenYield {
     fn from(y: ImapYield) -> Self {
         match y {
+            ImapYield::WantsTag => Self::WantsTag,
             ImapYield::WantsRead => Self::WantsRead,
             ImapYield::WantsWrite(bytes) => Self::WantsWrite(bytes),
         }
@@ -473,7 +482,7 @@ impl ImapCoroutine for ImapSessionOpen {
     fn resume(
         &mut self,
         fragmentizer: &mut Fragmentizer,
-        arg: Option<&[u8]>,
+        mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match &mut self.state {
@@ -523,7 +532,7 @@ impl ImapCoroutine for ImapSessionOpen {
                     debug!("{}", self.state);
                 }
                 State::StartTls(starttls) => {
-                    let leftover = imap_try!(starttls, fragmentizer, arg);
+                    let leftover = imap_try!(starttls, fragmentizer, arg.take());
 
                     if !leftover.is_empty() {
                         let err = ImapSessionOpenError::StartTlsInjection;
@@ -545,7 +554,7 @@ impl ImapCoroutine for ImapSessionOpen {
                     debug!("{}", self.state);
                 }
                 State::Capability(capability) => {
-                    self.capability = imap_try!(capability, fragmentizer, arg);
+                    self.capability = imap_try!(capability, fragmentizer, arg.take());
 
                     match self.wants_auth() {
                         Err(err) => return ImapCoroutineState::Complete(Err(err)),
@@ -557,7 +566,7 @@ impl ImapCoroutine for ImapSessionOpen {
                     }
                 }
                 State::Greeting(greeting) => {
-                    let greeting = imap_try!(greeting, fragmentizer, arg);
+                    let greeting = imap_try!(greeting, fragmentizer, arg.take());
 
                     self.capability = greeting.capability;
                     self.pre_authenticated = greeting.pre_authenticated;
@@ -573,13 +582,13 @@ impl ImapCoroutine for ImapSessionOpen {
                 }
                 State::Auth(auth) => {
                     self.capability = match auth {
-                        Auth::Anonymous(auth) => imap_try!(auth, fragmentizer, arg),
-                        Auth::Login(auth) => imap_try!(auth, fragmentizer, arg),
-                        Auth::Plain(auth) => imap_try!(auth, fragmentizer, arg),
-                        Auth::Oauthbearer(auth) => imap_try!(auth, fragmentizer, arg),
-                        Auth::Xoauth2(auth) => imap_try!(auth, fragmentizer, arg),
+                        Auth::Anonymous(auth) => imap_try!(auth, fragmentizer, arg.take()),
+                        Auth::Login(auth) => imap_try!(auth, fragmentizer, arg.take()),
+                        Auth::Plain(auth) => imap_try!(auth, fragmentizer, arg.take()),
+                        Auth::Oauthbearer(auth) => imap_try!(auth, fragmentizer, arg.take()),
+                        Auth::Xoauth2(auth) => imap_try!(auth, fragmentizer, arg.take()),
                         #[cfg(feature = "scram")]
-                        Auth::ScramSha256(auth) => imap_try!(auth, fragmentizer, arg),
+                        Auth::ScramSha256(auth) => imap_try!(auth, fragmentizer, arg.take()),
                     };
 
                     return self.complete();
@@ -776,7 +785,12 @@ mod tests {
         // NOTE: the STARTTLS coroutine discards the plaintext greeting
         // line before issuing its own command.
         let greeting = b"* OK server ready\r\n";
-        let command = match session.resume(&mut frag, Some(greeting)) {
+        assert!(matches!(
+            session.resume(&mut frag, Some(greeting)),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag)
+        ));
+
+        let command = match session.resume(&mut frag, Some(b"A1")) {
             ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => bytes,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
@@ -803,7 +817,12 @@ mod tests {
         // NOTE: the caller has swapped in the TLS stream; the coroutine
         // must now re-issue CAPABILITY rather than trust the pre-upgrade
         // list.
-        let command = match session.resume(&mut frag, None) {
+        assert!(matches!(
+            session.resume(&mut frag, None),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag)
+        ));
+
+        let command = match session.resume(&mut frag, Some(b"A2")) {
             ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => bytes,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
@@ -830,7 +849,12 @@ mod tests {
         session.resume(&mut frag, None);
         session.resume(&mut frag, None);
 
-        let command = match session.resume(&mut frag, Some(b"* OK server ready\r\n")) {
+        assert!(matches!(
+            session.resume(&mut frag, Some(b"* OK server ready\r\n")),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag)
+        ));
+
+        let command = match session.resume(&mut frag, Some(b"A1")) {
             ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => bytes,
             state => panic!("expected WantsWrite, got {state:?}"),
         };

@@ -10,7 +10,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions},
 //! };
@@ -25,12 +25,18 @@
 //!     ensure_capabilities: true,
 //! };
 //! let mut coroutine = ImapGreetingGet::new(opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let greeting = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -283,7 +289,10 @@ mod tests {
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_read(&mut greeting, &mut frag);
-        expect_wants_write_after(&mut greeting, &mut frag, b"* OK hello\r\n");
+        expect_wants_tag_after(&mut greeting, &mut frag, b"* OK hello\r\n");
+
+        let bytes = expect_wants_write_after(&mut greeting, &mut frag, b"A1");
+        assert_eq!(bytes, b"A1 CAPABILITY\r\n");
     }
 
     #[test]
@@ -349,6 +358,13 @@ mod tests {
         match cor.resume(frag, None) {
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
             state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_tag_after(cor: &mut ImapGreetingGet, frag: &mut Fragmentizer, arg: &[u8]) {
+        match cor.resume(frag, Some(arg)) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
         }
     }
 

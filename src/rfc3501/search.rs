@@ -9,7 +9,10 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::{fragmentizer::Fragmentizer, imap_types::core::Vec1},
+//!     codec::{
+//!         fragmentizer::Fragmentizer,
+//!         imap_types::core::{TagGenerator, Vec1},
+//!     },
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc3501::search::{ImapMessageSearch, ImapMessageSearchOptions},
 //!     types::search::SearchKey,
@@ -24,12 +27,18 @@
 //! let criteria = Vec1::try_from(vec![SearchKey::Unseen]).unwrap();
 //! let opts = ImapMessageSearchOptions::default();
 //! let mut coroutine = ImapMessageSearch::new(criteria, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let ids = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -53,7 +62,7 @@ use imap_codec::{
     fragmentizer::Fragmentizer,
     imap_types::{
         command::{Command, CommandBody},
-        core::{Charset, TagGenerator, Vec1},
+        core::{Charset, Tag, Vec1},
         response::{Data, StatusKind, Tagged},
         search::SearchKey,
     },
@@ -104,8 +113,10 @@ impl ImapMessageSearch {
     /// rejects non-ASCII criteria without the charset, Outlook rejects
     /// the charset itself.
     pub fn new(criteria: Vec1<SearchKey<'static>>, opts: ImapMessageSearchOptions) -> Self {
+        // NOTE: the probe tag only lets the codec serialise the criteria
+        // for the ASCII check; the real tag comes from the caller.
         let mut command = Command {
-            tag: TagGenerator::new().generate(),
+            tag: Tag::try_from("A").expect("A is a valid tag"),
             body: CommandBody::Search {
                 charset: None,
                 criteria,
@@ -121,9 +132,11 @@ impl ImapMessageSearch {
             *charset = Some(Charset::try_from("UTF-8").expect("UTF-8 is a valid charset"));
         }
 
-        trace!("send IMAP command {command:?}");
+        let body = command.body;
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        trace!("send IMAP command {body:?}");
+
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -205,7 +218,8 @@ mod tests {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut search, &mut frag, None);
+        expect_wants_tag(&mut search, &mut frag);
+        let bytes = expect_wants_write(&mut search, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         let tag = first_word(line).to_owned();
         assert!(line.contains(" SEARCH ALL\r\n"));
@@ -224,7 +238,8 @@ mod tests {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions { uid: true });
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut search, &mut frag, None);
+        expect_wants_tag(&mut search, &mut frag);
+        let bytes = expect_wants_write(&mut search, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         assert!(line.contains(" UID SEARCH ALL\r\n"));
     }
@@ -236,7 +251,8 @@ mod tests {
         let mut search = ImapMessageSearch::new(criteria, ImapMessageSearchOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut search, &mut frag, None);
+        expect_wants_tag(&mut search, &mut frag);
+        let bytes = expect_wants_write(&mut search, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&bytes).expect("utf8 command");
         assert!(line.contains(" SEARCH CHARSET UTF-8 FROM "));
     }
@@ -246,7 +262,8 @@ mod tests {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut search, &mut frag, None);
+        expect_wants_tag(&mut search, &mut frag);
+        let bytes = expect_wants_write(&mut search, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut search, &mut frag);
@@ -264,7 +281,8 @@ mod tests {
         let mut search = ImapMessageSearch::new(criteria(), ImapMessageSearchOptions::default());
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut search, &mut frag, None);
+        expect_wants_tag(&mut search, &mut frag);
+        let _ = expect_wants_write(&mut search, &mut frag, Some(b"A1"));
         expect_wants_read(&mut search, &mut frag);
 
         let err = expect_complete_err(&mut search, &mut frag, b"* BYE going down\r\n");
@@ -272,6 +290,13 @@ mod tests {
             panic!("expected ImapMessageSearchError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapMessageSearch, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

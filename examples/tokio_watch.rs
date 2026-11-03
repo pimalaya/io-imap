@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::{env, error::Error, sync::Arc};
 
 use io_imap::{
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::*,
     session::*,
     types::{mailbox::Mailbox, response::Capability},
@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 struct TokioSession {
     stream: TlsStream<TcpStream>,
     fragmentizer: Fragmentizer,
+    tags: TagGenerator,
     capability: Vec<Capability<'static>>,
 }
 
@@ -130,9 +131,11 @@ impl TokioSession {
         let opts = ImapSessionOpenOptions::default();
         let mut session = ImapSessionOpen::new(transport, sasl, opts);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+        let mut tags = TagGenerator::new();
         let mut stream: Option<TlsStream<TcpStream>> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         // NOTE: the state machine asks for the connect before any read
         // or write, so the socket is open by the time those arrive.
@@ -148,6 +151,10 @@ impl TokioSession {
                     let sock = TcpStream::connect((host.as_str(), port)).await?;
 
                     stream = Some(connector.connect(name, sock).await?);
+                }
+                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag) => {
+                    tag = tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
                     let stream = stream.as_mut().expect("session connects before it reads");
@@ -169,6 +176,7 @@ impl TokioSession {
         Ok(Self {
             stream: stream.expect("session connects before it completes"),
             fragmentizer,
+            tags,
             capability,
         })
     }
@@ -208,6 +216,10 @@ impl TokioSession {
                 ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes).await?;
                     arg = None;
+                }
+                ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {
+                    let tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes().to_vec());
                 }
                 ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
                     // NOTE: the read and the shutdown signal race here.

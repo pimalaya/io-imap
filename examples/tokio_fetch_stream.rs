@@ -29,7 +29,7 @@ use core::num::NonZeroU32;
 use std::{env, error::Error, sync::Arc};
 
 use io_imap::{
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::*,
     rfc3501::{fetch_stream::*, select::*},
     session::*,
@@ -101,6 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 struct TokioSession {
     stream: TlsStream<TcpStream>,
     fragmentizer: Fragmentizer,
+    tags: TagGenerator,
 }
 
 impl TokioSession {
@@ -125,9 +126,11 @@ impl TokioSession {
         let opts = ImapSessionOpenOptions::default();
         let mut session = ImapSessionOpen::new(transport, sasl, opts);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+        let mut tags = TagGenerator::new();
         let mut stream: Option<TlsStream<TcpStream>> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         // NOTE: the state machine asks for the connect before any read
         // or write, so the socket is open by the time those arrive.
@@ -138,6 +141,7 @@ impl TokioSession {
                     return Ok(Self {
                         stream: stream.expect("session connects before it completes"),
                         fragmentizer,
+                        tags,
                     });
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTlsConnect {
@@ -148,6 +152,10 @@ impl TokioSession {
                     let sock = TcpStream::connect((host.as_str(), port)).await?;
 
                     stream = Some(connector.connect(name, sock).await?);
+                }
+                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag) => {
+                    tag = tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
                 }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
                     let stream = stream.as_mut().expect("session connects before it reads");
@@ -182,11 +190,16 @@ impl TokioSession {
     {
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = self.stream.read(&mut buf).await?;
 
@@ -215,6 +228,7 @@ impl TokioSession {
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
@@ -223,6 +237,10 @@ impl TokioSession {
                     sink.flush().await?;
 
                     return Ok(());
+                }
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
                     let n = self.stream.read(&mut buf).await?;

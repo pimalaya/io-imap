@@ -28,7 +28,7 @@ use imap_codec::{
     fragmentizer::Fragmentizer,
     imap_types::{
         command::SelectParameter,
-        core::{IString, NString, Vec1},
+        core::{IString, NString, TagGenerator, Vec1},
         extensions::{
             enable::CapabilityEnable,
             sort::SortCriterion,
@@ -771,6 +771,9 @@ pub struct ImapClientStd {
     /// The connection-wide parser buffer shared by every coroutine run
     /// on this connection.
     pub fragmentizer: Fragmentizer,
+    /// The generator answering the `WantsTag` of every coroutine run
+    /// on this connection.
+    pub tags: TagGenerator,
     /// ID parameters consumed by every auth_*/login call; required by
     /// a few providers (mail.qq.com, fastmail).
     ///
@@ -792,11 +795,16 @@ impl ImapClient for ImapClientStd {
     {
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
@@ -817,6 +825,7 @@ impl ImapClientStd {
         Self {
             stream: Box::new(stream),
             fragmentizer: Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE),
+            tags: TagGenerator::new(),
             auto_id: None,
             pre_authenticated: false,
         }
@@ -864,6 +873,7 @@ impl ImapClientStd {
         };
         let mut watcher = ImapMailboxWatch::new(capability, mailbox, shutdown.clone(), watch_opts);
         let mut fragmentizer = self.fragmentizer;
+        let mut tags = self.tags;
         let mut stream = self.stream;
 
         stream.set_read_timeout(Some(opts.shutdown_poll))?;
@@ -884,6 +894,10 @@ impl ImapClientStd {
                         }
                     }
                     ImapCoroutineState::Complete(Ok(())) => return,
+                    ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {
+                        let tag = tags.generate();
+                        arg = Some(tag.as_ref().as_bytes().to_vec());
+                    }
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
                         match stream.read(&mut buf) {
                             Ok(0) => {
@@ -973,11 +987,16 @@ impl ImapClientStd {
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(())) => return Ok(()),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
                     let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
@@ -1035,11 +1054,16 @@ impl ImapClientStd {
         // committed at MessageEnd.
         let mut current: Option<(u32, S)> = None;
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(())) => return Ok(()),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsRead) => {
                     let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);
@@ -1105,11 +1129,16 @@ impl ImapClientStd {
         let mut coroutine = ImapMessageAppendStream::new(mailbox, len as u32, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         loop {
             match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                 ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                 ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsTag) => {
+                    tag = self.tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
                     let n = self.read_response(&mut buf)?;
                     arg = Some(&buf[..n]);

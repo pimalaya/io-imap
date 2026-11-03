@@ -13,7 +13,7 @@ use std::{
 };
 
 use io_imap::{
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions},
 };
@@ -40,6 +40,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut stream = StreamOwned::new(tls, sock);
 
     let mut fragmentizer = Fragmentizer::new(50 * 1024 * 1024);
+
+    let mut tags = TagGenerator::new();
     let mut buf = [0u8; 4096];
 
     let opts = ImapGreetingGetOptions {
@@ -47,11 +49,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut coroutine = ImapGreetingGet::new(opts);
     let mut arg = None;
+    let mut tag;
 
     let greeting = loop {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                 stream.write_all(&bytes)?;
+            }
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                tag = tags.generate();
+                arg = Some(tag.as_ref().as_bytes());
             }
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                 let n = stream.read(&mut buf)?;

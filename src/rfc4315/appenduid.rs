@@ -10,7 +10,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
 //!     rfc4315::appenduid::{ImapAppendUid, ImapAppendUidOptions},
 //!     types::{
@@ -31,12 +31,18 @@
 //! ));
 //! let opts = ImapAppendUidOptions::default();
 //! let mut coroutine = ImapAppendUid::new(mailbox, message, opts);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! let appenduid = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
+//!         }
+//!         ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
 //!             let n = stream.read(&mut buf).unwrap();
@@ -58,8 +64,7 @@ use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
     imap_types::{
-        command::{Command, CommandBody},
-        core::TagGenerator,
+        command::CommandBody,
         datetime::DateTime,
         extensions::binary::LiteralOrLiteral8,
         flag::Flag,
@@ -117,19 +122,16 @@ impl ImapAppendUid {
     ) -> Self {
         encode_inplace(&mut mailbox);
 
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Append {
-                mailbox,
-                flags: opts.flags,
-                date: opts.date,
-                message,
-            },
+        let body = CommandBody::Append {
+            mailbox,
+            flags: opts.flags,
+            date: opts.date,
+            message,
         };
 
-        trace!("send IMAP command {command:?}");
+        trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::new(CommandCodec::new(), command));
+        let state = State::Send(ImapSend::command(body));
 
         Self { state }
     }
@@ -213,7 +215,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut append, &mut frag);
@@ -235,7 +238,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut append, &mut frag);
@@ -255,7 +259,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let bytes = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
         expect_wants_read(&mut append, &mut frag);
@@ -278,7 +283,8 @@ mod tests {
         );
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
-        let _ = expect_wants_write(&mut append, &mut frag, None);
+        expect_wants_tag(&mut append, &mut frag);
+        let _ = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         expect_wants_read(&mut append, &mut frag);
 
         let err = expect_complete_err(&mut append, &mut frag, b"* BYE going down\r\n");
@@ -286,6 +292,13 @@ mod tests {
             panic!("expected ImapAppendUidError::Bye, got {err:?}");
         };
         assert_eq!(text, "going down");
+    }
+
+    fn expect_wants_tag(cor: &mut ImapAppendUid, frag: &mut Fragmentizer) {
+        match cor.resume(frag, None) {
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => {}
+            state => panic!("expected WantsTag, got {state:?}"),
+        }
     }
 
     fn expect_wants_write(

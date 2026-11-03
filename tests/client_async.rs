@@ -70,6 +70,9 @@ impl ImapClientAsync for FakeClientAsync {
                             .to_string();
                         arg = None;
                     }
+                    ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                        arg = Some(b"A1".to_vec());
+                    }
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         // NOTE: a real await point, so the future has to
                         // hold the coroutine across it. That is what

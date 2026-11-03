@@ -23,7 +23,7 @@ use std::{env, error::Error, io, sync::Arc};
 
 use io_imap::{
     client::{ImapClientAsync, ImapClientError},
-    codec::fragmentizer::Fragmentizer,
+    codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
     coroutine::*,
     session::*,
     types::{
@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 struct ImapClientTokio {
     stream: TokioStream,
     fragmentizer: Fragmentizer,
+    tags: TagGenerator,
 }
 
 impl ImapClientTokio {
@@ -123,9 +124,11 @@ impl ImapClientTokio {
         let transport = ImapSessionTransport::from_url(url)?;
         let mut session = ImapSessionOpen::new(transport, sasl, opts);
         let mut fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+        let mut tags = TagGenerator::new();
         let mut stream: Option<TokioStream> = None;
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
+        let mut tag;
 
         // NOTE: WantsTlsUpgrade carries no payload, so the host name of
         // the plaintext connect is kept for the certificate check the
@@ -144,6 +147,7 @@ impl ImapClientTokio {
                     let client = Self {
                         stream: stream.ok_or_else(missing)?,
                         fragmentizer,
+                        tags,
                     };
 
                     return Ok((client, data.capability));
@@ -183,6 +187,10 @@ impl ImapClientTokio {
 
                     stream = Some(plain.upgrade_tls(connector, &tls_host).await?);
                 }
+                ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag) => {
+                    tag = tags.generate();
+                    arg = Some(tag.as_ref().as_bytes());
+                }
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead) => {
                     let n = stream.as_mut().ok_or_else(missing)?.read(&mut buf).await?;
 
@@ -219,11 +227,16 @@ impl ImapClientAsync for ImapClientTokio {
         async move {
             let mut buf = [0u8; READ_BUFFER_SIZE];
             let mut arg: Option<&[u8]> = None;
+            let mut tag;
 
             loop {
                 match coroutine.resume(&mut self.fragmentizer, arg.take()) {
                     ImapCoroutineState::Complete(Ok(out)) => return Ok(out),
                     ImapCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                    ImapCoroutineState::Yielded(ImapYield::WantsTag) => {
+                        tag = self.tags.generate();
+                        arg = Some(tag.as_ref().as_bytes());
+                    }
                     ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         let n = self.stream.read(&mut buf).await?;
 
