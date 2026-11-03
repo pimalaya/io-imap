@@ -22,18 +22,13 @@ This library is composed of 3 feature-gated layers:
 
 ## Features
 
-- **I/O-free coroutines**: state machines with no socket, no async runtime and no forced I/O model; run them from any blocking, async or test harness.
-- **Complete IMAP4rev1 command set**: manage mailboxes, messages, flags and searches over a full standard session lifecycle.
-- **Push notifications**: keep a mailbox open with IDLE and receive live change events, refreshed periodically to survive middle-boxes.
-- **Incremental resync**: pull only what changed since the last sync with CONDSTORE and QRESYNC, powering the built-in mailbox watcher.
-- **Server-side sorting and threading**: SORT and THREAD support, with a client-side sorting fallback for servers lacking the extension.
-- **Streaming upload and download**: message bodies flow straight between the socket and your storage, never held in memory whole.
-- **SASL authentication**: ANONYMOUS, LOGIN, PLAIN, XOAUTH2, OAUTHBEARER and SCRAM-SHA-256 mechanisms, with optional client identification for providers requiring it.
-- **Light client**: a standard, blocking client exposing one method per IMAP command over a stream you opened yourself.
-- **Full client** with **TLS** support:
-  - [Rustls](https://crates.io/crates/rustls) with ring crypto (requires `rustls-ring` feature, enabled by default)
-  - [Rustls](https://crates.io/crates/rustls) with aws crypto (requires `rustls-aws` feature)
-  - [Native TLS](https://crates.io/crates/native-tls) (requires `native-tls` feature)
+- **I/O-free coroutines**: no_std state machines, usable from any blocking or async runtime.
+- **IMAP4rev1 command set**: mailboxes, messages, flags and searches over a full session.
+- **Push notifications**: watch a mailbox with IDLE and receive live change events.
+- **Incremental resync**: pull only what changed since the last sync with CONDSTORE and QRESYNC.
+- **Streaming transfers**: message bodies flow between socket and storage, never held in memory whole.
+- **SASL authentication**: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-256 and ANONYMOUS.
+- **Full client**: blocking client with TLS via Rustls (`rustls-ring` default, `rustls-aws`) or Native TLS (`native-tls`).
 
 > [!TIP]
 > I/O IMAP is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate backend support. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-imap/latest/features).
@@ -51,7 +46,7 @@ This library is composed of 3 feature-gated layers:
 | [5161] | ENABLE: explicit activation of server capabilities                                                                                         |
 | [5256] | SORT and THREAD: server-side message sorting and threading, with a client-side sorting fallback for servers lacking the extension          |
 | [6851] | MOVE: atomic message move between mailboxes                                                                                                |
-| [7162] | CONDSTORE and QRESYNC: incremental resync through mod-sequences and vanished message reporting on select, examine and fetch                |
+| [7162] | CONDSTORE and QRESYNC: incremental resync through mod-sequences and vanished message reporting on select and examine                       |
 | [7628] | OAUTHBEARER: OAuth 2.0 bearer token authentication, next to the pre-standard XOAUTH2                                                       |
 | [7677] | SCRAM-SHA-256: salted challenge-response authentication                                                                                    |
 
@@ -81,8 +76,9 @@ Have also a look at real-world projects built on top of this library:
 - [Himalaya CLI](https://github.com/pimalaya/himalaya): CLI to manage emails
 - [Himalaya TUI](https://github.com/pimalaya/himalaya-tui): TUI to manage emails
 - [Neverest](https://github.com/pimalaya/neverest): CLI to synchronize emails
-- [Mirador](https://github.com/pimalaya/mirador): CLI to watch mailbox changes and fire hooks on every event
+- [Carillon](https://github.com/pimalaya/carillon): CLI to watch PIM collection changes and fire hooks on every event
 - [Sirup](https://github.com/pimalaya/sirup): CLI to spawn pre-authenticated IMAP/SMTP sessions and expose them via Unix sockets
+- [Pimalaya Android](https://github.com/pimalaya/android): Android app to manage your personal information
 
 ## License
 

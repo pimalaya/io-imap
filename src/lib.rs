@@ -6,8 +6,8 @@
 //!
 //! I/O-free IMAP client coroutines built on
 //! [imap-codec](https://docs.rs/imap-codec): every command exchange is
-//! a resumable state machine emitting read and write requests instead
-//! of performing I/O itself, so the caller owns the socket and pumps
+//! a resumable state machine emitting tag, read and write requests
+//! instead of performing I/O itself, so the caller owns the socket and pumps
 //! the coroutine (see the `client` feature for a ready-made
 //! std-blocking pump). imap-codec is re-exported as [`codec`], with
 //! imap-types as [`types`], so consumers encode and decode with the
@@ -49,9 +49,12 @@
 //! [`coroutine::ImapCoroutineState`]: either a yield or the terminal
 //! result. The [`imap_try!`] macro is the coroutine equivalent of `?`.
 //!
-//! The standard yield is [`coroutine::ImapYield`]: WantsRead (the
-//! caller reads more bytes and feeds them back, `Some(&[])` on EOF) or
-//! WantsWrite (the caller writes the given bytes). Coroutines that
+//! The standard yield is [`coroutine::ImapYield`]: WantsTag (the caller
+//! feeds back the tag of the next command), WantsRead (the caller reads
+//! more bytes and feeds them back, `Some(&[])` on EOF) or WantsWrite
+//! (the caller writes the given bytes). Coroutines never generate tags,
+//! which keeps the core free of randomness and std; only raw commands
+//! carry the tags their caller wrote. Coroutines that
 //! need richer signals declare their own yield enum: the IDLE and
 //! mailbox-watch coroutines add an Event variant, and the streaming
 //! APPEND and FETCH coroutines add WantsStream / BodyChunk variants so
@@ -61,14 +64,17 @@
 //! ## The send primitive
 //!
 //! Every command-shaped coroutine delegates to one shared primitive:
-//! [`send::ImapSend`]. It serialises the command through imap-codec
-//! (handling synchronising literals by pausing until the server
-//! continuation), then collects the response: data and untagged
-//! status lines accumulate, a tagged, bye or continuation-request line
-//! terminates, and undecodable untagged lines are skipped instead of
-//! failing the whole command. Its terminal value is
-//! [`send::ImapSendOutput`]; failures surface as
-//! [`send::ImapSendError`]. The receive-only constructor
+//! [`send::ImapSend`]. [`send::ImapSend::command`] first asks for the
+//! tag, then serialises the command through imap-codec (handling
+//! synchronising literals by pausing until the server continuation),
+//! then collects the response: data and untagged status lines
+//! accumulate, the tagged completion of its own command, a bye or a
+//! continuation request terminates, and undecodable untagged lines and
+//! the tagged completions of other commands are skipped. Its terminal
+//! value is [`send::ImapSendOutput`]; failures surface as
+//! [`send::ImapSendError`]. Messages without a tag of their own (SASL
+//! continuations, IDLE DONE) go through [`send::ImapSend::new`] with
+//! the tag of the command they continue, and the receive-only
 //! [`send::ImapSend::receive`] parses the response of a request whose
 //! bytes were written out of band (used by the streamed APPEND).
 //!
@@ -93,7 +99,7 @@
 //! transport selection, the optional STARTTLS upgrade, the greeting,
 //! PREAUTH detection, the SASL-IR policy and the SASL exchange. It
 //! yields transport requests (connect this socket, upgrade that one)
-//! alongside the usual reads and writes, so a caller on any runtime
+//! alongside the usual tag, read and write requests, so a caller on any runtime
 //! answers them with its own sockets and inherits the ordering and the
 //! provider quirks. The std client is a thirty-line pump over it.
 //!
@@ -120,7 +126,8 @@
 //!
 //! [`client::ImapClientStd`] (`client` feature) is the in-tree
 //! implementation, wrapping any blocking `Read + Write` stream plus a
-//! per-connection `Fragmentizer`. Its connect constructor (TLS features)
+//! per-connection `Fragmentizer` and the imap-types `TagGenerator`
+//! answering every tag request. Its connect constructor (TLS features)
 //! is a pump over [`session::ImapSessionOpen`] answering the transport
 //! yields with pimalaya-stream, and the four opinionated methods
 //! (mailbox watch, streamed APPEND, the two streamed FETCHes) stay

@@ -7,7 +7,7 @@ Whether you are a human or an AI agent, read these in order before touching the 
 1. the [Pimalaya README](https://github.com/pimalaya) for what the project is and how its repositories stack;
 2. the [Pimalaya CONTRIBUTING](https://github.com/pimalaya/.github/blob/master/CONTRIBUTING.md) guide, which chains to the shared architecture and guidelines;
 3. the inline header documentation, starting with src/lib.rs: it is the architecture document of this crate;
-4. the docs/ folder for the development history and living plans.
+4. the cairn/ folder: the living spec, the change proposals and the dated log.
 
 Everything below documents only what differs from the Pimalaya standards.
 
@@ -24,15 +24,16 @@ cargo build                                                  # full client (scra
 
 ## End-to-end tests
 
-Besides the unit and doc tests, three ignored end-to-end tests run the full coroutine flow against real servers. The Stalwart one is self-contained: tests/stalwart.sh spawns a pre-provisioned local instance in a container, then:
+Besides the unit and doc tests, four ignored end-to-end test files run the full coroutine flow against real servers. The Stalwart one is self-contained: tests/stalwart.sh spawns a pre-provisioned local instance in a container, then:
 
 ```sh
 cargo test --test stalwart -- --ignored
 ```
 
-The Fastmail and Gmail ones need real credentials in the environment; see the doc comment of each test file:
+The Fastmail, Gmail and Outlook ones need real credentials in the environment; see the doc comment of each test file for the OAuth variants:
 
 ```sh
 FASTMAIL_EMAIL=user@fastmail.com FASTMAIL_APP_PASSWORD=xxx cargo test --test fastmail -- --ignored
-GMAIL_EMAIL=user@gmail.com GMAIL_APP_PASSWORD=xxx cargo test --test gmail -- --ignored
+GMAIL_EMAIL=user@gmail.com GMAIL_APP_PASSWORD=xxx cargo test --test gmail gmail -- --ignored
+IMAP_MICROSOFT_TENANT_ID=xxx IMAP_MICROSOFT_CLIENT_ID=xxx IMAP_MICROSOFT_CLIENT_SECRET=xxx cargo test --test outlook -- --ignored
 ```

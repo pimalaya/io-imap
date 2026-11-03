@@ -1,5 +1,6 @@
 //! Blocking IMAP client wrapping a `Read + Write` stream with a
-//! per-connection [`Fragmentizer`] and one method per coroutine.
+//! per-connection [`Fragmentizer`] and tag generator, and one method
+//! per coroutine.
 //!
 //! Session state is intentionally not cached: callers retain what
 //! they need (capability list, selected mailbox, ...).
@@ -287,7 +288,7 @@ macro_rules! imap_client_commands {
         /// [`run`]: Self::run
         pub trait ImapClient {
             /// Runs a standard-shape coroutine to completion, fulfilling
-            /// its read and write requests against the transport.
+            /// its tag, read and write requests against the transport.
             fn run<C, T, E>(&mut self, coroutine: C) -> Result<T, ImapClientError>
             where
                 C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
@@ -357,7 +358,7 @@ macro_rules! imap_client_commands {
         /// perfectly good client built on a thread-affine handle.
         pub trait ImapClientAsync: Send {
             /// Runs a standard-shape coroutine to completion, fulfilling
-            /// its read and write requests against the transport.
+            /// its tag, read and write requests against the transport.
             fn run<C, T, E>(
                 &mut self,
                 coroutine: C,

@@ -10,7 +10,7 @@
 //! every other runtime, so it lives here as a coroutine instead.
 //!
 //! Unlike a command coroutine, [`ImapSessionOpen`] yields transport
-//! requests as well as reads and writes: connect this socket, upgrade
+//! requests as well as tags, reads and writes: connect this socket, upgrade
 //! that one to TLS. The caller answers them with whatever sockets its
 //! runtime has, and inherits the ordering and the provider quirks for
 //! free. A caller that skips a step cannot advance, because the state

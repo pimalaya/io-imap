@@ -19,7 +19,7 @@
 //! };
 //!
 //! use io_imap::{
-//!     codec::fragmentizer::Fragmentizer,
+//!     codec::{fragmentizer::Fragmentizer, imap_types::core::TagGenerator},
 //!     coroutine::{ImapCoroutine, ImapCoroutineState},
 //!     rfc3501::fetch_stream::{
 //!         ImapMessageFetchStream, ImapMessageFetchStreamYield,
@@ -35,12 +35,15 @@
 //!
 //! let id = NonZeroU32::new(42).unwrap();
 //! let mut coroutine = ImapMessageFetchStream::new(id, true);
+//! let mut tags = TagGenerator::new();
+//! let mut tag;
 //! let mut arg = None;
 //!
 //! loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
-//!             arg = Some(b"A1");
+//!             tag = tags.generate();
+//!             arg = Some(tag.as_ref().as_bytes());
 //!         }
 //!         ImapCoroutineState::Yielded(
 //!             ImapMessageFetchStreamYield::WantsWrite(bytes),

@@ -36,8 +36,8 @@ pub trait ImapCoroutine {
     ) -> ImapCoroutineState<Self::Yield, Self::Return>;
 }
 
-/// Standard socket-I/O yield variants; pick another type when extra
-/// variants (events, etc.) are needed.
+/// Standard yield variants: the next command tag and socket I/O; pick
+/// another type when extra variants (events, etc.) are needed.
 #[derive(Debug)]
 pub enum ImapYield {
     /// The caller resumes with the tag of the next command, unique on

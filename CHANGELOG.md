@@ -8,13 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`, whose `max_literal_len` (100 MiB by default) and per-UID `sizes` bound the bodies a server may announce, failing with the new `LiteralTooLong` error.
+- Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`.
+
+  Its `max_literal_len` (100 MiB by default) and per-UID `sizes` bound the bodies a server may announce, failing with the new `LiteralTooLong` error.
+
 - Added `client::ImapClientStd::tags`, the generator answering every `WantsTag` on the connection.
 - Added `send::ImapSendOutput::tag`, the tag of the command the exchange belongs to.
 
 ### Changed
-
-- **BREAKING**: `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch::new` takes `(sequence_set, opts)`, the `uid` flag moving into `ImapMessageFetchStreamBatchOptions`.
 
 - **BREAKING**: Changed every coroutine to ask its caller for command tags through the new `coroutine::ImapYield::WantsTag`.
 
@@ -22,35 +23,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **BREAKING**: Changed `send::ImapSend::new` and `send::ImapSend::receive` to take the tag of the command whose completion ends the exchange.
 - **BREAKING**: Changed `rfc3501::select::ImapMailboxSelectData::vanished_earlier` to inclusive UID ranges.
+- **BREAKING**: Changed `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch::new` to take `(sequence_set, opts)`, the `uid` flag moving into its options.
 
 ### Fixed
 
-- Fixed a tagged completion of another command ending an exchange and lending it its status: it is now skipped.
-- Fixed SELECT and EXAMINE expanding a `VANISHED (EARLIER)` set into one entry per UID, so `1:4294967295` from a server allocated about 16 GiB.
-
 - Fixed bare builds pulling std through imap-codec's `tag_generator` feature, now enabled by `client` only ([pimalaya/io-imap#4](https://github.com/pimalaya/io-imap/issues/4)).
+- Fixed the build against abnf-core 0.6.1.
 
-- Fixed the build against abnf-core 0.6.1, which no longer enables nom's default features that imap-codec 2.0.0-alpha.9 relied on. io-imap now requires imap-codec 2.0.0-alpha.10, which requests nom's `alloc` feature itself.
+  imap-codec 2.0.0-alpha.9 relied on nom features abnf-core no longer enables. io-imap now requires imap-codec 2.0.0-alpha.10, which requests them itself.
 
-- Fixed FETCH responses carrying a `NIL` body parameter value, such as Mail.ru's `("boundary" NIL)`, being dropped as undecodable. imap-codec 2.0.0-alpha.10 reads the value as an empty string through its default `quirk` set ([pimalaya/himalaya#649](https://github.com/pimalaya/himalaya/issues/649)).
+- Fixed FETCH responses with a `NIL` body parameter value being dropped as undecodable ([pimalaya/himalaya#649](https://github.com/pimalaya/himalaya/issues/649)).
 
-- Fixed `rfc3501::greeting::ImapGreetingGet` panicking on a greeting carrying a literal, which anyone on the path of a plaintext connection could send. It now fails with `DecodingFailure` on the literal announcement.
+  Mail.ru sends `("boundary" NIL)`, which imap-codec 2.0.0-alpha.10 reads as an empty string.
 
-- Fixed the batched and single FETCH body streams and `rfc3501::starttls::ImapStartTls` buffering an endless response line without bound and rescanning it on every read. Lines are scanned incrementally and capped (1 MiB, 64 KiB before STARTTLS), failing with the new `LineTooLong` errors.
+- Fixed a tagged completion of another command ending an exchange and lending it its status: it is now skipped.
+- Fixed SELECT and EXAMINE expanding a `VANISHED (EARLIER)` set into one entry per UID.
 
-- Fixed LOGIN, AUTHENTICATE and raw commands logging their arguments at trace level, which leaked passwords and SASL initial responses in debug builds. Authentication commands now log only their tag and name, raw batches only their command count.
+  A server announcing `1:4294967295` made the client allocate about 16 GiB. The set is now kept as ranges.
 
-- Fixed `rfc3501::copy::ImapMessageCopy` and `rfc6851::r#move::ImapMessageMove` reporting no COPYUID when the server sends one with a UIDVALIDITY of `0`, such as Mailo's `OK [COPYUID 0 1582 22704]`, which RFC 4315 forbids and imap-codec leaves unparsed. That code is now read with its UID sets, the UIDVALIDITY returned as `0`; any other deviation from the grammar still gives no COPYUID ([pimalaya/himalaya#781](https://github.com/pimalaya/himalaya/issues/781)).
+- Fixed `rfc3501::greeting::ImapGreetingGet` panicking on a greeting carrying a literal.
 
-- Fixed `client::ImapClientAsync::login` failing to compile on rustc 1.88 to 1.91, the declared minimum included, with E0308 (one type is more general than the other). Its default body now boxes the future instead of awaiting in an async block.
+  Anyone on the path of a plaintext connection could send one. It now fails with `DecodingFailure`.
+
+- Fixed the FETCH body streams and `rfc3501::starttls::ImapStartTls` buffering an endless response line.
+
+  Lines are scanned incrementally and capped (1 MiB, 64 KiB before STARTTLS), failing with the new `LineTooLong` errors.
+
+- Fixed LOGIN, AUTHENTICATE and raw commands logging credentials at trace level.
+
+  Authentication commands now log only their name, raw batches only their command count.
+
+- Fixed `rfc3501::copy::ImapMessageCopy` and `rfc6851::r#move::ImapMessageMove` dropping a COPYUID whose UIDVALIDITY is `0` ([pimalaya/himalaya#781](https://github.com/pimalaya/himalaya/issues/781)).
+
+  Mailo sends `OK [COPYUID 0 1582 22704]`, which RFC 4315 forbids. Its UID sets are now read, the UIDVALIDITY returned as `0`.
+
+- Fixed `client::ImapClientAsync::login` failing to compile on rustc 1.88 to 1.91 (E0308).
+
+  Its default body now boxes the future instead of awaiting in an async block.
+
+### Removed
+
+- Removed the docs/ folder, replaced by cairn/.
 
 ## [0.7.1] - 2026-10-01
 
 ### Fixed
 
-- `rfc3501::search::ImapMessageSearch` sends `CHARSET UTF-8` only when its criteria hold non-ASCII bytes, and no charset otherwise.
+- Fixed `rfc3501::search::ImapMessageSearch` sending `CHARSET UTF-8` with ASCII criteria ([pimalaya/himalaya#769](https://github.com/pimalaya/himalaya/issues/769)).
 
-  Always sending it broke Outlook, which rejects the UTF-8 charset with `NO`, for every search including ASCII ones ([pimalaya/himalaya#769](https://github.com/pimalaya/himalaya/issues/769)). US-ASCII is the default RFC 3501 requires every server to support; Gmail still gets the charset its non-ASCII criteria need. The SORT fallback inherits the fix.
+  Outlook rejects that charset with `NO`, failing every search. It is now sent only for non-ASCII criteria, and the SORT fallback inherits the fix.
 
 ## [0.7.0] - 2026-09-29
 
@@ -60,45 +81,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- **BREAKING**: `ImapClientStd::connect` takes `(url, opts)`, the TLS configuration, the SASL mechanism and the session options moving into `ImapClientStdConnectOptions`.
+- **BREAKING**: Changed `ImapClientStd::connect` to take `(url, opts)`.
+
+  The TLS configuration, the SASL mechanism and the session options moved into `ImapClientStdConnectOptions`.
 
 ## [0.6.1] - 2026-09-26
 
 ### Fixed
 
-- Fixed `rfc3501::search::ImapMessageSearch` sending no charset.
+- Fixed `rfc3501::search::ImapMessageSearch` sending no charset ([pimalaya/io-imap#3](https://github.com/pimalaya/io-imap/issues/3)).
 
-  It now always sends `CHARSET UTF-8`, as SORT and THREAD do, since Gmail rejects non-ASCII criteria without it ([#3](https://github.com/pimalaya/io-imap/issues/3)).
+  It now always sends `CHARSET UTF-8`, as SORT and THREAD do, since Gmail rejects non-ASCII criteria without it.
 
 ## [0.6.0] - 2026-08-22
 
+### Added
+
+- Added `watch::ImapMailboxWatchOptions::idle_timeout`, also on `client::ImapMailboxWatchStreamOptions`.
+
+  A caller whose server keeps quiet connections open can re-issue IDLE up to every 29 minutes (RFC 2177 §3) instead of every 29 seconds, which `None` keeps.
+
 ### Changed
 
-- Added `watch::ImapMailboxWatchOptions::idle_timeout`, and the same option on `client::ImapMailboxWatchStreamOptions`.
+- **BREAKING**: Changed `watch::ImapMailboxWatch::new` to take `ImapMailboxWatchOptions`, which can select polling instead of IDLE.
 
-  The IDLE was re-issued every 29 seconds, around 120 round trips an hour per watched mailbox. A caller whose server keeps quiet connections open can go up to the 29 minutes of RFC 2177 §3, and `None` keeps the old value.
+  A polling watch yields the new `ImapMailboxWatchYield::WantsWait`, so the caller owns the wait. `client::ImapMailboxWatchStreamOptions` gained the matching `poll` interval.
 
-- Changed `watch::ImapMailboxWatch::new` to take `ImapMailboxWatchOptions`, which can select polling instead of IDLE. **Breaking.**
+- **BREAKING**: Changed `watch::ImapMailboxWatch` to no longer require QRESYNC.
 
-  A polling watch yields the new `ImapMailboxWatchYield::WantsWait`, so the driver owns the wait, an effect an I/O-free coroutine cannot perform. It answers servers that accept IDLE and then never speak.
+  Without it, the watch re-reads the whole mailbox on every wake and diffs locally into the same events. `new` now returns `Self`, and `ImapMailboxWatchError::QresyncUnsupported` is gone.
 
-  `client::ImapMailboxWatchStreamOptions` gained the matching `poll` interval, slept in shutdown-poll steps.
+- **BREAKING**: Changed `client::ImapClientStd::watch_mailbox` to take `ImapMailboxWatchStreamOptions`.
 
-- Changed `watch::ImapMailboxWatch` to no longer require QRESYNC. **Breaking.**
-
-  Without it, the watch EXAMINEs, seeds the same `FETCH 1:* (UID FLAGS)` baseline and re-reads the whole mailbox on every IDLE wake, diffing locally into the same UID-keyed events. The cost scales with the mailbox rather than with the change.
-
-  `ImapMailboxWatch::new` now returns `Self`, and `ImapMailboxWatchError::QresyncUnsupported` is gone.
-
-- Changed `client::ImapClientStd::watch_mailbox` to take `ImapMailboxWatchStreamOptions`. **Breaking.**
-
-  Its `shutdown_poll` field is the worker's read deadline, hence the worst-case latency of `close` against a silent server. The default stays five seconds, and a desktop daemon can lower it.
+  Its `shutdown_poll` field (five seconds by default) is the worst-case latency of `close` against a silent server.
 
 ### Fixed
 
 - Fixed the mailbox watch emitting deltas after the mailbox was recreated under the same name.
 
-  Both paths re-EXAMINE on every wake, and now end the watch with `ImapMailboxWatchError::UidValidityChanged` when UIDVALIDITY changes.
+  It now ends with `ImapMailboxWatchError::UidValidityChanged` when UIDVALIDITY changes.
 
 ## [0.5.0] - 2026-08-15
 
@@ -106,127 +127,97 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added the `session::ImapSessionOpen` coroutine, covering everything from an address to an authenticated session.
 
-  It yields transport requests (`WantsTcpConnect`, `WantsTlsConnect`, `WantsUnixConnect`, `WantsTlsUpgrade`) alongside the usual reads and writes.
-
-  Scheme dispatch, STARTTLS ordering, PREAUTH, the SASL-IR policy and `auto_id` used to live inside `ImapClientStd::connect`. A caller on any runtime now answers the yields with its own sockets and inherits the ordering and the provider quirks.
+  It yields transport requests (`WantsTcpConnect`, `WantsTlsConnect`, `WantsUnixConnect`, `WantsTlsUpgrade`) that a caller on any runtime answers with its own sockets.
 
 - Added the `client::ImapClient` and `client::ImapClientAsync` traits.
 
-  Implementors write one `run` method and inherit forty-odd commands. The five coroutines with their own yields (watch, idle, streamed `APPEND`, both streamed `FETCH`es) stay outside the traits.
+  Implementors write one `run` method and inherit forty-odd commands. `ImapClientAsync` returns `impl Future + Send`, while `ImapClient` has no `Send` bound, for thread-affine clients such as a JNI bridge.
 
-  `ImapClientAsync` returns `impl Future + Send`, so default bodies survive `tokio::spawn`. `ImapClient` has no `Send` bound, so a thread-affine client such as a JNI bridge can implement it.
+- Added `session::ImapSessionOpenOptions::sasl_ir`.
 
-- Added the `session::ImapSessionOpenOptions::sasl_ir` option.
-
-  It forces the RFC 4959 initial response on (`Some(true)`) or off (`Some(false)`), and `None` follows the `SASL-IR` capability. Coremail (126.com, 163.com) advertises `SASL-IR` yet rejects the inline form with `BAD`.
+  It forces the RFC 4959 initial response on or off for servers such as Coremail, which advertise `SASL-IR` yet reject it. `None` follows the capability.
 
 - Added the `url` cargo feature, gating `session::ImapSessionTransport::from_url`.
 
   The TLS features enable it, and a consumer bringing its own TLS can parse IMAP URLs without the std client.
 
-- Added `client::ImapStream::stop_retrying`.
-
-  It makes a transport return "not ready yet" failures instead of retrying them. The watch worker needs it, since its read timeout is a shutdown poll. The default body is empty.
+- Added `client::ImapStream::stop_retrying`, making a transport return "not ready" failures instead of retrying them.
 
 ### Changed
 
-- Changed `sasl::auth_login::ImapAuthLogin` to wrap io-sasl's LOGIN mechanism. **Breaking.**
+- **BREAKING**: Changed `sasl::auth_login::ImapAuthLogin` to wrap io-sasl's LOGIN mechanism.
 
-  The coroutine keeps the IMAP framing and asks the mechanism what each response carries, including whether the tagged `OK` ends the exchange. The wire bytes are unchanged.
+  The wire bytes are unchanged. `ImapAuthLoginError` gained `Mechanism` and lost `UnexpectedContinuationRequest`.
 
-  `ImapAuthLoginError` gained `Mechanism` and lost `UnexpectedContinuationRequest`, an extra prompt now being refused by the mechanism.
+- **BREAKING**: Changed `sasl::auth_plain::ImapAuthPlain` to wrap io-sasl's PLAIN mechanism.
 
-- Changed `sasl::auth_plain::ImapAuthPlain` to wrap io-sasl's PLAIN mechanism. **Breaking.**
+  Its error changed as LOGIN's did. A tagged `OK` now completes the exchange only when the credentials went inline, and fails with `UnexpectedOk` otherwise.
 
-  `ImapAuthPlainError` changed as LOGIN's did. A tagged `OK` to the command now completes the exchange only when the credentials went inline, and fails with `UnexpectedOk` otherwise.
-
-- Changed `sasl::auth_anonymous::ImapAuthAnonymous` to wrap io-sasl's ANONYMOUS mechanism. **Breaking.**
+- **BREAKING**: Changed `sasl::auth_anonymous::ImapAuthAnonymous` to wrap io-sasl's ANONYMOUS mechanism.
 
   `ImapAuthAnonymousError` gained `Mechanism` and lost `UnexpectedContinuationRequest`.
 
-- Changed `sasl::auth_xoauth2::ImapAuthXoauth2` to wrap io-sasl's XOAUTH2 mechanism. **Breaking.**
+- **BREAKING**: Changed `sasl::auth_xoauth2::ImapAuthXoauth2` to wrap io-sasl's XOAUTH2 mechanism.
 
-  The mechanism answers the error challenge with the empty response Google documents, and the JSON is still reported as `NoWithError`.
+  `ImapAuthXoauth2Error` gained `Mechanism` and lost `UnexpectedStatus`. The error JSON is still reported as `NoWithError`.
 
-  `ImapAuthXoauth2Error` gained `Mechanism` and lost `UnexpectedStatus`. An `OK` or `BAD` answer to the acknowledgement now reports what the server actually sent.
+- **BREAKING**: Changed `rfc7628::auth_oauthbearer::ImapAuthOauthbearer` to wrap io-sasl's OAUTHBEARER mechanism.
 
-- Changed `rfc7628::auth_oauthbearer::ImapAuthOauthbearer` to wrap io-sasl's OAUTHBEARER mechanism. **Breaking.**
+  It changed as XOAUTH2 did, answering the error challenge with the `%x01` of RFC 7628 §3.2.3.
 
-  It changed as XOAUTH2 did, the error challenge being answered with the single `%x01` of RFC 7628 §3.2.3.
+- **BREAKING**: Changed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` to wrap io-sasl's SCRAM-SHA-256 mechanism.
 
-- Changed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` to wrap io-sasl's SCRAM-SHA-256 mechanism. **Breaking.**
+  `ImapAuthScramSha256Error` replaced its eleven RFC 5802 variants with a single `Mechanism`.
 
-  All RFC 5802 computation and verification moved to the mechanism. `ImapAuthScramSha256Error` replaced its eleven RFC 5802 variants with a single `Mechanism`.
+- **BREAKING**: Changed `ImapAuthScramSha256::new` to take a single `SaslScramCreds`.
 
-- Changed `ImapAuthScramSha256::new` to take a single `SaslScramCreds`. **Breaking.**
+  The credentials carry the client nonce, so the coroutine draws no randomness, and the channel binding selecting `SCRAM-SHA-256-PLUS`.
 
-  The credentials carry the client nonce, so the coroutine draws no randomness, and the channel binding, which selects `SCRAM-SHA-256-PLUS`. `ImapClientStd::connect` draws a nonce when they carry none.
+- **BREAKING**: Changed the SASL vocabulary to io-sasl's `Sasl` and `SaslMechanism`.
 
-- Changed the SASL vocabulary to io-sasl's `Sasl` and `SaslMechanism`. **Breaking.**
+  Credential structs gained a `Creds` suffix (`SaslPlainCreds`, `SaslLoginCreds`, ...). `ImapSessionOpenError` gained `UnsupportedMechanism` and lost `ScramSha256NotEnabled`.
 
-  `ImapSessionOpen`, `ImapClientStd::connect` and `rfc3501::capability::available_auth_mechanisms` use them in place of pimalaya-stream's. Credential structs gained a `Creds` suffix (`SaslPlainCreds`, `SaslLoginCreds`, ...).
+- **BREAKING**: Moved the command methods from `ImapClientStd` to the `ImapClient` trait.
 
-  `ImapSessionOpenError` gained `UnsupportedMechanism` for mechanisms io-sasl computes but this crate does not frame, and lost `ScramSha256NotEnabled`.
+  Callers add `use io_imap::client::ImapClient;`. `impl AsRef` arguments became `&str` and `&[u8]`, and `status` takes a `Cow<'static, [StatusDataItemName]>`.
 
-- Moved `hmac`, `pbkdf2` and `sha2` to dev-dependencies.
+- **BREAKING**: Renamed `client::ImapClientStdError` to `client::ImapClientError`.
 
-  The SCRAM crypto now lives in io-sasl. The `scram` feature keeps `rand` and enables `io-sasl/scram`.
+  It serves both client traits, and its new `Transport` variant boxes errors from transports whose I/O is not `std::io`.
 
-- Made pimalaya-stream optional, enabled by the TLS provider features.
+- **BREAKING**: Replaced the trailing `ImapClientStd::connect` parameters with `session::ImapSessionOpenOptions`.
 
-  Only the std client uses it now, so the coroutine core is truly `no_std`, depending only on io-sasl and imap-codec.
+  `connect(url, tls, starttls, sasl, auto_id)` became `connect(url, tls, sasl, opts)`.
 
-- Moved the command methods from `ImapClientStd` to the `ImapClient` trait. **Breaking.**
+- **BREAKING**: Bumped pimalaya-stream to 0.3.
 
-  Callers add `use io_imap::client::ImapClient;`. Names and semantics are unchanged, but `impl AsRef<str>` and `impl AsRef<[u8]>` arguments became `&str` and `&[u8]`, and `status` takes a `Cow<'static, [StatusDataItemName]>`.
+  `client::ImapStream` is now implemented for its renamed `stream::Stream`, which arms a one-minute read deadline at connect time.
 
-  `watch_mailbox`, `fetch_body_stream`, `fetch_bodies_stream` and `append_stream` stay inherent to `ImapClientStd`, each encoding a runtime-specific choice.
+- **BREAKING**: Changed `ImapClient::greeting` to return the whole `ImapGreetingOk`.
 
-- Renamed `client::ImapClientStdError` to `client::ImapClientError`. **Breaking.**
+  Callers append `.capability`, and it also reports `pre_authenticated`.
 
-  It now serves both client traits. The new `Transport` variant boxes errors from transports whose I/O is not `std::io`, such as a JNI upcall.
-
-- Replaced the trailing `ImapClientStd::connect` parameters with `session::ImapSessionOpenOptions`. **Breaking.**
-
-  `connect(url, tls, starttls, sasl, auto_id)` became `connect(url, tls, sasl, opts)`, and `ImapSessionOpenOptions::default()` keeps the previous behaviour. The method is now a pump over `ImapSessionOpen`.
-
-- Bumped pimalaya-stream to 0.3. **Breaking.**
-
-  `client::ImapStream` is now implemented for its renamed `stream::Stream`. It also arms a one-minute read deadline at connect time, so a silent server ends the exchange instead of blocking forever.
-
-- Changed `ImapClient::greeting` to return the whole `ImapGreetingOk`. **Breaking.**
-
-  Callers append `.capability`. It also reports `pre_authenticated`, which the old signature discarded.
-
-- Moved `default_alpn` and `default_port` into the `session` module.
-
-  They sit next to the scheme table, no longer require the `client` feature, and stay re-exported from `client`.
-
+- Moved `hmac`, `pbkdf2` and `sha2` to dev-dependencies, the SCRAM crypto now living in io-sasl.
+- Made pimalaya-stream optional, enabled by the TLS provider features, so only the std client depends on it.
+- Moved `default_alpn` and `default_port` into the `session` module, still re-exported from `client`.
 - Raised the minimum supported Rust version from 1.87 to 1.88, following pimalaya-stream.
 
 ### Fixed
 
 - Fixed SCRAM-SHA-256 accepting a tagged `OK` in place of the server-final-message.
 
-  The server signature was never verified, skipping mutual authentication. The mechanism now refuses it with `ServerSignatureNotVerified`.
+  The server signature was never verified. The mechanism now refuses it with `ServerSignatureNotVerified`.
 
-- Fixed `EAGAIN` ending an exchange on macOS. **Behaviour change.**
+- Fixed `EAGAIN` ending an exchange on macOS ([pimalaya/himalaya#731](https://github.com/pimalaya/himalaya/issues/731), [pimalaya/himalaya#732](https://github.com/pimalaya/himalaya/issues/732)).
 
-  Long exchanges failed with `Resource temporarily unavailable (os error 35)`, such as a slow `AUTHENTICATE` or a `SORT` fallback `FETCH` on a large Gmail mailbox (himalaya#731, himalaya#732).
+  pimalaya-stream now retries such failures for a minute. The watch worker opts out, its read timeout being a shutdown poll.
 
-  pimalaya-stream now retries such failures for a minute, so every protocol crate inherits the fix. The watch worker opts out, its read timeout being a shutdown poll.
+- Fixed the handshake and the streamed FETCH and APPEND spinning on a closed connection: they now fail with `UnexpectedEof`.
+- Fixed `ImapSessionOpen` discarding bytes trailing the STARTTLS response.
 
-- Fixed the handshake and the streamed `FETCH` and `APPEND` spinning on a closed connection.
-
-  They now fail with `UnexpectedEof`. Only `ImapClient::run` checked for an empty read.
-
-- Fixed `ImapSessionOpen` discarding bytes trailing the `STARTTLS` response. **Behaviour change.**
-
-  RFC 3501 §6.2.1 forbids them, as they signal injected plaintext commands. The upgrade is now refused with `ImapSessionOpenError::StartTlsInjection`.
+  RFC 3501 §6.2.1 forbids them, as they signal injected plaintext. The upgrade now fails with `ImapSessionOpenError::StartTlsInjection`.
 
 - Fixed the build with the `client` feature alone.
-
-  `impl ImapStream for StreamStd` was ungated while its import was gated behind the TLS features.
 
 ## [0.4.0] - 2026-08-07
 
@@ -234,73 +225,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch` and `ImapClientStd::fetch_bodies_stream`.
 
-  They stream the bodies of a whole sequence set with one `UID FETCH <set> (UID BODY.PEEK[])`, so N bodies cost one round trip. Each body goes to its own sink via `open(uid)` and `done(uid, sink)`, never held whole in memory.
-
-  `BODY.PEEK[]` leaves `\Seen` alone. A body without a parseable `UID` fails with `UidMissing` rather than being misrouted.
+  They stream the bodies of a whole sequence set with one `UID FETCH <set> (UID BODY.PEEK[])`, each body to its own sink. A body without a parseable `UID` fails with `UidMissing`.
 
 - Added `rfc3501::capability::available_auth_mechanisms`.
 
-  It maps advertised capabilities to the `SaslMechanism`s a client can use, most preferred first and `LOGIN` last unless `LOGINDISABLED`. A setup wizard can offer only what the server supports.
+  It maps advertised capabilities to the usable `SaslMechanism`s, most preferred first and `LOGIN` last unless `LOGINDISABLED`.
 
 - Added `rfc4315::expunge_uid::ImapMessageExpungeUid` and `ImapClientStd::uid_expunge`.
 
-  `UID EXPUNGE` removes only the `\Deleted` messages in the given set, leaving the others untouched. It requires `UIDPLUS`.
+  `UID EXPUNGE` removes only the `\Deleted` messages in the given set. It requires UIDPLUS.
 
 ### Changed
 
+- **BREAKING**: Changed `ImapRaw` into a byte-verbatim batch passthrough.
+
+  `ImapRaw::new` and `ImapClientStd::raw` send their bytes as-is, so callers tag and terminate each command. `ImapRaw::new` is now fallible.
+
+- **BREAKING**: Changed `ImapStream` to require `set_read_timeout`.
+
+  The blanket `ImapStream` impl is gone, so custom transports implement the trait by hand.
+
 - Made pimalaya-stream a required dependency, pulled with no features.
-
-  This lets `available_auth_mechanisms` live in the coroutine core. Its socket and TLS layers still require a TLS provider feature.
-
-- Reworked `ImapRaw` into a byte-verbatim batch passthrough. **Breaking.**
-
-  `ImapRaw::new` and `ImapClientStd::raw` take `impl AsRef<[u8]>` and send it as-is, so callers tag each command and end it with CRLF. The exchange reads until every tag is acknowledged, in any order (RFC 3501 §5.5).
-
-  `ImapRaw::new` is now fallible, rejecting an empty, untagged, duplicate-tagged or unterminated batch via new `ImapRawError` variants.
-
-- Added the required `ImapStream::set_read_timeout` method. **Breaking.**
-
-  The blanket `ImapStream` impl is gone, so custom transports implement the trait by hand. `ImapClientStd::new` and `set_stream` now bound on `S: ImapStream`.
 
 ### Fixed
 
 - Fixed commands failing after 5 seconds of server silence.
 
-  `ImapClientStd::connect` no longer sets a per-read timeout, which broke slow SEARCH or SORT and large mailboxes. Only the watch worker keeps a periodic wakeup, treated as a shutdown check rather than an error.
+  `ImapClientStd::connect` no longer sets a per-read timeout, which broke slow SEARCH, SORT and large mailboxes.
 
 ## [0.3.1] - 2026-07-25
 
 ### Added
 
-- Added `unix://` support to `ImapClientStd::connect`.
-
-  It reaches a local socket proxy such as sirup via `StreamStd::connect_unix`.
-
+- Added `unix://` support to `ImapClientStd::connect`, reaching a local socket proxy such as sirup.
 - Added PREAUTH handling to `ImapClientStd::connect`.
 
   A `PREAUTH` greeting skips the SASL step, recorded in the new `ImapClientStd::pre_authenticated` field.
 
-- Added `tag::set_tag_prefix`, setting a global tag prefix.
-
-  It avoids tag conflicts between several io-imap instances.
-
-- Added `default_port`.
-
-  It returns 993 for `imaps` and 143 otherwise, so config-based callers derive the same fallback as `ImapClientStd::connect`.
+- Added `tag::set_tag_prefix`, setting a global tag prefix to avoid conflicts between io-imap instances.
+- Added `default_port`, returning 993 for `imaps` and 143 otherwise.
 
 ### Fixed
 
-- Fixed the std client spinning on a closed connection.
-
-  A zero-length read now returns `UnexpectedEof`.
+- Fixed the std client spinning on a closed connection: a zero-length read now returns `UnexpectedEof`.
 
 ## [0.3.0] - 2026-07-25
 
 ### Fixed
 
-- Fixed `ImapMessageMove` losing the `COPYUID` returned in an untagged `OK`.
+- Fixed `ImapMessageMove` losing the COPYUID returned in an untagged `OK`.
 
-  RFC 6851 §4.4 servers such as Fastmail send it before the `EXPUNGE`, not in the tagged reply. Both are now read, tagged first.
+  RFC 6851 §4.4 servers such as Fastmail send it before the EXPUNGE. Both places are now read, tagged first.
 
 - Fixed the SORT fallback ordering `SortKey::Date` by weekday name.
 
@@ -308,7 +283,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed `ImapMailboxWatch` opening the mailbox with SELECT.
 
-  It now uses read-only EXAMINE, so it never mutates the mailbox nor resets `\Recent`. The `ImapMailboxWatchError` `Select*` variants became `Examine*`.
+  It now uses read-only EXAMINE, never resetting `\Recent`. The `ImapMailboxWatchError` `Select*` variants became `Examine*`.
 
 ## [0.2.0] - 2026-07-15
 
@@ -316,137 +291,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added a client-side SORT fallback via `ImapMessageSortOptions::fallback`.
 
-  With it, the coroutine SEARCHes, FETCHes the sort keys in chunks of 255 and sorts locally, returning the same result as a server SORT.
-
-  Arrival, Date, Size and Subject are honoured. From, To, Cc and Display fall back to Date, as imap-types `Address` has no `Ord`.
+  The coroutine SEARCHes, FETCHes the sort keys in chunks of 255 and sorts locally. From, To, Cc and Display fall back to Date.
 
 - Added `ImapMessageFetchStream` and `ImapClientStd::fetch_body_stream`.
 
-  They stream one message body (`BODY.PEEK[]`) into a caller `Write` sink instead of buffering it. A short body fails with `ImapMessageFetchStreamError::ShortBody`, and a missing id completes with an empty sink.
+  They stream one message body into a caller `Write` sink. A short body fails with `ShortBody`, and a missing id completes with an empty sink.
 
 - Added `ImapMessageAppendStream` and `ImapClientStd::append_stream`.
 
-  They pump the message from any `Read` source of known length straight to the socket. A short source poisons the connection and fails with `ImapMessageAppendStreamError::ShortMessage`.
+  They pump the message from any `Read` source of known length to the socket. A short source fails with `ShortMessage`.
 
-- Added `ImapMessageAppendOptions::non_sync`.
-
-  It sends a non-synchronising literal (`{N+}`, LITERAL+ or LITERAL-) without waiting for the continuation. The default `{N}` lets the server reject before the body is sent.
-
-- Added `ImapSend::receive`.
-
-  It parses a response whose request was written out of band, as the streamed APPEND does.
+- Added `ImapMessageAppendOptions::non_sync`, sending a non-synchronising literal (`{N+}`) without waiting for the continuation.
+- Added `ImapSend::receive`, parsing a response whose request was written out of band.
 
 ### Changed
 
 - Bumped pimalaya-stream to 0.1.
+- Changed coroutine logging to the shared Pimalaya convention: a `debug` on state changes, usually followed by a `trace` with the data.
+- Changed the `ImapClientStd` methods to take their coroutine options struct last.
+- Renamed `SendImapCommand`, `SendImapCommandOk`, `SendImapCommandError` and `SendImapCommandResult` to `ImapSend`, `ImapSendOutput`, `ImapSendError` and `ImapSendResult`.
 
-- Changed coroutine logging to the shared Pimalaya convention.
-
-  Coroutines emit a `debug` on state changes, usually followed by a `trace` with the data, instead of a per-resume trace.
-
-- Changed the `ImapClientStd` methods to take their coroutine options struct.
-
-  `id`, `select`, `examine`, `fetch`, `search`, `store`, `copy`, `move`, `thread` and `sort` take their `Imap*Options` last and forward it unchanged.
-
-- Renamed the send primitive types to the crate naming scheme.
-
-  `SendImapCommand`, `SendImapCommandOk`, `SendImapCommandError` and `SendImapCommandResult` became `ImapSend`, `ImapSendOutput`, `ImapSendError` and `ImapSendResult`. `ImapSendResult::Ok` now boxes its `ImapSendOutput`.
+  `ImapSendResult::Ok` now boxes its `ImapSendOutput`.
 
 - Renamed `SelectData` and `SelectFetch` to `ImapMailboxSelectData` and `ImapMailboxSelectFetch`.
-
-- Renamed `ImapMailboxSort*` to `ImapMessageSort*`.
-
-  It matches `ImapMessageThread`. `ImapClientStd::sort` keeps its name, and its error variant is now `ImapClientStdError::MessageSort`.
-
+- Renamed `ImapMailboxSort*` to `ImapMessageSort*`, matching `ImapMessageThread`.
 - Changed `ImapMessageAppend::new` to take the message as `Vec<u8>`.
 
-  `ImapClientStd::append` takes `&[u8]`. Both APPEND coroutines share `ImapMessageAppendOptions` (`flags`, `date`, `non_sync`).
+  `ImapClientStd::append` takes `&[u8]`, and both APPEND coroutines share `ImapMessageAppendOptions`.
 
 ## [0.1.0] - 2026-06-03
 
 ### Added
 
-- Added the `ImapCoroutine` trait mirroring `core::ops::Coroutine`.
-
-  It has `Yield` and `Return` types and a two-variant `ImapCoroutineState<Y, R>`. Standard coroutines yield the shared `ImapYield`, and event-emitting ones declare their own with an `Event(...)` variant.
-
+- Added the `ImapCoroutine` trait mirroring `core::ops::Coroutine`, with its `ImapCoroutineState` and the shared `ImapYield`.
 - Added the `imap_try!` macro, the coroutine equivalent of `?`.
+- Added the I/O-free IDLE coroutine (RFC 2177).
 
-  It advances one inner resume step, re-yields intermediate yields and short-circuits on `Complete(Err(_))`.
+  It yields an `ImapIdleEvent` per unilateral untagged batch, and refreshes every 29 seconds by default.
 
-- Added I/O-free IMAP IDLE coroutine following RFC 2177.
+- Added the I/O-free ID coroutine (RFC 2971).
+- Added the I/O-free IMAP4rev1 coroutines (RFC 3501).
 
-  It yields an `ImapIdleEvent` per unilateral untagged batch, and refreshes every 29 seconds by default to survive middle-boxes.
+  They cover greeting, capability, login, logout, STARTTLS, list, lsub, status, create, delete, rename, subscribe, unsubscribe, select, examine, close, check, expunge, fetch, search, store, copy, append and noop.
 
-- Added I/O-free IMAP ID coroutine following RFC 2971.
-
-  It returns the server's identification parameters, or sends `ID NIL` when none are passed.
-
-- Added I/O-free IMAP4rev1 coroutines following RFC 3501.
-
-  greeting, capability, login, logout, starttls, list, lsub, status, create, delete, rename, subscribe, unsubscribe, select, examine, close, check, expunge, fetch (range + single-message), search, store (echo + silent), copy, append, noop.
-
-- Added I/O-free IMAP UNSELECT coroutine following RFC 3691.
-
-  It closes the selected mailbox without expunging `\Deleted` messages.
-
-- Added I/O-free IMAP APPENDUID-only coroutine following RFC 4315 (UIDPLUS).
-
-  Lighter than `ImapMessageAppend`, it skips the EXISTS count and returns only the APPENDUID pair.
-
-- Added I/O-free IMAP ENABLE coroutine following RFC 5161.
-
-  It returns the server's `ENABLED` capability list.
-
-- Added I/O-free IMAP SORT and THREAD coroutines following RFC 5256.
-
-  Each supports the `UID` variant via its options struct.
-
-- Added I/O-free IMAP MOVE coroutine following RFC 6851.
-
-  It surfaces the optional `[COPYUID …]` triple when the server announces UIDPLUS.
-
-- Added I/O-free SASL coroutines under `crate::sasl`: ANONYMOUS, LOGIN, PLAIN, XOAUTH2.
-
-  Each supports both the non-IR and SASL-IR (RFC 4959) flows.
-
-- Added I/O-free SASL OAUTHBEARER coroutine following RFC 7628.
-
-  It supports both non-IR and SASL-IR flows.
-
-- Added I/O-free SASL SCRAM-SHA-256 coroutine following RFC 7677, behind the `scram` cargo feature.
-
+- Added the I/O-free UNSELECT coroutine (RFC 3691).
+- Added the I/O-free APPENDUID coroutine (RFC 4315), returning only the APPENDUID pair.
+- Added the I/O-free ENABLE coroutine (RFC 5161).
+- Added the I/O-free SORT and THREAD coroutines (RFC 5256).
+- Added the I/O-free MOVE coroutine (RFC 6851), surfacing the optional COPYUID.
+- Added the I/O-free ANONYMOUS, LOGIN, PLAIN and XOAUTH2 SASL coroutines, each with non-IR and SASL-IR (RFC 4959) flows.
+- Added the I/O-free OAUTHBEARER SASL coroutine (RFC 7628).
+- Added the I/O-free SCRAM-SHA-256 SASL coroutine (RFC 7677), behind the `scram` cargo feature.
 - Added the optional `auto_id` field on every auth and login coroutine.
 
-  It chains an RFC 2971 `ID` right after the tagged auth response, as mail.qq.com and Fastmail require. An empty vec sends `ID NIL`.
+  It chains an RFC 2971 ID right after authentication, as mail.qq.com and Fastmail require.
 
 - Added the `ImapMailboxWatch` composite coroutine.
 
-  It chains ENABLE QRESYNC, SELECT (CONDSTORE), a `FETCH 1:*` baseline, IDLE and SELECT (QRESYNC) delta pulls. It emits UID-keyed `EnvelopeAdded`, `FlagsAdded`, `FlagsRemoved` and `EnvelopeRemoved` events.
+  It chains ENABLE QRESYNC, SELECT (CONDSTORE), a baseline FETCH, IDLE and QRESYNC delta pulls into UID-keyed events.
 
-- Added the `client` cargo feature enabling `ImapClientStd::new(stream)`.
-
-  A blocking light client over any `Read + Write` stream, exposing one method per IMAP coroutine.
-
-- Added `ImapClientStd::watch_mailbox`.
-
-  It consumes the client and runs `ImapMailboxWatch` on a worker thread, exposing events on a bounded channel. `close()` flips a shutdown flag and joins the worker.
-
-- Added the `rustls-ring` cargo feature (default) enabling `ImapClientStd::connect`.
-
-  It opens `imap://` or `imaps://` via [pimalaya/stream](https://github.com/pimalaya/stream) with rustls and ring, runs STARTTLS when asked, then SASL, and returns an authenticated client.
-
-- Added the `rustls-aws` cargo feature.
-
-  Same full client as `rustls-ring`, with the aws-lc-rs crypto provider.
-
-- Added the `native-tls` cargo feature.
-
-  Same full client, backed by the platform's `native-tls` implementation.
-
-- Added the `vendored` cargo feature.
-
-  It compiles the TLS dependencies in vendored mode (forwarded to `pimalaya-stream/vendored`).
+- Added the `client` cargo feature and `ImapClientStd::new`, a blocking client over any `Read + Write` stream.
+- Added `ImapClientStd::watch_mailbox`, running `ImapMailboxWatch` on a worker thread behind a bounded channel.
+- Added the `rustls-ring` cargo feature (default), enabling `ImapClientStd::connect` with rustls and ring.
+- Added the `rustls-aws` cargo feature, the same full client with the aws-lc-rs crypto provider.
+- Added the `native-tls` cargo feature, the same full client with the platform TLS.
+- Added the `vendored` cargo feature, compiling the TLS dependencies in vendored mode.
 
 [unreleased]: https://github.com/pimalaya/io-imap/compare/v0.7.1..HEAD
 [0.7.1]: https://github.com/pimalaya/io-imap/compare/v0.7.0..v0.7.1
