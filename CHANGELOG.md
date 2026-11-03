@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-03
+
 ### Added
 
 - Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`.
@@ -357,7 +359,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added the `native-tls` cargo feature, the same full client with the platform TLS.
 - Added the `vendored` cargo feature, compiling the TLS dependencies in vendored mode.
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.7.1..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.8.0..HEAD
+[0.8.0]: https://github.com/pimalaya/io-imap/compare/v0.7.1..v0.8.0
 [0.7.1]: https://github.com/pimalaya/io-imap/compare/v0.7.0..v0.7.1
 [0.7.0]: https://github.com/pimalaya/io-imap/compare/v0.6.1..v0.7.0
 [0.6.1]: https://github.com/pimalaya/io-imap/compare/v0.6.0..v0.6.1
