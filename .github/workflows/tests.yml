@@ -43,8 +43,8 @@ jobs:
           RUST_LOG: trace
           GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      # NOTE: debug, not trace: debug builds log the SASL initial
-      # response, which holds the minted token GitHub cannot mask.
+      # NOTE: debug, not trace: io-http traces the token request, whose
+      # body carries the client secret or the signed assertion.
       - run: nix develop -c cargo test --features rustls-ring --test gmail oauth -- --ignored
         env:
           RUST_LOG: debug
@@ -64,8 +64,8 @@ jobs:
           name: soywod
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
-      # NOTE: debug, not trace: debug builds log the SASL initial
-      # response, which holds the minted token GitHub cannot mask.
+      # NOTE: debug, not trace: io-http traces the token request, whose
+      # body carries the client secret or the signed assertion.
       - run: nix develop -c cargo test --features rustls-ring --test outlook -- --ignored
         env:
           RUST_LOG: debug

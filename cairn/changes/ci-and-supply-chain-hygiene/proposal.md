@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: ci-and-supply-chain-hygiene
-status: active
+status: landed
 created: 2026-10-18
 ---
 
