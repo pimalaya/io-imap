@@ -500,7 +500,7 @@ mod tests {
 
     use alloc::{borrow::ToOwned, format};
 
-    use base64::{Engine, engine::general_purpose::STANDARD};
+    use base64_codec::codec::Base64Codec;
     use hmac::{Hmac, KeyInit, Mac};
     use io_sasl::rfc5801::SaslGs2ChannelBinding;
     use secrecy::SecretString;
@@ -541,7 +541,7 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
-        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        let challenge = format!("+ {}\r\n", encode(&server_first));
         let client_final_bytes =
             expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
         let client_final_line = str::from_utf8(&client_final_bytes).expect("utf8");
@@ -550,7 +550,7 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_final = build_server_final(&client_first, &server_first, &client_final);
-        let challenge2 = format!("+ {}\r\n", STANDARD.encode(&server_final));
+        let challenge2 = format!("+ {}\r\n", encode(&server_final));
         let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge2.as_bytes()));
         assert_eq!(b"\r\n", &*ack);
 
@@ -578,13 +578,13 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
-        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        let challenge = format!("+ {}\r\n", encode(&server_first));
         let _client_final = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
 
         expect_wants_read(&mut auth, &mut frag);
 
         let server_final = "e=invalid-proof";
-        let challenge2 = format!("+ {}\r\n", STANDARD.encode(server_final));
+        let challenge2 = format!("+ {}\r\n", encode(server_final));
         let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
         let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
             panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
@@ -636,7 +636,7 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
-        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        let challenge = format!("+ {}\r\n", encode(&server_first));
         expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
 
         expect_wants_read(&mut auth, &mut frag);
@@ -678,7 +678,7 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
-        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        let challenge = format!("+ {}\r\n", encode(&server_first));
         let client_final_bytes =
             expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
         let client_final = decode_last_base64_token(
@@ -690,7 +690,7 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_final = build_server_final(&client_first, &server_first, &client_final);
-        let challenge2 = format!("+ {}\r\n", STANDARD.encode(&server_final));
+        let challenge2 = format!("+ {}\r\n", encode(&server_final));
         let ack = expect_wants_write(&mut auth, &mut frag, Some(challenge2.as_bytes()));
         assert_eq!(b"\r\n", &*ack);
 
@@ -723,13 +723,13 @@ mod tests {
         expect_wants_read(&mut auth, &mut frag);
 
         let server_first = format!("r={client_nonce}ServerExtra,s={SALT_B64},i={ITERATIONS}");
-        let challenge = format!("+ {}\r\n", STANDARD.encode(&server_first));
+        let challenge = format!("+ {}\r\n", encode(&server_first));
         let _client_final = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
 
         expect_wants_read(&mut auth, &mut frag);
 
         let server_final = "e=invalid-proof";
-        let challenge2 = format!("+ {}\r\n", STANDARD.encode(server_final));
+        let challenge2 = format!("+ {}\r\n", encode(server_final));
         let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
         let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
             panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
@@ -789,13 +789,25 @@ mod tests {
             .expect("first whitespace-separated token")
     }
 
+    fn encode(bytes: impl AsRef<[u8]>) -> String {
+        let mut encoded = Vec::new();
+        Base64Codec::default().encode_vec(bytes.as_ref(), &mut encoded);
+        String::from_utf8(encoded).expect("ascii base64")
+    }
+
+    fn decode(text: &str) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        assert!(Base64Codec::default().decode_vec(text.as_bytes(), &mut decoded));
+        decoded
+    }
+
     fn decode_last_base64_token(line: &str) -> String {
         let b64 = line
             .trim_end()
             .rsplit_terminator(char::is_whitespace)
             .next()
             .expect("token");
-        let bytes = STANDARD.decode(b64).expect("valid base64");
+        let bytes = decode(b64);
         String::from_utf8(bytes).expect("valid utf8")
     }
 
@@ -818,7 +830,7 @@ mod tests {
             .0;
         let auth_message =
             format!("{client_first_bare},{server_first},{client_final_without_proof}");
-        let salt = STANDARD.decode(SALT_B64).expect("valid salt");
+        let salt = decode(SALT_B64);
 
         // NOTE: SaltedPassword = PBKDF2(SHA-256, password, salt, iterations).
         let mut salted_password = [0u8; 32];
@@ -834,6 +846,6 @@ mod tests {
         mac.update(auth_message.as_bytes());
         let server_signature = mac.finalize().into_bytes();
 
-        format!("v={}", STANDARD.encode(server_signature))
+        format!("v={}", encode(server_signature))
     }
 }

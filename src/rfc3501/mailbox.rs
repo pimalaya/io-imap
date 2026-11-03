@@ -6,10 +6,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
-};
+use base64_codec::codec::Base64Codec;
 use imap_codec::imap_types::mailbox::Mailbox;
 use log::trace;
 
@@ -89,16 +86,23 @@ fn flush_shifted(shifted: &mut Vec<u8>, out: &mut String) {
         return;
     }
 
-    let mut b64 = STANDARD_NO_PAD.encode(&shifted);
-    // SAFETY: base64 alphabet is ASCII, byte substitution preserves UTF-8.
-    for byte in unsafe { b64.as_bytes_mut() } {
-        if *byte == b'/' {
-            *byte = b',';
-        }
-    }
+    let codec = Base64Codec {
+        pad: false,
+        ..Base64Codec::default()
+    };
+
+    let mut b64 = Vec::new();
+    codec.encode_vec(shifted, &mut b64);
 
     out.push('&');
-    out.push_str(&b64);
+
+    for byte in b64 {
+        out.push(match byte {
+            b'/' => ',',
+            byte => char::from(byte),
+        });
+    }
+
     out.push('-');
     shifted.clear();
 }
@@ -130,23 +134,30 @@ fn decode(input: &str) -> String {
             out.push('&');
         } else {
             let payload = &input[payload_start..j];
-            let mut standard = String::with_capacity(payload.len());
-            for c in payload.chars() {
-                standard.push(if c == ',' { '/' } else { c });
-            }
 
-            // NOTE: modified base64 strips padding; standard engine
-            // handles complete groups, no-pad covers the rest.
-            let decoded_bytes = STANDARD
-                .decode(standard.as_bytes())
-                .or_else(|_| STANDARD_NO_PAD.decode(standard.as_bytes()));
+            let standard: Vec<u8> = payload
+                .bytes()
+                .map(|byte| if byte == b',' { b'/' } else { byte })
+                .collect();
 
-            match decoded_bytes {
-                Ok(bytes) if bytes.len() % 2 == 0 => {
-                    let units: Vec<u16> = bytes
-                        .chunks_exact(2)
-                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                        .collect();
+            // NOTE: the decoder is lenient, so only a payload encoding its
+            // bytes back to itself is well-formed: a name decoded from any
+            // other form would not encode back to the one the server knows.
+            let codec = Base64Codec {
+                pad: standard.ends_with(b"="),
+                ..Base64Codec::default()
+            };
+
+            let mut decoded = Vec::new();
+            let mut canonical = Vec::new();
+            codec.decode_vec(&standard, &mut decoded);
+            codec.encode_vec(&decoded, &mut canonical);
+
+            match (canonical == standard).then_some(decoded) {
+                Some(bytes) if bytes.len() % 2 == 0 => {
+                    let (pairs, _) = bytes.as_chunks::<2>();
+                    let units: Vec<u16> =
+                        pairs.iter().map(|&pair| u16::from_be_bytes(pair)).collect();
                     out.push_str(&String::from_utf16_lossy(&units));
                 }
                 // NOTE: malformed shift: re-emit the source verbatim.
@@ -209,6 +220,18 @@ mod tests {
     fn decode_unescapes_doubled_ampersand() {
         assert_eq!(decode("AT&-T"), "AT&T");
         assert_eq!(decode("&-"), "&");
+    }
+
+    /// A shift that would not encode back to itself is malformed, even
+    /// when a lenient base64 decoder reads it.
+    #[test]
+    fn decode_keeps_non_canonical_shifts_verbatim() {
+        assert_eq!(decode("&AGE-"), "a");
+        assert_eq!(decode("&AGE=-"), "a");
+
+        for wire in ["&AGF-", "&AG E-", "&=-", "&AGF=-"] {
+            assert_eq!(decode(wire), wire);
+        }
     }
 
     #[test]

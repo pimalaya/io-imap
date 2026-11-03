@@ -672,7 +672,7 @@ name = "io-imap"
 version = "0.8.1"
 dependencies = [
  "anyhow",
- "base64",
+ "base64-codec",
  "chrono",
  "env_logger",
  "hmac",

@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Changed the minimum Rust version to 1.89.
 
+- Replaced the base64 crate with [base64-codec](https://crates.io/crates/base64-codec) for the modified UTF-7 mailbox names.
+
+  imap-codec still depends on the base64 crate.
+
 - Changed the io-sasl requirement to 0.1.1, which replaced the base64 crate with base64-codec.
 
 ### Security
