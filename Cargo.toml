@@ -1,7 +1,7 @@
 [package]
 name = "io-imap"
 description = "IMAP client library for Rust"
-version = "0.8.0"
+version = "0.8.1"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
 rust-version = "1.89"
 edition = "2024"
@@ -61,7 +61,7 @@ required-features = ["rustls-ring"]
 env_logger = "0.11"
 hmac = "0.13"
 io-oauth = { version = "0.4", default-features = false, features = ["jwt-bearer", "rustls-ring"] }
-io-sasl = { version = "0.1", default-features = false }
+io-sasl = { version = "0.1.1", default-features = false }
 pbkdf2 = { version = "0.13", features = ["hmac"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-platform-verifier = "0.7"
@@ -77,9 +77,9 @@ anyhow = { version = "1", optional = true }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 imap-codec = { version = "2.0.0-alpha.10", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls"] }
-io-sasl = { version = "0.1", default-features = false }
+io-sasl = { version = "0.1.1", default-features = false }
 log = { version = "0.4", default-features = false }
-pimalaya-stream = { version = "0.3", default-features = false, optional = true }
+pimalaya-stream = { version = "0.3.1", default-features = false, optional = true }
 rand = { version = "0.10", optional = true }
 secrecy = { version = "0.10", default-features = false }
 thiserror = { version = "2", default-features = false }

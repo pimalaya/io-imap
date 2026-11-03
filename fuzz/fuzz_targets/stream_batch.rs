@@ -43,6 +43,9 @@ fuzz_target!(|data: &[u8]| {
     for _ in 0..100_000 {
         match coroutine.resume(&mut fragmentizer, arg.take().as_deref()) {
             ImapCoroutineState::Complete(_) => return,
+            ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsTag) => {
+                arg = Some(b"A1".to_vec());
+            }
             ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsWrite(_)) => {}
             ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::WantsRead) => {
                 arg = Some(reads.next().to_vec());

@@ -65,11 +65,17 @@ fuzz_target!(|data: &[u8]| {
         }
         4 => {
             let reference = "".try_into().unwrap();
-            run(ImapMailboxList::new(reference, "*".try_into().unwrap()), data);
+            run(
+                ImapMailboxList::new(reference, "*".try_into().unwrap()),
+                data,
+            );
         }
         5 => {
             let opts = ImapMessageSearchOptions { uid: true };
-            run(ImapMessageSearch::new(Vec1::from(SearchKey::All), opts), data);
+            run(
+                ImapMessageSearch::new(Vec1::from(SearchKey::All), opts),
+                data,
+            );
         }
         6 => {
             let sort = Vec1::from(SortCriterion {
@@ -80,7 +86,10 @@ fuzz_target!(|data: &[u8]| {
                 uid: true,
                 ..Default::default()
             };
-            run(ImapMessageSort::new(sort, Vec1::from(SearchKey::All), opts), data);
+            run(
+                ImapMessageSort::new(sort, Vec1::from(SearchKey::All), opts),
+                data,
+            );
         }
         7 => {
             let items = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
@@ -123,6 +132,7 @@ fn run<C: ImapCoroutine<Yield = ImapYield>>(mut coroutine: C, data: &[u8]) {
     for _ in 0..MAX_RESUMES {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(_) => return,
+            ImapCoroutineState::Yielded(ImapYield::WantsTag) => arg = Some(b"A1".as_slice()),
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => {}
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => arg = Some(reads.next()),
         }

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-03
+
+### Changed
+
+- Changed the minimum Rust version to 1.89.
+
+- Changed the io-sasl requirement to 0.1.1, which replaced the base64 crate with base64-codec.
+
+### Security
+
+- Raised the pimalaya-stream requirement to 0.3.1, fixing RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+
+  It requires rustls 0.23.46.
+
 ## [0.8.0] - 2026-11-03
 
 ### Added
@@ -359,7 +373,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added the `native-tls` cargo feature, the same full client with the platform TLS.
 - Added the `vendored` cargo feature, compiling the TLS dependencies in vendored mode.
 
-[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.8.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-imap/compare/v0.8.1..HEAD
+[0.8.1]: https://github.com/pimalaya/io-imap/compare/v0.8.0..v0.8.1
 [0.8.0]: https://github.com/pimalaya/io-imap/compare/v0.7.1..v0.8.0
 [0.7.1]: https://github.com/pimalaya/io-imap/compare/v0.7.0..v0.7.1
 [0.7.0]: https://github.com/pimalaya/io-imap/compare/v0.6.1..v0.7.0
