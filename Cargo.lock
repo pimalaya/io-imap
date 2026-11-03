@@ -118,6 +118,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "base64-codec"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8c21fac036871f0cc54f32f04486210962fea0b2450233906c1b5b957be5262"
+dependencies = [
+ "simd-cpu",
+]
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -644,15 +653,14 @@ dependencies = [
 
 [[package]]
 name = "io-http"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fe2064378f85c13e3f3aca141308fa541c4478ff5cf5ebadd7dcbcce1a44281"
+checksum = "7a9086cd840a757b9dd4105caad54a59fdb440c49be33882491a07274ca32e06"
 dependencies = [
  "anyhow",
- "base64",
+ "base64-codec",
  "httparse",
  "log",
- "memchr",
  "pimalaya-stream",
  "secrecy",
  "thiserror",
@@ -689,9 +697,9 @@ dependencies = [
 
 [[package]]
 name = "io-oauth"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ada4f4b661b47b6e6d69e15ff342653f40446866762e1744270d721eb3a92276"
+checksum = "98faa946c5d7c2fede0d5af4eec05d6596154cc291483bd9b60fcfc0d46aa0ae"
 dependencies = [
  "anyhow",
  "base64",
@@ -711,22 +719,22 @@ dependencies = [
 
 [[package]]
 name = "io-proxy"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea1200e73a98f7a2500af468bb7857a1c78b5b4b453c8d69760c2a61b9df5303"
+checksum = "155d6f9416bdcf3a147e156ad92c94ec772b3684276e6405b2d3319d610922e5"
 dependencies = [
- "base64",
+ "base64-codec",
  "log",
  "thiserror",
 ]
 
 [[package]]
 name = "io-sasl"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c646c1b97cc26d3ffbffac5db3a242f5aa58f77d0cfe4df986df68c926949d"
+checksum = "b7b6d27b84ce81172fd74e7181e07b94d765018564ed44aaec30601d213150dc"
 dependencies = [
- "base64",
+ "base64-codec",
  "hmac",
  "log",
  "pbkdf2",
@@ -1027,9 +1035,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pimalaya-stream"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b327ad009344854c74da2a96956f312241ffb90d8680159736d2303d50ae5cf2"
+checksum = "2390fbe42466eda5498c913b7558a76376e982915ed3aad3a19758a86c46c098"
 dependencies = [
  "anyhow",
  "io-proxy",
@@ -1457,6 +1465,12 @@ dependencies = [
  "digest",
  "rand_core",
 ]
+
+[[package]]
+name = "simd-cpu"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d362f934351780e3ec67adf32bcb5bc341f23a393076d17a600a699c0c93b726"
 
 [[package]]
 name = "simd_cesu8"

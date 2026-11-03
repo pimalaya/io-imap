@@ -3,7 +3,7 @@ name = "io-imap"
 description = "IMAP client library for Rust"
 version = "0.8.0"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
-rust-version = "1.88"
+rust-version = "1.89"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 categories = ["email", "no-std"]
@@ -60,7 +60,7 @@ required-features = ["rustls-ring"]
 [dev-dependencies]
 env_logger = "0.11"
 hmac = "0.13"
-io-oauth = { version = "0.3", default-features = false, features = ["jwt-bearer", "rustls-ring"] }
+io-oauth = { version = "0.4", default-features = false, features = ["jwt-bearer", "rustls-ring"] }
 io-sasl = { version = "0.1", default-features = false }
 pbkdf2 = { version = "0.13", features = ["hmac"] }
 rustls = { version = "0.23", features = ["ring"] }
