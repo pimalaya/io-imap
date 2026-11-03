@@ -16,7 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
-- Fixed the build against abnf-core 0.6.1, which no longer enables nom's default features: imap-codec 2.0.0-alpha.9 relies on nom's `alloc` parsers without requesting them, so io-imap now depends on nom with `alloc` itself, until an imap-codec release declares it.
+- Fixed the build against abnf-core 0.6.1, which no longer enables nom's default features that imap-codec 2.0.0-alpha.9 relied on. io-imap now requires imap-codec 2.0.0-alpha.10, which requests nom's `alloc` feature itself.
+
+- Fixed FETCH responses carrying a `NIL` body parameter value, such as Mail.ru's `("boundary" NIL)`, being dropped as undecodable. imap-codec 2.0.0-alpha.10 reads the value as an empty string through its default `quirk` set ([pimalaya/himalaya#649](https://github.com/pimalaya/himalaya/issues/649)).
 
 - Fixed `rfc3501::greeting::ImapGreetingGet` panicking on a greeting carrying a literal, which anyone on the path of a plaintext connection could send. It now fails with `DecodingFailure` on the literal announcement.
 

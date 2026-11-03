@@ -352,6 +352,30 @@ mod tests {
         assert_eq!(2, out.len());
     }
 
+    /// Mail.ru sends an empty quoted display name and a `NIL` body
+    /// parameter value (`("boundary" NIL)`), see pimalaya/himalaya#649.
+    #[test]
+    fn fetch_keeps_bodystructure_with_nil_param_value() {
+        let mut fetch = ImapMessageFetch::new(
+            "2010".try_into().expect("valid sequence set"),
+            MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::All),
+            ImapMessageFetchOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        let bytes = expect_wants_write_fetch(&mut fetch, &mut frag, None);
+        let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+
+        expect_wants_read_fetch(&mut fetch, &mut frag);
+
+        let reply = format!(
+            "* 2010 FETCH (UID 154395 FLAGS (\\Seen) ENVELOPE (\"Fri, 17 Apr 2026 14:15:28 +0000\" \"subject\" ((\"name\" NIL \"local\" \"example.org\")) NIL NIL ((\"\" NIL \"local\" \"example.org\")) NIL NIL NIL \"<id@example.org>\") BODYSTRUCTURE ((\"text\" \"plain\" (\"charset\" \"US-ASCII\") NIL NIL \"8bit\" 7078 0 NIL NIL NIL NIL)(\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 37865 0 NIL NIL NIL NIL) \"alternative\" (\"boundary\" NIL)))\r\n{tag} OK FETCH completed\r\n",
+        );
+        let out = expect_complete_ok_fetch(&mut fetch, &mut frag, reply.as_bytes());
+        let id = NonZeroU32::new(2010).expect("non-zero");
+        assert_eq!(4, out.get(&id).expect("fetched message").as_ref().len());
+    }
+
     #[test]
     fn uid_variant_sends_uid_fetch() {
         let mut fetch = ImapMessageFetch::new(
