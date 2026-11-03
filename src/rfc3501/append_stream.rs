@@ -279,7 +279,7 @@ impl ImapCoroutine for ImapMessageAppendStream {
                     self.state = if self.non_sync {
                         State::Stream
                     } else {
-                        State::Continuation(ImapSend::receive(command.clone()))
+                        State::Continuation(ImapSend::receive(command.clone(), command.tag.clone()))
                     };
                     debug!("{}", self.state);
 
@@ -333,7 +333,8 @@ impl ImapCoroutine for ImapMessageAppendStream {
                 State::WriteCrlf => {
                     let crlf = self.crlf.take().expect("crlf written once");
                     let command = self.command.take().expect("command tagged once");
-                    self.state = State::Recv(ImapSend::receive(command));
+                    let tag = command.tag.clone();
+                    self.state = State::Recv(ImapSend::receive(command, tag));
                     debug!("{}", self.state);
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         crlf,

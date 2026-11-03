@@ -89,7 +89,7 @@ use imap_codec::{
     imap_types::{
         auth::{AuthMechanism, AuthenticateData},
         command::CommandBody,
-        core::{IString, NString},
+        core::{IString, NString, Tag},
         response::{
             Capability, Code, CommandContinuationRequest, Data, StatusBody, StatusKind, Tagged,
         },
@@ -246,10 +246,10 @@ impl ImapAuthScramSha256 {
     }
 
     // helper that tells if the coroutine needs to send continuation auth data
-    fn wants_continue(payload: Vec<u8>) -> State {
+    fn wants_continue(payload: Vec<u8>, tag: Tag<'static>) -> State {
         let auth = AuthenticateData::r#continue(payload);
         let codec = AuthenticateDataCodec::new();
-        State::Continue(ImapSend::new(codec, auth))
+        State::Continue(ImapSend::new(codec, auth, tag))
     }
 
     // helper that resumes SASL coroutine
@@ -329,7 +329,7 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             }
                         };
 
-                        self.state = Self::wants_continue(payload);
+                        self.state = Self::wants_continue(payload, out.tag);
                         debug!("{}", self.state);
                         continue;
                     }
@@ -395,7 +395,7 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             Err(err) => return ImapCoroutineState::Complete(Err(err)),
                         };
 
-                        self.state = Self::wants_continue(payload);
+                        self.state = Self::wants_continue(payload, out.tag);
                         debug!("{}", self.state);
                         continue;
                     }

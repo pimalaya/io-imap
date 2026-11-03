@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatchOptions`, whose `max_literal_len` (100 MiB by default) and per-UID `sizes` bound the bodies a server may announce, failing with the new `LiteralTooLong` error.
 - Added `client::ImapClientStd::tags`, the generator answering every `WantsTag` on the connection.
+- Added `send::ImapSendOutput::tag`, the tag of the command the exchange belongs to.
 
 ### Changed
 
@@ -19,7 +20,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Every yield type carries the variant, and a resume loop answers it with the tag bytes. A missing or invalid tag fails with `MissingTag` or `InvalidTag`.
 
+- **BREAKING**: Changed `send::ImapSend::new` and `send::ImapSend::receive` to take the tag of the command whose completion ends the exchange.
+- **BREAKING**: Changed `rfc3501::select::ImapMailboxSelectData::vanished_earlier` to inclusive UID ranges.
+
 ### Fixed
+
+- Fixed a tagged completion of another command ending an exchange and lending it its status: it is now skipped.
+- Fixed SELECT and EXAMINE expanding a `VANISHED (EARLIER)` set into one entry per UID, so `1:4294967295` from a server allocated about 16 GiB.
 
 - Fixed bare builds pulling std through imap-codec's `tag_generator` feature, now enabled by `client` only ([pimalaya/io-imap#4](https://github.com/pimalaya/io-imap/issues/4)).
 

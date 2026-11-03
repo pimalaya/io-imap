@@ -34,3 +34,12 @@ Building io-imap without default features enables no `std` feature in its depend
 
 - **WHEN** io-imap is built with `--no-default-features`
 - **THEN** no dependency has its `std` feature enabled
+
+### Requirement: An exchange ends on its own command's completion
+
+A send ends only on the tagged completion carrying the tag of the command it belongs to: the tag it was answered with, or the tag of the command a continuation or IDLE DONE belongs to. A tagged completion with another tag is skipped.
+
+#### Scenario: Foreign completion first
+
+- **WHEN** a send for the command tagged `A1` reads `B9 NO not yours`, then `A1 OK`
+- **THEN** it keeps reading after `B9`, and completes with the `A1 OK` status

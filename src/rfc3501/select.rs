@@ -49,7 +49,7 @@
 //! println!("{data:?}");
 //! ```
 
-use core::{fmt, num::NonZeroU32};
+use core::{fmt, num::NonZeroU32, ops::RangeInclusive};
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -63,7 +63,7 @@ use imap_codec::{
         flag::{Flag, FlagPerm},
         mailbox::Mailbox,
         response::{Code, Data, StatusBody, StatusKind, Tagged},
-        sequence::SequenceSet,
+        sequence::{Sequence, SequenceSet},
     },
 };
 use log::trace;
@@ -113,8 +113,9 @@ pub struct ImapMailboxSelectData {
     pub uid_validity: Option<NonZeroU32>,
     /// Highest modification sequence (CONDSTORE HIGHESTMODSEQ code).
     pub highest_mod_seq: Option<u64>,
-    /// UIDs expunged since the last sync (QRESYNC `VANISHED (EARLIER)`).
-    pub vanished_earlier: Vec<NonZeroU32>,
+    /// UIDs expunged since the last sync (QRESYNC `VANISHED (EARLIER)`),
+    /// kept as the inclusive ranges the server announced.
+    pub vanished_earlier: Vec<RangeInclusive<NonZeroU32>>,
     /// Implicit FETCH responses for changed messages (QRESYNC).
     pub changed: Vec<ImapMailboxSelectFetch>,
 }
@@ -196,7 +197,7 @@ impl ImapCoroutine for ImapMailboxSelect {
                             earlier,
                             known_uids,
                         } if earlier => {
-                            output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                            output.vanished_earlier.extend(uid_ranges(&known_uids));
                         }
                         _ => {}
                     }
@@ -247,11 +248,25 @@ impl fmt::Display for State {
     }
 }
 
-/// Expand `VANISHED (EARLIER)` uid-set to concrete UIDs (RFC 7162 §3.2.10
-/// forbids `*`, so `u32::MAX` is a safe ceiling).
-fn expand_uid_set(uid_set: &SequenceSet) -> Vec<NonZeroU32> {
-    let max = NonZeroU32::new(u32::MAX).unwrap();
-    uid_set.iter(max).collect()
+/// Reads a `VANISHED (EARLIER)` uid-set as inclusive ranges, never
+/// expanded: a server may announce any span, such as `1:4294967295`.
+///
+/// RFC 7162 §3.2.10 forbids `*`; one read anyway stands for the largest
+/// UID. Reversed ranges (`9:3`) are normalised.
+pub(crate) fn uid_ranges(
+    uid_set: &SequenceSet,
+) -> impl Iterator<Item = RangeInclusive<NonZeroU32>> + '_ {
+    uid_set.0.as_ref().iter().map(|seq| match seq {
+        Sequence::Single(uid) => {
+            let uid = uid.expand(NonZeroU32::MAX);
+            uid..=uid
+        }
+        Sequence::Range(a, b) => {
+            let a = a.expand(NonZeroU32::MAX);
+            let b = b.expand(NonZeroU32::MAX);
+            a.min(b)..=a.max(b)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -289,6 +304,29 @@ mod tests {
         assert_eq!(Some(42), data.exists);
         assert_eq!(Some(7), data.recent);
         assert_eq!(1700, data.uid_validity.expect("uid validity").get());
+    }
+
+    #[test]
+    fn vanished_earlier_keeps_ranges() {
+        let mut select = ImapMailboxSelect::new(
+            "INBOX".try_into().expect("valid mailbox"),
+            ImapMailboxSelectOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut select, &mut frag);
+        let _ = expect_wants_write(&mut select, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut select, &mut frag);
+
+        // NOTE: expanded, the first range would be four billion UIDs.
+        let reply = b"* VANISHED (EARLIER) 1:4294967295\r\n\
+                      * VANISHED (EARLIER) 9:3,12\r\n\
+                      A1 OK [READ-WRITE] SELECT completed\r\n";
+        let data = expect_complete_ok(&mut select, &mut frag, reply);
+
+        let uid = |n| NonZeroU32::new(n).expect("non-zero");
+        let expected = Vec::from([uid(1)..=NonZeroU32::MAX, uid(3)..=uid(9), uid(12)..=uid(12)]);
+        assert_eq!(expected, data.vanished_earlier);
     }
 
     #[test]

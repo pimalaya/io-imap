@@ -82,6 +82,7 @@ pub struct ImapSend<T: Encoder> {
     message: Option<T::Message<'static>>,
     untagged_command: Option<UntaggedCommand<T>>,
     tag_requested: bool,
+    tag: Option<Tag<'static>>,
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
@@ -98,8 +99,13 @@ pub struct ImapSend<T: Encoder> {
 
 impl<T: Encoder> ImapSend<T> {
     /// Builds a send serialising `message` through `encoder` and
-    /// parsing its response.
-    pub fn new(encoder: T, message: T::Message<'static>) -> Self {
+    /// parsing its response, which ends on the tagged completion of the
+    /// command tagged `tag`.
+    ///
+    /// Used for messages carrying no tag of their own, such as SASL
+    /// continuation data or IDLE DONE, whose exchange ends on the
+    /// completion of the command they continue.
+    pub fn new(encoder: T, message: T::Message<'static>, tag: Tag<'static>) -> Self {
         let fragments = encoder.encode(&message).collect();
 
         Self {
@@ -107,6 +113,7 @@ impl<T: Encoder> ImapSend<T> {
             message: Some(message),
             untagged_command: None,
             tag_requested: false,
+            tag: Some(tag),
             codec: ResponseCodec::new(),
             state: State::Serialize,
             wants_read: false,
@@ -126,8 +133,9 @@ impl<T: Encoder> ImapSend<T> {
     /// request whose bytes were written out of band.
     ///
     /// Used by the streamed APPEND literal; `message` is echoed back
-    /// unchanged in the Ok output.
-    pub fn receive(message: T::Message<'static>) -> Self
+    /// unchanged in the Ok output, and the exchange ends on the tagged
+    /// completion of the command tagged `tag`.
+    pub fn receive(message: T::Message<'static>, tag: Tag<'static>) -> Self
     where
         T: Default,
     {
@@ -136,6 +144,7 @@ impl<T: Encoder> ImapSend<T> {
             message: Some(message),
             untagged_command: None,
             tag_requested: false,
+            tag: Some(tag),
             codec: ResponseCodec::new(),
             state: State::Read,
             wants_read: false,
@@ -174,6 +183,8 @@ impl<T: Encoder> ImapSend<T> {
                             Ok(tag) => tag.into_static(),
                             Err(err) => return ImapSendResult::Err(ImapSendError::InvalidTag(err)),
                         };
+
+                        self.tag = Some(tag.clone());
 
                         // NOTE: the untagged command always exists in the
                         // tag state.
@@ -253,6 +264,15 @@ impl<T: Encoder> ImapSend<T> {
                             Ok(Response::Status(Status::Untagged(status))) => {
                                 self.untagged.push(status.into_static());
                             }
+                            Ok(Response::Status(Status::Tagged(tagged)))
+                                if Some(&tagged.tag) != self.tag.as_ref() =>
+                            {
+                                // NOTE: a completion of another command
+                                // (late, or forged) must neither end
+                                // this exchange nor lend it its status.
+                                debug!("skipping tagged response of another command");
+                                trace!("tag: {}", tagged.tag.as_ref());
+                            }
                             Ok(Response::Status(Status::Tagged(tagged))) => {
                                 self.tagged.replace(tagged.into_static());
                                 self.done = true;
@@ -306,6 +326,8 @@ impl<T: Encoder> ImapSend<T> {
                         // NOTE: message always exists during a resume cycle.
                         return ImapSendResult::Ok(Box::new(ImapSendOutput {
                             message: self.message.take().unwrap(),
+                            // NOTE: the tag is known once the message is.
+                            tag: self.tag.take().unwrap(),
                             data: mem::take(&mut self.data),
                             untagged: mem::take(&mut self.untagged),
                             tagged: self.tagged.take(),
@@ -338,6 +360,7 @@ impl ImapSend<CommandCodec> {
                 into_message: |command| command,
             }),
             tag_requested: false,
+            tag: None,
             codec: ResponseCodec::new(),
             state: State::Tag,
             wants_read: false,
@@ -368,6 +391,8 @@ struct UntaggedCommand<T: Encoder> {
 pub struct ImapSendOutput<T: Encoder> {
     /// The sent message, echoed back to the caller.
     pub message: T::Message<'static>,
+    /// The tag of the command the exchange belongs to.
+    pub tag: Tag<'static>,
     /// The untagged data responses collected during the exchange.
     pub data: Vec<Data<'static>>,
     /// The untagged status responses collected during the exchange.
@@ -406,6 +431,8 @@ impl<T: Encoder> ImapCoroutine for ImapSend<T> {
 #[cfg(test)]
 mod tests {
     use core::str;
+
+    use imap_codec::imap_types::response::StatusKind;
 
     use crate::send::*;
 
@@ -453,5 +480,41 @@ mod tests {
             send.resume(&mut frag, Some(b"A+1")),
             ImapSendResult::Err(ImapSendError::InvalidTag(_))
         ));
+    }
+
+    #[test]
+    fn foreign_tagged_completion_is_skipped() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsTag
+        ));
+        assert!(matches!(
+            send.resume(&mut frag, Some(b"A1")),
+            ImapSendResult::WantsWrite(_)
+        ));
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsRead
+        ));
+
+        // NOTE: the foreign completion arrives alone, so that taking it
+        // would end the exchange before the right one is read.
+        let foreign = b"B9 NO not yours\r\n";
+        assert!(matches!(
+            send.resume(&mut frag, Some(foreign)),
+            ImapSendResult::WantsRead
+        ));
+
+        let reply = b"A1 OK NOOP completed\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply)) else {
+            panic!("expected Ok");
+        };
+
+        let tagged = out.tagged.expect("tagged completion");
+        assert_eq!("A1", tagged.tag.as_ref());
+        assert_eq!(StatusKind::Ok, tagged.body.kind);
     }
 }

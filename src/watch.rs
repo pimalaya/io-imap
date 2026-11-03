@@ -428,10 +428,19 @@ impl ImapMailboxWatch {
     }
 
     fn compute_deltas(&mut self, data: &ImapMailboxSelectData) {
-        for uid in &data.vanished_earlier {
-            if self.shadow.remove(uid).is_some() {
+        // NOTE: walk the shadow within each range rather than the range
+        // itself, whose span the server chose.
+        for range in &data.vanished_earlier {
+            let uids: Vec<NonZeroU32> = self
+                .shadow
+                .range(range.clone())
+                .map(|(uid, _)| *uid)
+                .collect();
+
+            for uid in uids {
+                self.shadow.remove(&uid);
                 self.pending
-                    .push_back(ImapMailboxWatchEvent::EnvelopeRemoved { uid: *uid });
+                    .push_back(ImapMailboxWatchEvent::EnvelopeRemoved { uid });
             }
         }
 
@@ -826,6 +835,33 @@ mod tests {
     use crate::watch::*;
 
     const UID_VALIDITY: u32 = 1700;
+
+    #[test]
+    fn vanished_range_removes_only_shadowed_uids() {
+        let (mut watch, _) = watcher(&[Capability::QResync]);
+        let uid = |n| NonZeroU32::new(n).expect("non-zero");
+
+        for n in [2, 5, 9] {
+            watch.shadow.insert(uid(n), Vec::new());
+        }
+
+        let data = ImapMailboxSelectData {
+            vanished_earlier: Vec::from([uid(1)..=NonZeroU32::MAX]),
+            ..Default::default()
+        };
+        watch.compute_deltas(&data);
+        assert!(watch.shadow.is_empty());
+
+        let removed: Vec<u32> = watch
+            .pending
+            .iter()
+            .map(|event| match event {
+                ImapMailboxWatchEvent::EnvelopeRemoved { uid } => uid.get(),
+                event => panic!("expected EnvelopeRemoved, got {event:?}"),
+            })
+            .collect();
+        assert_eq!(Vec::from([2, 5, 9]), removed);
+    }
 
     /// One scripted exchange: the fragment the next written command
     /// must contain, then the replies to feed it, `{tag}` standing for

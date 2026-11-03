@@ -68,6 +68,7 @@ use imap_codec::{
     imap_types::{
         IntoStatic,
         command::CommandBody,
+        core::Tag,
         extensions::idle::IdleDone,
         response::{Bye, Data, Response, Status, StatusBody, StatusKind, Tagged},
         secret::Secret,
@@ -171,6 +172,7 @@ pub struct ImapIdle {
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
     bye: Option<Bye<'static>>,
+    tag: Option<Tag<'static>>,
     done: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     opts: ImapIdleOptions,
@@ -198,6 +200,7 @@ impl ImapIdle {
             data: Vec::new(),
             untagged: Vec::new(),
             bye: None,
+            tag: None,
             done,
             opts,
             #[cfg(feature = "client")]
@@ -264,6 +267,7 @@ impl ImapCoroutine for ImapIdle {
                         return ImapCoroutineState::Complete(Err(err));
                     }
 
+                    self.tag = Some(out.tag);
                     self.state = State::Read;
                     debug!("{}", self.state);
 
@@ -286,7 +290,9 @@ impl ImapCoroutine for ImapIdle {
                     if done || timed_out {
                         trace!("idle done: {done}");
                         trace!("idle timed out: {timed_out}");
-                        let send = ImapSend::new(IdleDoneCodec::new(), IdleDone);
+                        // NOTE: the IDLE completion arrives after DONE.
+                        let tag = self.tag.take().expect("IDLE tag kept while idling");
+                        let send = ImapSend::new(IdleDoneCodec::new(), IdleDone, tag);
                         self.state = State::Done(send);
                         debug!("{}", self.state);
                         continue;

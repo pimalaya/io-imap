@@ -48,7 +48,7 @@
 //! println!("{data:?}");
 //! ```
 
-use core::{fmt, num::NonZeroU32};
+use core::fmt;
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -59,7 +59,6 @@ use imap_codec::{
         command::{CommandBody, SelectParameter},
         mailbox::Mailbox,
         response::{Code, Data, StatusBody, StatusKind, Tagged},
-        sequence::SequenceSet,
     },
 };
 use log::trace;
@@ -70,7 +69,7 @@ use crate::{
     imap_try,
     rfc3501::{
         mailbox::encode_inplace,
-        select::{ImapMailboxSelectData, ImapMailboxSelectFetch},
+        select::{ImapMailboxSelectData, ImapMailboxSelectFetch, uid_ranges},
     },
     send::*,
 };
@@ -169,7 +168,7 @@ impl ImapCoroutine for ImapMailboxExamine {
                             earlier,
                             known_uids,
                         } if earlier => {
-                            output.vanished_earlier.extend(expand_uid_set(&known_uids));
+                            output.vanished_earlier.extend(uid_ranges(&known_uids));
                         }
                         _ => {}
                     }
@@ -218,13 +217,6 @@ impl fmt::Display for State {
             Self::Send(_) => f.write_str("send examine"),
         }
     }
-}
-
-/// Expand `VANISHED (EARLIER)` uid-set to concrete UIDs (RFC 7162 §3.2.10
-/// forbids `*`, so `u32::MAX` is a safe ceiling).
-fn expand_uid_set(uid_set: &SequenceSet) -> Vec<NonZeroU32> {
-    let max = NonZeroU32::new(u32::MAX).unwrap();
-    uid_set.iter(max).collect()
 }
 
 #[cfg(test)]
