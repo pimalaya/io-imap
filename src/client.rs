@@ -857,11 +857,14 @@ impl ImapClientStd {
 
     /// Useful after a STARTTLS upgrade or on reconnection.
     ///
-    /// The fragmentizer starts over: bytes read from the previous
-    /// stream say nothing about this one.
+    /// The fragmentizer starts over, its size limit kept: bytes read from
+    /// the previous stream say nothing about this one.
     pub fn set_stream<S: ImapStream + 'static>(&mut self, stream: S) {
         self.stream = Box::new(stream);
-        self.fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
+
+        // NOTE: emptied in place, the fragmentizer not exposing its limit.
+        while self.fragmentizer.progress().is_some() {}
+        self.fragmentizer.skip_message();
     }
 
     /// Consumes the client into a background watcher.
@@ -878,6 +881,7 @@ impl ImapClientStd {
     ) -> Result<ImapMailboxWatchStream, ImapClientError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let watch_opts = ImapMailboxWatchOptions {
+            resume_from: opts.resume_from,
             idle_timeout: opts.idle_timeout,
             poll: opts.poll.is_some(),
         };
@@ -895,7 +899,7 @@ impl ImapClientStd {
             let mut buf = [0u8; READ_BUFFER_SIZE];
             let mut arg: Option<Vec<u8>> = None;
 
-            loop {
+            let mut pump = || loop {
                 match watcher.resume(&mut fragmentizer, arg.as_deref()) {
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(e)) => {
                         arg = None;
@@ -972,11 +976,14 @@ impl ImapClientStd {
                         return;
                     }
                 }
-            }
+            };
+
+            pump();
+            watcher.state()
         });
 
         Ok(ImapMailboxWatchStream {
-            rx,
+            rx: Some(rx),
             handle: Some(handle),
             shutdown: shutdown_handle,
         })
@@ -1188,8 +1195,12 @@ impl fmt::Debug for ImapClientStd {
 }
 
 /// Options of [`ImapClientStd::watch_mailbox`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ImapMailboxWatchStreamOptions {
+    /// The state a previous watch of the same mailbox ended with, from
+    /// [`ImapMailboxWatchStream::into_state`], to resume from instead
+    /// of taking a new baseline.
+    pub resume_from: Option<ImapMailboxWatchState>,
     /// How long the worker may sit in a read before it looks at the
     /// shutdown flag again.
     ///
@@ -1216,6 +1227,7 @@ pub struct ImapMailboxWatchStreamOptions {
 impl Default for ImapMailboxWatchStreamOptions {
     fn default() -> Self {
         Self {
+            resume_from: None,
             shutdown_poll: Duration::from_secs(5),
             idle_timeout: None,
             poll: None,
@@ -1225,15 +1237,18 @@ impl Default for ImapMailboxWatchStreamOptions {
 
 /// Background-worker watch stream; drop or [`Self::close`] to wind down.
 pub struct ImapMailboxWatchStream {
-    rx: Receiver<Result<ImapMailboxWatchEvent, ImapClientError>>,
-    handle: Option<JoinHandle<()>>,
+    rx: Option<Receiver<Result<ImapMailboxWatchEvent, ImapClientError>>>,
+    handle: Option<JoinHandle<Option<ImapMailboxWatchState>>>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl ImapMailboxWatchStream {
     /// Non-blocking probe for the next event.
     pub fn try_recv(&self) -> Result<Result<ImapMailboxWatchEvent, ImapClientError>, TryRecvError> {
-        self.rx.try_recv()
+        match &self.rx {
+            Some(rx) => rx.try_recv(),
+            None => Err(TryRecvError::Disconnected),
+        }
     }
 
     /// Waits up to `timeout` for the next event.
@@ -1241,18 +1256,41 @@ impl ImapMailboxWatchStream {
         &self,
         timeout: Duration,
     ) -> Result<Result<ImapMailboxWatchEvent, ImapClientError>, RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
+        match &self.rx {
+            Some(rx) => rx.recv_timeout(timeout),
+            None => Err(RecvTimeoutError::Disconnected),
+        }
     }
 
     /// Signals shutdown and joins the worker.
-    pub fn close(mut self) -> Result<(), ImapClientError> {
-        self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .map_err(|_| io::Error::other("IMAP watch worker panicked"))?;
-        }
+    pub fn close(self) -> Result<(), ImapClientError> {
+        self.into_state()?;
         Ok(())
+    }
+
+    /// Signals shutdown, joins the worker and returns what the watch
+    /// knew of its mailbox, `None` when it ended before its baseline.
+    ///
+    /// Called once the stream has yielded its error, it gives the
+    /// state to resume from on a new connection, through
+    /// [`ImapMailboxWatchStreamOptions::resume_from`].
+    pub fn into_state(mut self) -> Result<Option<ImapMailboxWatchState>, ImapClientError> {
+        match self.stop() {
+            Some(Ok(state)) => Ok(state),
+            Some(Err(_)) => Err(io::Error::other("IMAP watch worker panicked").into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Winds the worker down and joins it, once.
+    fn stop(&mut self) -> Option<thread::Result<Option<ImapMailboxWatchState>>> {
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        // NOTE: dropped before the join, so a worker blocked on a full
+        // channel fails its send and returns.
+        self.rx.take();
+
+        self.handle.take().map(JoinHandle::join)
     }
 }
 
@@ -1260,17 +1298,13 @@ impl Iterator for ImapMailboxWatchStream {
     type Item = Result<ImapMailboxWatchEvent, ImapClientError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rx.recv().ok()
+        self.rx.as_ref()?.recv().ok()
     }
 }
 
 impl Drop for ImapMailboxWatchStream {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-
-        if let Some(handle) = self.handle.take() {
-            handle.join().ok();
-        }
+        self.stop();
     }
 }
 
@@ -1346,6 +1380,54 @@ mod tests {
         client.fragmentizer.enqueue_bytes(b"* 1 EXISTS\r\n");
         client.fragmentizer.progress();
         assert_eq!(b"* 1 EXISTS\r\n", client.fragmentizer.message_bytes());
+    }
+
+    #[test]
+    fn closing_a_watch_stream_nobody_drains_returns() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            // NOTE: more events than the channel holds, as a burst of
+            // flag changes gives a worker.
+            for _ in 0..3 {
+                let uid = NonZeroU32::MIN;
+                let event = ImapMailboxWatchEvent::EnvelopeRemoved { uid };
+
+                if tx.send(Ok(event)).is_err() {
+                    break;
+                }
+            }
+
+            None
+        });
+        let stream = ImapMailboxWatchStream {
+            rx: Some(rx),
+            handle: Some(handle),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        thread::spawn(move || {
+            stream.close().ok();
+            closed_tx.send(()).ok();
+        });
+
+        let closed = closed_rx.recv_timeout(Duration::from_secs(2));
+        assert!(closed.is_ok(), "close is still waiting for the worker");
+    }
+
+    #[test]
+    fn set_stream_keeps_the_configured_message_size() {
+        let mut client = ImapClientStd::new(OkStream::default());
+        client.fragmentizer = Fragmentizer::new(8);
+        client
+            .fragmentizer
+            .enqueue_bytes(b"* 2 EXISTS\r\n* 3 FETCH (BODY[] {9}\r\nstale");
+
+        client.set_stream(OkStream::default());
+        client.fragmentizer.enqueue_bytes(b"* 1 EXISTS\r\n");
+        client.fragmentizer.progress();
+        assert!(client.fragmentizer.is_max_message_size_exceeded());
+        assert_eq!(b"* 1 EXIS", client.fragmentizer.message_bytes());
     }
 
     /// A stream answering each flushed command with its `OK`, and reading

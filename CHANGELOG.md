@@ -18,9 +18,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Its `max_literal_len` (100 MiB by default) and `size` bound the body a server may announce.
 
+- Added `watch::ImapMailboxWatchState`, handed out by `watch::ImapMailboxWatch::state` and taken back through `watch::ImapMailboxWatchOptions::resume_from`.
+
+  A watch that lost its connection is resumed on a new one and emits what changed meanwhile, instead of taking a silent new baseline.
+
+- Added `client::ImapMailboxWatchStream::into_state` and `client::ImapMailboxWatchStreamOptions::resume_from`, the same for the blocking watch.
+
 ### Changed
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
+
+- **BREAKING**: Changed `watch::ImapMailboxWatchOptions` and `client::ImapMailboxWatchStreamOptions` to no longer be `Copy`, as they carry the state to resume from.
 
 - **BREAKING**: Changed `rfc3501::copy::ImapCopyUid` to a struct keeping the two COPYUID sets as inclusive UID ranges, in the order of the code.
 
@@ -48,6 +56,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed `client::ImapClientStd` never flushing its stream after a write.
 
+- Fixed `rfc2177::idle::ImapIdle` dropping the bytes it is resumed with once `done` is set or its refresh timer has run out: the notification they held was lost.
+
+- Fixed `rfc2177::idle::ImapIdle` dropping the data read between `DONE` and its completion: it is yielded as an event, so a watch whose IDLE is refreshed while a message arrives resyncs.
+
+- Fixed `rfc2177::idle::ImapIdle` reporting a BYE as an empty event then an EOF: it fails with `ImapIdleError::Bye`.
+
+- Fixed `rfc2177::idle::ImapIdle` failing on an untagged response that does not decode: it is skipped, as a command skips it.
+
+- Fixed `watch::ImapMailboxWatch` ending its IDLE and re-reading the mailbox on any server line, a keepalive included: it wakes on EXISTS, EXPUNGE, FETCH and VANISHED only.
+
+- Fixed `watch::ImapMailboxWatch` fetching its baseline by sequence number, which a strict server refuses on an empty mailbox: it sends `UID FETCH 1:* (UID FLAGS)`.
+
+- Fixed `client::ImapMailboxWatchStream` hanging on close or drop when its events are not drained.
+
 - Fixed `rfc3501::list::ImapMailboxList` and `rfc3501::lsub::ImapMailboxLsub` sending the pattern unencoded: it now goes out in modified UTF-7, the wildcards kept, as a quoted string, which iCloud requires for LSUB.
 
 - Fixed the client-side SORT fallback of `rfc5256::sort::ImapMessageSort` to follow RFC 5256: `FROM`, `TO` and `CC` sort by the first address's mailbox instead of being ignored, `SUBJECT` by the base subject (encoded words decoded, reply and forward prefixes stripped, case ignored) instead of the raw bytes, `DATE` falls back to the internal date, and ties keep the sequence order, `REVERSE` included.
@@ -74,7 +96,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed the client-side SORT fallback taking quadratic time on a subject made of bracketed blobs.
 
-- Fixed `client::ImapClientStd::set_stream` keeping the bytes buffered from the previous stream, which were parsed in front of what the new one delivers: the fragmentizer starts over.
+- Fixed `client::ImapClientStd::set_stream` keeping the bytes buffered from the previous stream, which were parsed in front of what the new one delivers: the fragmentizer is emptied, its size limit kept.
 
 ### Removed
 

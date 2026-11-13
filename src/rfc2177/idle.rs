@@ -70,7 +70,7 @@ use imap_codec::{
         command::CommandBody,
         core::Tag,
         extensions::idle::IdleDone,
-        response::{Bye, Data, Response, Status, StatusBody, StatusKind, Tagged},
+        response::{Data, Response, Status, StatusBody, StatusKind, Tagged},
         secret::Secret,
         utils::escape_byte_string,
     },
@@ -171,7 +171,6 @@ pub struct ImapIdle {
     codec: ResponseCodec,
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
-    bye: Option<Bye<'static>>,
     tag: Option<Tag<'static>>,
     done: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
@@ -199,7 +198,6 @@ impl ImapIdle {
             codec: ResponseCodec::new(),
             data: Vec::new(),
             untagged: Vec::new(),
-            bye: None,
             tag: None,
             done,
             opts,
@@ -281,23 +279,8 @@ impl ImapCoroutine for ImapIdle {
                     }
                 }
                 State::Read => {
-                    let done = self.done.load(Ordering::SeqCst);
-                    #[cfg(feature = "client")]
-                    let timed_out = self.timed_out();
-                    #[cfg(not(feature = "client"))]
-                    let timed_out = false;
-
-                    if done || timed_out {
-                        trace!("idle done: {done}");
-                        trace!("idle timed out: {timed_out}");
-                        // NOTE: the IDLE completion arrives after DONE.
-                        let tag = self.tag.take().expect("IDLE tag kept while idling");
-                        let send = ImapSend::new(IdleDoneCodec::new(), IdleDone, tag);
-                        self.state = State::Done(send);
-                        debug!("{}", self.state);
-                        continue;
-                    }
-
+                    // NOTE: the bytes are taken before the flags are
+                    // tested, or a DONE falling due would drop them.
                     match arg.take() {
                         Some(&[]) => {
                             return ImapCoroutineState::Complete(Err(ImapIdleError::Eof));
@@ -306,10 +289,7 @@ impl ImapCoroutine for ImapIdle {
                             trace!("read bytes: {}", escape_byte_string(bytes));
                             fragmentizer.enqueue_bytes(bytes);
                         }
-                        None => {
-                            self.wants_read = true;
-                            continue;
-                        }
+                        None => {}
                     }
 
                     loop {
@@ -331,21 +311,38 @@ impl ImapCoroutine for ImapIdle {
                                     }
                                     Ok(Response::Status(Status::Tagged(_))) => {}
                                     Ok(Response::Status(Status::Bye(bye))) => {
-                                        self.bye.replace(bye.into_static());
+                                        let err = ImapIdleError::Bye(bye.text.to_string());
+                                        return ImapCoroutineState::Complete(Err(err));
                                     }
                                     Ok(Response::CommandContinuationRequest(_)) => {}
                                     Err(decode_err) => {
                                         let bytes = fragmentizer.message_bytes();
-                                        let bytes = Secret::new(bytes.into());
                                         let err = match decode_err {
                                             DecodeMessageError::DecodingFailure(_)
                                             | DecodeMessageError::DecodingRemainder { .. } => {
+                                                // NOTE: see himalaya#641.
+                                                if bytes.starts_with(b"* ") {
+                                                    debug!(
+                                                        "skipping undecodable untagged response"
+                                                    );
+                                                    trace!("{}", escape_byte_string(bytes));
+                                                    continue;
+                                                }
+
+                                                if decode_lossy_tagged(&self.codec, bytes).is_some()
+                                                {
+                                                    continue;
+                                                }
+
+                                                let bytes = Secret::new(bytes.into());
                                                 ImapIdleError::DecodingFailure(bytes)
                                             }
                                             DecodeMessageError::MessageTooLong { .. } => {
+                                                let bytes = Secret::new(bytes.into());
                                                 ImapIdleError::MessageTooLong(bytes)
                                             }
                                             DecodeMessageError::MessagePoisoned { .. } => {
+                                                let bytes = Secret::new(bytes.into());
                                                 ImapIdleError::MessageIsPoisoned(bytes)
                                             }
                                         };
@@ -357,16 +354,37 @@ impl ImapCoroutine for ImapIdle {
                                 let bytes = fragmentizer.fragment_bytes(info);
                                 trace!("read literal fragment ({} bytes)", bytes.len());
                             }
-                            None => {
-                                let event = ImapIdleEvent {
-                                    data: mem::take(&mut self.data),
-                                    untagged: mem::take(&mut self.untagged),
-                                };
-
-                                return ImapCoroutineState::Yielded(ImapIdleYield::Event(event));
-                            }
+                            None => break,
                         }
                     }
+
+                    if !self.data.is_empty() || !self.untagged.is_empty() {
+                        let event = ImapIdleEvent {
+                            data: mem::take(&mut self.data),
+                            untagged: mem::take(&mut self.untagged),
+                        };
+
+                        return ImapCoroutineState::Yielded(ImapIdleYield::Event(event));
+                    }
+
+                    let done = self.done.load(Ordering::SeqCst);
+                    #[cfg(feature = "client")]
+                    let timed_out = self.timed_out();
+                    #[cfg(not(feature = "client"))]
+                    let timed_out = false;
+
+                    if done || timed_out {
+                        trace!("idle done: {done}");
+                        trace!("idle timed out: {timed_out}");
+                        // NOTE: the IDLE completion arrives after DONE.
+                        let tag = self.tag.take().expect("IDLE tag kept while idling");
+                        let send = ImapSend::new(IdleDoneCodec::new(), IdleDone, tag);
+                        self.state = State::Done(send);
+                        debug!("{}", self.state);
+                        continue;
+                    }
+
+                    self.wants_read = true;
                 }
                 State::Done(send) => {
                     let out = imap_try!(send, fragmentizer, arg.take());
@@ -389,23 +407,47 @@ impl ImapCoroutine for ImapIdle {
                     #[cfg(not(feature = "client"))]
                     let timed_out = false;
 
-                    return match body.kind {
-                        StatusKind::Ok if timed_out => {
-                            trace!("reached timeout, starting a new IDLE command");
-                            let send = ImapSend::command(CommandBody::Idle);
-                            self.state = State::Idle(send);
-                            debug!("{}", self.state);
-                            continue;
+                    match body.kind {
+                        StatusKind::Ok => {}
+                        StatusKind::No => {
+                            let err = ImapIdleError::No(body.text.to_string());
+                            return ImapCoroutineState::Complete(Err(err));
                         }
-                        StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
-                        StatusKind::No => ImapCoroutineState::Complete(Err(ImapIdleError::No(
-                            body.text.to_string(),
-                        ))),
-                        StatusKind::Bad => ImapCoroutineState::Complete(Err(ImapIdleError::Bad(
-                            body.text.to_string(),
-                        ))),
+                        StatusKind::Bad => {
+                            let err = ImapIdleError::Bad(body.text.to_string());
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+                    }
+
+                    self.state = if timed_out {
+                        State::Refresh
+                    } else {
+                        State::Finish
                     };
+                    debug!("{}", self.state);
+
+                    // NOTE: what the server sent before completing DONE is
+                    // mailbox data like any other.
+                    if !out.data.is_empty() || !out.untagged.is_empty() {
+                        let event = ImapIdleEvent {
+                            data: out.data,
+                            untagged: out.untagged,
+                        };
+
+                        return ImapCoroutineState::Yielded(ImapIdleYield::Event(event));
+                    }
                 }
+                State::Refresh => {
+                    if self.done.load(Ordering::SeqCst) {
+                        return ImapCoroutineState::Complete(Ok(()));
+                    }
+
+                    trace!("reached timeout, starting a new IDLE command");
+                    let send = ImapSend::command(CommandBody::Idle);
+                    self.state = State::Idle(send);
+                    debug!("{}", self.state);
+                }
+                State::Finish => return ImapCoroutineState::Complete(Ok(())),
             }
         }
     }
@@ -415,6 +457,8 @@ enum State {
     Idle(ImapSend<CommandCodec>),
     Read,
     Done(ImapSend<IdleDoneCodec>),
+    Refresh,
+    Finish,
 }
 
 impl fmt::Display for State {
@@ -423,6 +467,8 @@ impl fmt::Display for State {
             Self::Idle(_) => f.write_str("send idle"),
             Self::Read => f.write_str("read events"),
             Self::Done(_) => f.write_str("send done"),
+            Self::Refresh => f.write_str("refresh idle"),
+            Self::Finish => f.write_str("finish idle"),
         }
     }
 }
@@ -487,6 +533,126 @@ mod tests {
         expect_wants_read(&mut idle, &mut frag);
 
         let event = expect_event(&mut idle, &mut frag, b"+ idling\r\n* 10 EXISTS\r\n");
+        assert_eq!(1, event.data.len());
+    }
+
+    #[test]
+    fn bytes_read_once_done_is_set_yield_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        done.store(true, Ordering::SeqCst);
+        let event = expect_event(&mut idle, &mut frag, b"* 5 EXISTS\r\n");
+        assert_eq!(1, event.data.len());
+
+        let bytes = expect_wants_write(&mut idle, &mut frag, None);
+        assert_eq!(b"DONE\r\n", &*bytes);
+    }
+
+    #[test]
+    fn data_read_before_done_completion_yields_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done.clone(), ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        done.store(true, Ordering::SeqCst);
+        let _ = expect_wants_write(&mut idle, &mut frag, None);
+        expect_wants_read(&mut idle, &mut frag);
+
+        let reply = b"* 24 EXISTS\r\nA1 OK IDLE terminated\r\n";
+        let event = expect_event(&mut idle, &mut frag, reply);
+        assert_eq!(1, event.data.len());
+
+        match idle.resume(&mut frag, None) {
+            ImapCoroutineState::Complete(Ok(())) => {}
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn data_read_before_refresh_completion_yields_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let opts = ImapIdleOptions {
+            timeout: Some(Duration::ZERO),
+        };
+        let mut idle = ImapIdle::new(done, opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+
+        // NOTE: the timer has run out already, so DONE follows at once.
+        let bytes = expect_wants_write(&mut idle, &mut frag, Some(b"+ idling\r\n"));
+        assert_eq!(b"DONE\r\n", &*bytes);
+        expect_wants_read(&mut idle, &mut frag);
+
+        let reply = b"* 24 EXISTS\r\nA1 OK IDLE terminated\r\n";
+        let event = expect_event(&mut idle, &mut frag, reply);
+        assert_eq!(1, event.data.len());
+
+        expect_wants_tag(&mut idle, &mut frag);
+    }
+
+    #[test]
+    fn bye_while_idling_returns_bye_error() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        let err = expect_complete_err(&mut idle, &mut frag, b"* BYE Autologout\r\n");
+        let ImapIdleError::Bye(text) = err else {
+            panic!("expected ImapIdleError::Bye, got {err:?}");
+        };
+        assert_eq!(text, "Autologout");
+    }
+
+    #[test]
+    fn undecodable_untagged_line_is_skipped() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+
+        let reply = b"* FLAGS (OIB-Seen-[Gmail]/All Mail)\r\n* 5 EXISTS\r\n";
+        let event = expect_event(&mut idle, &mut frag, reply);
+        assert_eq!(1, event.data.len());
+    }
+
+    #[test]
+    fn read_completing_no_response_yields_no_event() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut idle = ImapIdle::new(done, ImapIdleOptions::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut idle, &mut frag);
+        let _ = expect_wants_write(&mut idle, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut idle, &mut frag);
+        expect_wants_read_after(&mut idle, &mut frag, b"+ idling\r\n");
+        expect_wants_read_after(&mut idle, &mut frag, b"* 5 EXI");
+
+        let event = expect_event(&mut idle, &mut frag, b"STS\r\n");
         assert_eq!(1, event.data.len());
     }
 

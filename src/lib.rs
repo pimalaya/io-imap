@@ -114,7 +114,9 @@
 //! QRESYNC it re-reads the whole mailbox on each wake and diffs the
 //! same baseline locally, so the events are the same and only the cost
 //! differs. The connection is dedicated; a shared `AtomicBool` winds it
-//! down cleanly.
+//! down cleanly. A watch that lost its connection hands out what it
+//! knew of the mailbox, and a new one resumed from it emits what
+//! changed during the outage.
 //!
 //! ## The clients
 //!
