@@ -4,9 +4,14 @@
 //! caller, and feeds responses back through the borrowed
 //! `Fragmentizer`.
 
-use core::mem;
+use core::{fmt, mem};
 
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use imap_codec::{
     CommandCodec, ResponseCodec,
@@ -17,7 +22,10 @@ use imap_codec::{
         command::{Command, CommandBody},
         core::{LiteralMode, Tag},
         error::ValidationError,
-        response::{Bye, CommandContinuationRequest, Data, Response, Status, StatusBody, Tagged},
+        response::{
+            Bye, Code, CommandContinuationRequest, Data, Response, Status, StatusBody, StatusKind,
+            Tagged,
+        },
         secret::Secret,
         utils::escape_byte_string,
     },
@@ -55,6 +63,38 @@ pub enum ImapSendError {
     /// the given budget.
     #[error("Read IMAP response error: over {} responses or {} octets", .0.responses, .0.octets)]
     ResponseTooLong(ImapSendBudget),
+}
+
+/// A NO or BAD completion: its kind, its response code and its text.
+///
+/// Shared by the command errors, so a caller reads the response code
+/// instead of parsing the text. Displays as the text alone.
+///
+/// Refs: <https://datatracker.ietf.org/doc/html/rfc3501#section-7.1>
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapStatusError {
+    /// Whether the server answered NO or BAD.
+    pub kind: StatusKind,
+    /// The response code, such as `AUTHENTICATIONFAILED` or `TRYCREATE`.
+    pub code: Option<Code<'static>>,
+    /// The human-readable text.
+    pub text: String,
+}
+
+impl From<StatusBody<'static>> for ImapStatusError {
+    fn from(body: StatusBody<'static>) -> Self {
+        Self {
+            kind: body.kind,
+            code: body.code,
+            text: body.text.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for ImapStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 /// Bounds on the untagged responses one exchange collects.
@@ -121,6 +161,7 @@ pub struct ImapSend<T: Encoder> {
     codec: ResponseCodec,
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
+    skipped: Vec<Secret<Box<[u8]>>>,
     tagged: Option<Tagged<'static>>,
     bye: Option<Bye<'static>>,
     cr: Option<CommandContinuationRequest<'static>>,
@@ -156,6 +197,7 @@ impl<T: Encoder> ImapSend<T> {
             fragments,
             data: Vec::new(),
             untagged: Vec::new(),
+            skipped: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -190,6 +232,7 @@ impl<T: Encoder> ImapSend<T> {
             fragments: VecDeque::new(),
             data: Vec::new(),
             untagged: Vec::new(),
+            skipped: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -203,7 +246,7 @@ impl<T: Encoder> ImapSend<T> {
 
     /// Charges one more collected response of `octets` to the budget.
     fn spend(&mut self, octets: usize) -> Result<(), ImapSendError> {
-        let responses = self.data.len() + self.untagged.len();
+        let responses = self.data.len() + self.untagged.len() + self.skipped.len();
         self.octets = self.octets.saturating_add(octets);
 
         if responses >= self.budget.responses || self.octets > self.budget.octets {
@@ -366,6 +409,14 @@ impl<T: Encoder> ImapSend<T> {
                                         if bytes.starts_with(b"* ") {
                                             debug!("skipping undecodable untagged response");
                                             trace!("{}", escape_byte_string(bytes));
+
+                                            let skipped = Secret::new(bytes.into());
+
+                                            if let Err(err) = self.spend(octets) {
+                                                return ImapSendResult::Err(err);
+                                            }
+
+                                            self.skipped.push(skipped);
                                             continue;
                                         }
 
@@ -415,6 +466,7 @@ impl<T: Encoder> ImapSend<T> {
                             tag: self.tag.take().unwrap(),
                             data: mem::take(&mut self.data),
                             untagged: mem::take(&mut self.untagged),
+                            skipped: mem::take(&mut self.skipped),
                             tagged: self.tagged.take(),
                             bye: self.bye.take(),
                             continuation_request: self.cr.take(),
@@ -460,6 +512,7 @@ impl ImapSend<CommandCodec> {
             fragments: VecDeque::new(),
             data: Vec::new(),
             untagged: Vec::new(),
+            skipped: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -545,6 +598,9 @@ pub struct ImapSendOutput<T: Encoder> {
     pub data: Vec<Data<'static>>,
     /// The untagged status responses collected during the exchange.
     pub untagged: Vec<StatusBody<'static>>,
+    /// The untagged responses that did not decode and were skipped, as
+    /// raw bytes: data the result may be missing.
+    pub skipped: Vec<Secret<Box<[u8]>>>,
     /// The tagged response terminating the exchange, when one arrived.
     pub tagged: Option<Tagged<'static>>,
     /// The BYE response, when the server closed the session instead.
@@ -711,6 +767,25 @@ mod tests {
 
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!(StatusKind::Ok, tagged.body.kind);
+    }
+
+    #[test]
+    fn skipped_untagged_response_is_kept_in_output() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let line = b"* FLAGS (OIB-Seen-[Gmail]/All Mail)\r\n";
+        let reply = [line.as_slice(), b"A1 OK NOOP completed\r\n"].concat();
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(&reply)) else {
+            panic!("expected Ok");
+        };
+
+        assert_eq!(1, out.skipped.len());
+        assert_eq!(line, &**out.skipped[0].declassify());
     }
 
     #[test]

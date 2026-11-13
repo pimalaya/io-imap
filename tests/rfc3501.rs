@@ -176,7 +176,7 @@ fn noop_ok() {
         }
     };
 
-    assert!(matches!(result, ImapCoroutineState::Complete(Ok(()))));
+    assert!(matches!(result, ImapCoroutineState::Complete(Ok(_))));
 }
 
 #[test]

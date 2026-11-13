@@ -31,3 +31,4 @@ pub mod status;
 pub mod store;
 pub mod subscribe;
 pub mod unsubscribe;
+pub mod updates;

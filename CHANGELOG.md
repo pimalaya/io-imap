@@ -24,9 +24,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added `client::ImapMailboxWatchStream::into_state` and `client::ImapMailboxWatchStreamOptions::resume_from`, the same for the blocking watch.
 
+- Added `send::ImapStatusError`, the kind, response code and text of a NO or BAD completion, and `client::ImapClientError::status` to read it.
+
+- Added `send::ImapSendOutput::skipped`, the untagged responses skipped for not decoding.
+
+- Added `read_only` and `no_mod_seq` to `rfc3501::select::ImapMailboxSelectData`.
+
+- Added `rfc3501::updates::ImapMailboxUpdates`, the unsolicited EXISTS, RECENT, EXPUNGE, VANISHED and FETCH data of a response.
+
+- Added the `No`, `Bad` and `Bye` variants to `rfc3501::starttls::ImapStartTlsError`.
+
 ### Changed
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
+
+- **BREAKING**: Changed the `No` and `Bad` variants of the LOGIN, AUTHENTICATE, SELECT, EXAMINE, FETCH, STORE, COPY, MOVE and buffered APPEND errors to carry a `send::ImapStatusError` instead of the text.
+
+  The response code reaches the caller. The error messages are unchanged.
+
+- **BREAKING**: Changed `rfc3501::noop::ImapNoop` and `rfc3501::check::ImapMailboxCheck` to return `rfc3501::updates::ImapMailboxUpdates` instead of `()`.
 
 - **BREAKING**: Changed `watch::ImapMailboxWatchOptions` and `client::ImapMailboxWatchStreamOptions` to no longer be `Copy`, as they carry the state to resume from.
 
@@ -55,6 +71,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed the client-side SORT fallback returning a message the search did not match when the server adds its FETCH to the response.
 
 - Fixed `client::ImapClientStd` never flushing its stream after a write.
+
+- Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` announcing `SCRAM-SHA-256` for credentials carrying a channel binding: they run under `SCRAM-SHA-256-PLUS`.
+
+- Fixed `rfc3501::starttls::ImapStartTls` completing with success on a tagged `NO` or `BAD`, and reading past a `BYE` greeting.
 
 - Fixed `rfc2177::idle::ImapIdle` dropping the bytes it is resumed with once `done` is set or its refresh timer has run out: the notification they held was lost.
 

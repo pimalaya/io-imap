@@ -76,10 +76,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxSelectError {
     /// The server rejected the command with a NO response.
     #[error("IMAP SELECT failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP SELECT failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP SELECT failed: BYE {0}")]
     Bye(String),
@@ -118,6 +118,25 @@ pub struct ImapMailboxSelectData {
     pub vanished_earlier: Vec<RangeInclusive<NonZeroU32>>,
     /// Implicit FETCH responses for changed messages (QRESYNC).
     pub changed: Vec<ImapMailboxSelectFetch>,
+    /// Whether the mailbox was opened read-only (READ-ONLY or
+    /// READ-WRITE code of the completion), `None` when the server
+    /// said neither.
+    pub read_only: Option<bool>,
+    /// Whether the mailbox keeps no modification sequences (NOMODSEQ
+    /// code).
+    pub no_mod_seq: bool,
+}
+
+impl ImapMailboxSelectData {
+    /// Reads what a response code says of the opened mailbox itself.
+    pub(crate) fn read_access_code(&mut self, code: Option<&Code<'_>>) {
+        match code {
+            Some(Code::ReadOnly) => self.read_only = Some(true),
+            Some(Code::ReadWrite) => self.read_only = Some(false),
+            Some(Code::NoModSeq) => self.no_mod_seq = true,
+            _ => {}
+        }
+    }
 }
 
 /// Implicit FETCH returned during a QRESYNC SELECT.
@@ -203,8 +222,12 @@ impl ImapCoroutine for ImapMailboxSelect {
                     }
                 }
 
+                output.read_access_code(body.code.as_ref());
+
                 for StatusBody { kind, code, .. } in out.untagged {
                     if let StatusKind::Ok = kind {
+                        output.read_access_code(code.as_ref());
+
                         match code {
                             Some(Code::Unseen(seq)) => output.unseen = Some(seq),
                             Some(Code::PermanentFlags(flags)) => {
@@ -223,11 +246,11 @@ impl ImapCoroutine for ImapMailboxSelect {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
                     StatusKind::No => {
-                        let err = ImapMailboxSelectError::No(body.text.to_string());
+                        let err = ImapMailboxSelectError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxSelectError::Bad(body.text.to_string());
+                        let err = ImapMailboxSelectError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -298,12 +321,15 @@ mod tests {
              * 42 EXISTS\r\n\
              * 7 RECENT\r\n\
              * OK [UIDVALIDITY 1700] uid validity\r\n\
+             * OK [NOMODSEQ] no modification sequences\r\n\
              {tag} OK [READ-WRITE] SELECT completed\r\n",
         );
         let data = expect_complete_ok(&mut select, &mut frag, reply.as_bytes());
         assert_eq!(Some(42), data.exists);
         assert_eq!(Some(7), data.recent);
         assert_eq!(1700, data.uid_validity.expect("uid validity").get());
+        assert_eq!(Some(false), data.read_only);
+        assert!(data.no_mod_seq);
     }
 
     #[test]
@@ -348,7 +374,7 @@ mod tests {
         let ImapMailboxSelectError::No(text) = err else {
             panic!("expected ImapMailboxSelectError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox does not exist");
+        assert_eq!(text.text, "mailbox does not exist");
     }
 
     #[test]

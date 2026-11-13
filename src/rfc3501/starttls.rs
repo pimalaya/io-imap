@@ -53,7 +53,7 @@
 
 use core::{fmt, mem};
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use imap_codec::{
     CommandCodec,
@@ -75,6 +75,15 @@ use crate::coroutine::*;
 /// Failure causes during the IMAP STARTTLS handshake.
 #[derive(Clone, Debug, Error)]
 pub enum ImapStartTlsError {
+    /// The server rejected the command with a NO response.
+    #[error("IMAP STARTTLS failed: NO {0}")]
+    No(String),
+    /// The server rejected the command with a BAD response.
+    #[error("IMAP STARTTLS failed: BAD {0}")]
+    Bad(String),
+    /// The server greeted with a BYE.
+    #[error("IMAP STARTTLS failed: BYE {0}")]
+    Bye(String),
     /// The stream reached EOF during the STARTTLS exchange.
     #[error("IMAP STARTTLS failed: reached unexpected EOF on stream")]
     Eof,
@@ -189,6 +198,11 @@ impl ImapCoroutine for ImapStartTls {
 
                         trace!("discard greeting line: {}", escape_byte_string(&line));
 
+                        if let Some(text) = strip_word(&line, b"* BYE") {
+                            let err = ImapStartTlsError::Bye(text);
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+
                         self.state = State::Tag;
                         return ImapCoroutineState::Yielded(ImapYield::WantsTag);
                     }
@@ -259,10 +273,27 @@ impl ImapCoroutine for ImapStartTls {
                             let tagged = line.starts_with(&self.tag_bytes)
                                 && line.get(self.tag_bytes.len()) == Some(&b' ');
 
-                            if tagged {
+                            if !tagged {
+                                continue;
+                            }
+
+                            // NOTE: only an OK lets the upgrade begin.
+                            let status = &line[self.tag_bytes.len() + 1..];
+
+                            if strip_word(status, b"OK").is_some() {
                                 let remaining = mem::take(&mut self.buf);
                                 return ImapCoroutineState::Complete(Ok(remaining));
                             }
+
+                            let err = match strip_word(status, b"NO") {
+                                Some(text) => ImapStartTlsError::No(text),
+                                None => {
+                                    let text = strip_word(status, b"BAD");
+                                    ImapStartTlsError::Bad(text.unwrap_or_default())
+                                }
+                            };
+
+                            return ImapCoroutineState::Complete(Err(err));
                         }
                     }
                     None => {
@@ -292,6 +323,18 @@ impl fmt::Display for State {
     }
 }
 
+/// The text following `word` when `line` starts with it, whatever its
+/// case: a byte compare, the codec being of no use in cleartext.
+fn strip_word(line: &[u8], word: &[u8]) -> Option<String> {
+    let (head, rest) = line.split_at_checked(word.len())?;
+
+    if !head.eq_ignore_ascii_case(word) || !matches!(rest.first(), Some(b' ' | b'\r' | b'\n')) {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(rest).trim().into())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::{format, string::String, vec::Vec};
@@ -307,6 +350,38 @@ mod tests {
         let reply = format!("* CAPABILITY IMAP4rev1\r\n{tag} OK begin TLS\r\n");
         let leftover = expect_complete(&mut starttls, &mut frag, reply.as_bytes()).unwrap();
         assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn tagged_no_returns_no_error() {
+        let mut starttls = ImapStartTls::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let tag = write_command(&mut starttls, &mut frag);
+
+        let reply = format!("{tag} NO TLS not available\r\n");
+        let res = expect_complete(&mut starttls, &mut frag, reply.as_bytes());
+        assert!(matches!(res, Err(ImapStartTlsError::No(text)) if text == "TLS not available"));
+    }
+
+    #[test]
+    fn tagged_bad_returns_bad_error() {
+        let mut starttls = ImapStartTls::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        let tag = write_command(&mut starttls, &mut frag);
+
+        let reply = format!("{tag} BAD unknown command\r\n");
+        let res = expect_complete(&mut starttls, &mut frag, reply.as_bytes());
+        assert!(matches!(res, Err(ImapStartTlsError::Bad(text)) if text == "unknown command"));
+    }
+
+    #[test]
+    fn bye_greeting_returns_bye_error() {
+        let mut starttls = ImapStartTls::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+        expect_wants_read(&mut starttls, &mut frag, None);
+
+        let res = expect_complete(&mut starttls, &mut frag, b"* BYE overloaded\r\n");
+        assert!(matches!(res, Err(ImapStartTlsError::Bye(text)) if text == "overloaded"));
     }
 
     #[test]

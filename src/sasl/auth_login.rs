@@ -95,10 +95,10 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapAuthLoginError {
     /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE LOGIN failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE LOGIN failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE LOGIN failed: BYE {0}")]
     Bye(String),
@@ -319,8 +319,8 @@ impl ImapCoroutine for ImapAuthLogin {
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
                             StatusKind::Ok => ImapAuthLoginError::UnexpectedOk,
-                            StatusKind::No => ImapAuthLoginError::No(body.text.to_string()),
-                            StatusKind::Bad => ImapAuthLoginError::Bad(body.text.to_string()),
+                            StatusKind::No => ImapAuthLoginError::No(body.into()),
+                            StatusKind::Bad => ImapAuthLoginError::Bad(body.into()),
                         };
 
                         return ImapCoroutineState::Complete(Err(err));
@@ -357,11 +357,11 @@ impl ImapCoroutine for ImapAuthLogin {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthLoginError::No(body.text.to_string());
+                            let err = ImapAuthLoginError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthLoginError::Bad(body.text.to_string());
+                            let err = ImapAuthLoginError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -502,7 +502,7 @@ mod tests {
         let ImapAuthLoginError::No(text) = err else {
             panic!("expected ImapAuthLoginError::No, got {err:?}");
         };
-        assert_eq!(text, "authentication failed");
+        assert_eq!(text.text, "authentication failed");
     }
 
     #[test]
@@ -526,7 +526,7 @@ mod tests {
         let ImapAuthLoginError::Bad(text) = err else {
             panic!("expected ImapAuthLoginError::Bad, got {err:?}");
         };
-        assert_eq!(text, "AUTHENTICATE not enabled");
+        assert_eq!(text.text, "AUTHENTICATE not enabled");
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         let ImapAuthLoginError::No(text) = err else {
             panic!("expected ImapAuthLoginError::No, got {err:?}");
         };
-        assert_eq!(text, "authentication failed");
+        assert_eq!(text.text, "authentication failed");
     }
 
     #[test]

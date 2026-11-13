@@ -57,7 +57,7 @@ use crate::{
         append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
         delete::*, examine::*, expunge::*, fetch::*, fetch_stream::*, fetch_stream_batch::*,
         greeting::*, list::*, login::*, logout::*, lsub::*, noop::*, raw::*, rename::*, search::*,
-        select::*, starttls::*, status::*, store::*, subscribe::*, unsubscribe::*,
+        select::*, starttls::*, status::*, store::*, subscribe::*, unsubscribe::*, updates::*,
     },
     rfc3691::unselect::*,
     rfc4315::expunge_uid::*,
@@ -66,6 +66,7 @@ use crate::{
     rfc6851::r#move::*,
     rfc7628::auth_oauthbearer::*,
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*, auth_xoauth2::*},
+    send::ImapStatusError,
     session::*,
     watch::*,
 };
@@ -249,6 +250,58 @@ pub enum ImapClientError {
     /// as a JNI upcall or a runtime-specific socket error.
     #[error(transparent)]
     Transport(Box<dyn core::error::Error + Send + Sync>),
+}
+
+impl ImapClientError {
+    /// The NO or BAD completion behind this error, with its response
+    /// code.
+    ///
+    /// `None` for any other failure, and for the commands whose error
+    /// keeps the text alone: it is carried by LOGIN, AUTHENTICATE,
+    /// SELECT, EXAMINE, FETCH, STORE, COPY, MOVE and the buffered
+    /// APPEND.
+    pub fn status(&self) -> Option<&ImapStatusError> {
+        match self {
+            Self::Login(ImapLoginError::No(status) | ImapLoginError::Bad(status))
+            | Self::AuthLogin(ImapAuthLoginError::No(status) | ImapAuthLoginError::Bad(status))
+            | Self::AuthPlain(ImapAuthPlainError::No(status) | ImapAuthPlainError::Bad(status))
+            | Self::AuthAnonymous(
+                ImapAuthAnonymousError::No(status) | ImapAuthAnonymousError::Bad(status),
+            )
+            | Self::AuthOAuthBearer(
+                ImapAuthOauthbearerError::No(status) | ImapAuthOauthbearerError::Bad(status),
+            )
+            | Self::AuthXOAuth2(
+                ImapAuthXoauth2Error::No(status) | ImapAuthXoauth2Error::Bad(status),
+            )
+            | Self::MailboxSelect(
+                ImapMailboxSelectError::No(status) | ImapMailboxSelectError::Bad(status),
+            )
+            | Self::MailboxExamine(
+                ImapMailboxExamineError::No(status) | ImapMailboxExamineError::Bad(status),
+            )
+            | Self::MessageFetch(
+                ImapMessageFetchError::No(status) | ImapMessageFetchError::Bad(status),
+            )
+            | Self::MessageStore(
+                ImapMessageStoreError::No(status) | ImapMessageStoreError::Bad(status),
+            )
+            | Self::MessageCopy(
+                ImapMessageCopyError::No(status) | ImapMessageCopyError::Bad(status),
+            )
+            | Self::MessageMove(
+                ImapMessageMoveError::No(status) | ImapMessageMoveError::Bad(status),
+            )
+            | Self::MessageAppend(
+                ImapMessageAppendError::No(status) | ImapMessageAppendError::Bad(status),
+            ) => Some(status),
+            #[cfg(feature = "scram")]
+            Self::AuthScramSha256(
+                ImapAuthScramSha256Error::No(status) | ImapAuthScramSha256Error::Bad(status),
+            ) => Some(status),
+            _ => None,
+        }
+    }
 }
 
 /// Emits the [`ImapClient`] and [`ImapClientAsync`] command surfaces
@@ -532,8 +585,8 @@ imap_client_commands! {
     }
 
     /// `NOOP`; round-trips to keep the connection alive or poll for
-    /// updates.
-    fn noop() -> () {
+    /// updates, which it returns.
+    fn noop() -> ImapMailboxUpdates {
         ImapNoop::new()
     }
 
@@ -627,8 +680,9 @@ imap_client_commands! {
         ImapMailboxUnselect::new()
     }
 
-    /// `CHECK`; requests a mailbox checkpoint.
-    fn check() -> () {
+    /// `CHECK`; requests a mailbox checkpoint and returns the updates
+    /// the server reports with it.
+    fn check() -> ImapMailboxUpdates {
         ImapMailboxCheck::new()
     }
 
@@ -1338,6 +1392,8 @@ pub trait ImapStream: Read + Write + Send + Any {
 mod tests {
     use core::mem;
 
+    use imap_codec::imap_types::response::{Code, StatusKind};
+
     use crate::client::*;
 
     #[cfg(target_pointer_width = "64")]
@@ -1353,6 +1409,20 @@ mod tests {
         let stream = client.stream.as_any_mut().downcast_mut::<OkStream>();
         let written = &stream.expect("the stream given").written;
         assert_eq!("", String::from_utf8_lossy(written));
+    }
+
+    #[test]
+    fn status_gives_the_response_code_of_a_refused_command() {
+        let status = ImapStatusError {
+            kind: StatusKind::No,
+            code: Some(Code::TryCreate),
+            text: "mailbox does not exist".into(),
+        };
+        let err = ImapClientError::from(ImapMessageCopyError::No(status.clone()));
+        assert_eq!(Some(&status), err.status());
+
+        let err = ImapClientError::from(ImapMessageCopyError::MissingTagged);
+        assert_eq!(None, err.status());
     }
 
     #[test]

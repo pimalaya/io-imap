@@ -130,10 +130,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMessageStoreError {
     /// The server rejected the command with a NO response.
     #[error("IMAP STORE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP STORE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP STORE failed: BYE {0}")]
     Bye(String),
@@ -218,11 +218,11 @@ impl ImapCoroutine for ImapMessageStore {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(data)),
                     StatusKind::No => {
-                        let err = ImapMessageStoreError::No(body.text.to_string());
+                        let err = ImapMessageStoreError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageStoreError::Bad(body.text.to_string());
+                        let err = ImapMessageStoreError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -288,11 +288,11 @@ impl ImapCoroutine for ImapMessageStoreSilent {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMessageStoreError::No(body.text.to_string());
+                        let err = ImapMessageStoreError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageStoreError::Bad(body.text.to_string());
+                        let err = ImapMessageStoreError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -405,7 +405,7 @@ mod tests {
         let ImapMessageStoreError::No(text) = err else {
             panic!("expected ImapMessageStoreError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox is read-only");
+        assert_eq!(text.text, "mailbox is read-only");
     }
 
     fn expect_wants_tag_echo(cor: &mut ImapMessageStore, frag: &mut Fragmentizer) {

@@ -85,10 +85,10 @@ pub type ExamineFetch = ImapMailboxSelectFetch;
 pub enum ImapMailboxExamineError {
     /// The server rejected the command with a NO response.
     #[error("IMAP EXAMINE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP EXAMINE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP EXAMINE failed: BYE {0}")]
     Bye(String),
@@ -174,8 +174,12 @@ impl ImapCoroutine for ImapMailboxExamine {
                     }
                 }
 
+                output.read_access_code(body.code.as_ref());
+
                 for StatusBody { kind, code, .. } in out.untagged {
                     if let StatusKind::Ok = kind {
+                        output.read_access_code(code.as_ref());
+
                         match code {
                             Some(Code::Unseen(seq)) => output.unseen = Some(seq),
                             Some(Code::PermanentFlags(flags)) => {
@@ -194,11 +198,11 @@ impl ImapCoroutine for ImapMailboxExamine {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
                     StatusKind::No => {
-                        let err = ImapMailboxExamineError::No(body.text.to_string());
+                        let err = ImapMailboxExamineError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxExamineError::Bad(body.text.to_string());
+                        let err = ImapMailboxExamineError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -276,7 +280,7 @@ mod tests {
         let ImapMailboxExamineError::No(text) = err else {
             panic!("expected ImapMailboxExamineError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox does not exist");
+        assert_eq!(text.text, "mailbox does not exist");
     }
 
     #[test]
@@ -298,7 +302,7 @@ mod tests {
         let ImapMailboxExamineError::Bad(text) = err else {
             panic!("expected ImapMailboxExamineError::Bad, got {err:?}");
         };
-        assert_eq!(text, "EXAMINE syntax error");
+        assert_eq!(text.text, "EXAMINE syntax error");
     }
 
     #[test]

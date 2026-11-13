@@ -120,10 +120,10 @@ impl ImapCopyUid {
 pub enum ImapMessageCopyError {
     /// The server rejected the command with a NO response.
     #[error("IMAP COPY failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP COPY failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP COPY failed: BYE {0}")]
     Bye(String),
@@ -200,11 +200,11 @@ impl ImapCoroutine for ImapMessageCopy {
                         ImapCoroutineState::Complete(Ok(copyuid))
                     }
                     StatusKind::No => {
-                        let err = ImapMessageCopyError::No(body.text.to_string());
+                        let err = ImapMessageCopyError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageCopyError::Bad(body.text.to_string());
+                        let err = ImapMessageCopyError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -562,7 +562,7 @@ mod tests {
         let ImapMessageCopyError::No(text) = err else {
             panic!("expected ImapMessageCopyError::No, got {err:?}");
         };
-        assert_eq!(text, "destination mailbox does not exist");
+        assert_eq!(text.text, "destination mailbox does not exist");
     }
 
     #[test]

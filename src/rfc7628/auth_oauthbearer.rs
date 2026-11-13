@@ -101,7 +101,7 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapAuthOauthbearerError {
     /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected authentication with a tagged NO after
     /// returning an error payload in a challenge.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: NO {info} ({err})")]
@@ -113,7 +113,7 @@ pub enum ImapAuthOauthbearerError {
     },
     /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE OAUTHBEARER failed: BYE {0}")]
     Bye(String),
@@ -269,12 +269,13 @@ impl ImapAuthOauthbearer {
     // helper that turns a tagged NO into the reason the mechanism holds, when
     // it holds one: the JSON explaining a rejected token was sent in a
     // challenge, and the mechanism gives it up once the exchange is over
-    fn no(&mut self, info: String) -> ImapAuthOauthbearerError {
+    fn no(&mut self, status: ImapStatusError) -> ImapAuthOauthbearerError {
         match self.mechanism.resume(SaslArg::Done) {
             SaslCoroutineState::Complete(Err(SaslOauthbearerError::Rejected(err))) => {
+                let info = status.text;
                 ImapAuthOauthbearerError::NoWithError { info, err }
             }
-            _ => ImapAuthOauthbearerError::No(info),
+            _ => ImapAuthOauthbearerError::No(status),
         }
     }
 }
@@ -366,11 +367,11 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::No => {
-                            let err = self.no(body.text.to_string());
+                            let err = self.no(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -422,11 +423,11 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = self.no(body.text.to_string());
+                            let err = self.no(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthOauthbearerError::Bad(body.text.to_string());
+                            let err = ImapAuthOauthbearerError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -608,7 +609,7 @@ mod tests {
         let ImapAuthOauthbearerError::Bad(text) = err else {
             panic!("expected ImapAuthOauthbearerError::Bad, got {err:?}");
         };
-        assert_eq!(text, "AUTHENTICATE not enabled");
+        assert_eq!(text.text, "AUTHENTICATE not enabled");
     }
 
     #[test]

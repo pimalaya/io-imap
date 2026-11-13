@@ -129,10 +129,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMessageFetchError {
     /// The server rejected the command with a NO response.
     #[error("IMAP FETCH failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP FETCH failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP FETCH failed: BYE {0}")]
     Bye(String),
@@ -224,11 +224,11 @@ impl ImapCoroutine for ImapMessageFetch {
                         .map(|(key, val)| (key, Vec1::unvalidated(val)))
                         .collect())),
                     StatusKind::No => {
-                        let err = ImapMessageFetchError::No(body.text.to_string());
+                        let err = ImapMessageFetchError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageFetchError::Bad(body.text.to_string());
+                        let err = ImapMessageFetchError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -322,11 +322,11 @@ impl ImapCoroutine for ImapMessageFetchFirst {
                         }
                     },
                     StatusKind::No => {
-                        let err = ImapMessageFetchError::No(body.text.to_string());
+                        let err = ImapMessageFetchError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageFetchError::Bad(body.text.to_string());
+                        let err = ImapMessageFetchError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -441,7 +441,7 @@ mod tests {
         let ImapMessageFetchError::No(text) = err else {
             panic!("expected ImapMessageFetchError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]

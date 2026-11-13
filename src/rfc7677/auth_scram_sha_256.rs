@@ -98,6 +98,7 @@ use imap_codec::{
 };
 use io_sasl::{
     coroutine::*,
+    mechanism::SaslMechanism,
     rfc5802::{SaslScramCreds, SaslScramError},
     rfc7677::scram_sha_256::SaslScramSha256,
 };
@@ -111,10 +112,10 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapAuthScramSha256Error {
     /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: BYE {0}")]
     Bye(String),
@@ -296,8 +297,14 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                         payload => (None, payload),
                     };
 
+                    // NOTE: bound credentials run under the `-PLUS` name.
+                    let mechanism = match self.mechanism.mechanism() {
+                        SaslMechanism::ScramSha256Plus => AuthMechanism::ScramSha256Plus,
+                        _ => AuthMechanism::ScramSha256,
+                    };
+
                     let body = CommandBody::Authenticate {
-                        mechanism: AuthMechanism::ScramSha256,
+                        mechanism,
                         initial_response,
                     };
                     // NOTE: never log arguments, they carry credentials.
@@ -351,11 +358,11 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::No => {
-                            let err = ImapAuthScramSha256Error::No(body.text.to_string());
+                            let err = ImapAuthScramSha256Error::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthScramSha256Error::Bad(body.text.to_string());
+                            let err = ImapAuthScramSha256Error::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -411,11 +418,11 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthScramSha256Error::No(body.text.to_string());
+                            let err = ImapAuthScramSha256Error::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthScramSha256Error::Bad(body.text.to_string());
+                            let err = ImapAuthScramSha256Error::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -514,6 +521,26 @@ mod tests {
     type HmacSha256 = Hmac<Sha256>;
 
     const NONCE: &[u8] = b"fyko+d2lbbFgONRv9qkxdawL";
+
+    #[test]
+    fn bound_credentials_announce_the_plus_mechanism() {
+        use io_sasl::rfc5801::SaslGs2ChannelBindingKind;
+
+        let creds = SaslScramCreds {
+            channel_binding: SaslGs2ChannelBinding::Bound {
+                kind: SaslGs2ChannelBindingKind::TlsExporter,
+                data: b"exported".to_vec(),
+            },
+            ..creds()
+        };
+        let mut auth = ImapAuthScramSha256::new(creds, Default::default());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
+        let line = str::from_utf8(&bytes).expect("utf8 command");
+        assert_eq!("A1 AUTHENTICATE SCRAM-SHA-256-PLUS\r\n", line);
+    }
 
     fn creds() -> SaslScramCreds {
         SaslScramCreds {
@@ -616,7 +643,7 @@ mod tests {
         let ImapAuthScramSha256Error::Bad(text) = err else {
             panic!("expected ImapAuthScramSha256Error::Bad, got {err:?}");
         };
-        assert_eq!(text, "AUTHENTICATE not enabled");
+        assert_eq!(text.text, "AUTHENTICATE not enabled");
     }
 
     #[test]

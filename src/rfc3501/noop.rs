@@ -38,7 +38,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(())) => break,
+//!         ImapCoroutineState::Complete(Ok(_updates)) => break,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! }
@@ -59,7 +59,7 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{coroutine::*, imap_try, send::*};
+use crate::{coroutine::*, imap_try, rfc3501::updates::ImapMailboxUpdates, send::*};
 
 /// Failure causes during the IMAP NOOP flow.
 #[derive(Clone, Debug, Error)]
@@ -108,7 +108,7 @@ impl Default for ImapNoop {
 
 impl ImapCoroutine for ImapNoop {
     type Yield = ImapYield;
-    type Return = Result<(), ImapNoopError>;
+    type Return = Result<ImapMailboxUpdates, ImapNoopError>;
 
     fn resume(
         &mut self,
@@ -130,7 +130,10 @@ impl ImapCoroutine for ImapNoop {
                 };
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                    StatusKind::Ok => {
+                        let updates = ImapMailboxUpdates::from_data(out.data);
+                        ImapCoroutineState::Complete(Ok(updates))
+                    }
                     StatusKind::No => {
                         let err = ImapNoopError::No(body.text.to_string());
                         ImapCoroutineState::Complete(Err(err))
@@ -161,7 +164,7 @@ impl fmt::Display for State {
 mod tests {
     use core::str;
 
-    use alloc::{borrow::ToOwned, format, vec::Vec};
+    use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
     use crate::rfc3501::noop::*;
 
@@ -180,6 +183,29 @@ mod tests {
 
         let reply = format!("{tag} OK NOOP completed\r\n");
         expect_complete_ok(&mut noop, &mut frag, reply.as_bytes());
+    }
+
+    #[test]
+    fn success_returns_mailbox_updates() {
+        let mut noop = ImapNoop::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut noop, &mut frag);
+        let _ = expect_wants_write(&mut noop, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut noop, &mut frag);
+
+        let reply = b"* 3 EXPUNGE\r\n\
+            * 3 EXPUNGE\r\n\
+            * 5 EXISTS\r\n\
+            * 1 RECENT\r\n\
+            * 2 FETCH (FLAGS (\\Seen))\r\n\
+            A1 OK NOOP completed\r\n";
+        let updates = expect_complete_ok(&mut noop, &mut frag, reply);
+        let expunged: Vec<u32> = updates.expunged.iter().map(|seq| seq.get()).collect();
+        assert_eq!(vec![3, 3], expunged);
+        assert_eq!(Some(5), updates.exists);
+        assert_eq!(Some(1), updates.recent);
+        assert_eq!(1, updates.fetched.len());
     }
 
     #[test]
@@ -242,9 +268,13 @@ mod tests {
         }
     }
 
-    fn expect_complete_ok(cor: &mut ImapNoop, frag: &mut Fragmentizer, reply: &[u8]) {
+    fn expect_complete_ok(
+        cor: &mut ImapNoop,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> ImapMailboxUpdates {
         match cor.resume(frag, Some(reply)) {
-            ImapCoroutineState::Complete(Ok(())) => {}
+            ImapCoroutineState::Complete(Ok(updates)) => updates,
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }

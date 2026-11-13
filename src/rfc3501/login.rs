@@ -76,10 +76,10 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapLoginError {
     /// The server rejected the command with a NO response.
     #[error("IMAP LOGIN failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP LOGIN failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP LOGIN failed: BYE {0}")]
     Bye(String),
@@ -183,11 +183,11 @@ impl ImapCoroutine for ImapLogin {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapLoginError::No(body.text.to_string());
+                            let err = ImapLoginError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapLoginError::Bad(body.text.to_string());
+                            let err = ImapLoginError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -304,7 +304,7 @@ mod tests {
         let ImapLoginError::No(text) = err else {
             panic!("expected ImapLoginError::No, got {err:?}");
         };
-        assert_eq!(text, "authentication failed");
+        assert_eq!(text.text, "authentication failed");
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
         let ImapLoginError::Bad(text) = err else {
             panic!("expected ImapLoginError::Bad, got {err:?}");
         };
-        assert_eq!(text, "LOGIN disabled");
+        assert_eq!(text.text, "LOGIN disabled");
     }
 
     #[test]

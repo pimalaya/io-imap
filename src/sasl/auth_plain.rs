@@ -96,10 +96,10 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapAuthPlainError {
     /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE PLAIN failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE PLAIN failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE PLAIN failed: BYE {0}")]
     Bye(String),
@@ -337,11 +337,11 @@ impl ImapCoroutine for ImapAuthPlain {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::No => {
-                            let err = ImapAuthPlainError::No(body.text.to_string());
+                            let err = ImapAuthPlainError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthPlainError::Bad(body.text.to_string());
+                            let err = ImapAuthPlainError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -393,11 +393,11 @@ impl ImapCoroutine for ImapAuthPlain {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthPlainError::No(body.text.to_string());
+                            let err = ImapAuthPlainError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthPlainError::Bad(body.text.to_string());
+                            let err = ImapAuthPlainError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -556,7 +556,7 @@ mod tests {
         let ImapAuthPlainError::No(text) = err else {
             panic!("expected ImapAuthPlainError::No, got {err:?}");
         };
-        assert_eq!(text, "authentication failed");
+        assert_eq!(text.text, "authentication failed");
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         let ImapAuthPlainError::Bad(text) = err else {
             panic!("expected ImapAuthPlainError::Bad, got {err:?}");
         };
-        assert_eq!(text, "AUTHENTICATE not enabled");
+        assert_eq!(text.text, "AUTHENTICATE not enabled");
     }
 
     #[test]
@@ -648,7 +648,7 @@ mod tests {
         let ImapAuthPlainError::No(text) = err else {
             panic!("expected ImapAuthPlainError::No, got {err:?}");
         };
-        assert_eq!(text, "authentication failed");
+        assert_eq!(text.text, "authentication failed");
     }
 
     #[test]

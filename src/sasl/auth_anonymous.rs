@@ -94,10 +94,10 @@ use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send
 pub enum ImapAuthAnonymousError {
     /// The server rejected authentication with a tagged NO.
     #[error("IMAP AUTHENTICATE ANONYMOUS failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the AUTHENTICATE command with a tagged BAD.
     #[error("IMAP AUTHENTICATE ANONYMOUS failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE ANONYMOUS failed: BYE {0}")]
     Bye(String),
@@ -327,11 +327,11 @@ impl ImapCoroutine for ImapAuthAnonymous {
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::No => {
-                            let err = ImapAuthAnonymousError::No(body.text.to_string());
+                            let err = ImapAuthAnonymousError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthAnonymousError::Bad(body.text.to_string());
+                            let err = ImapAuthAnonymousError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -383,11 +383,11 @@ impl ImapCoroutine for ImapAuthAnonymous {
                     let code = match body.kind {
                         StatusKind::Ok => body.code,
                         StatusKind::No => {
-                            let err = ImapAuthAnonymousError::No(body.text.to_string());
+                            let err = ImapAuthAnonymousError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapAuthAnonymousError::Bad(body.text.to_string());
+                            let err = ImapAuthAnonymousError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     };
@@ -520,7 +520,7 @@ mod tests {
         let ImapAuthAnonymousError::No(text) = err else {
             panic!("expected ImapAuthAnonymousError::No, got {err:?}");
         };
-        assert_eq!(text, "anonymous access disabled");
+        assert_eq!(text.text, "anonymous access disabled");
     }
 
     #[test]
@@ -544,7 +544,7 @@ mod tests {
         let ImapAuthAnonymousError::Bad(text) = err else {
             panic!("expected ImapAuthAnonymousError::Bad, got {err:?}");
         };
-        assert_eq!(text, "AUTHENTICATE not enabled");
+        assert_eq!(text.text, "AUTHENTICATE not enabled");
     }
 
     #[test]
@@ -612,7 +612,7 @@ mod tests {
         let ImapAuthAnonymousError::No(text) = err else {
             panic!("expected ImapAuthAnonymousError::No, got {err:?}");
         };
-        assert_eq!(text, "anonymous access disabled");
+        assert_eq!(text.text, "anonymous access disabled");
     }
 
     fn expect_wants_tag(cor: &mut ImapAuthAnonymous, frag: &mut Fragmentizer) {

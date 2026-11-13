@@ -81,10 +81,10 @@ use crate::{
 pub enum ImapMessageMoveError {
     /// The server rejected the MOVE command with a NO response.
     #[error("IMAP MOVE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the MOVE command with a BAD response.
     #[error("IMAP MOVE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP MOVE failed: BYE {0}")]
     Bye(String),
@@ -169,11 +169,11 @@ impl ImapCoroutine for ImapMessageMove {
                         ImapCoroutineState::Complete(Ok(copyuid))
                     }
                     StatusKind::No => {
-                        let err = ImapMessageMoveError::No(body.text.to_string());
+                        let err = ImapMessageMoveError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageMoveError::Bad(body.text.to_string());
+                        let err = ImapMessageMoveError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -333,7 +333,7 @@ mod tests {
         let ImapMessageMoveError::No(text) = err else {
             panic!("expected ImapMessageMoveError::No, got {err:?}");
         };
-        assert_eq!(text, "destination mailbox does not exist");
+        assert_eq!(text.text, "destination mailbox does not exist");
     }
 
     #[test]

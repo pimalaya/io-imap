@@ -38,7 +38,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(())) => break,
+//!         ImapCoroutineState::Complete(Ok(_updates)) => break,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! }
@@ -59,7 +59,7 @@ use imap_codec::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{coroutine::*, imap_try, send::*};
+use crate::{coroutine::*, imap_try, rfc3501::updates::ImapMailboxUpdates, send::*};
 
 /// Failure causes during the IMAP CHECK flow.
 #[derive(Clone, Debug, Error)]
@@ -108,7 +108,7 @@ impl Default for ImapMailboxCheck {
 
 impl ImapCoroutine for ImapMailboxCheck {
     type Yield = ImapYield;
-    type Return = Result<(), ImapMailboxCheckError>;
+    type Return = Result<ImapMailboxUpdates, ImapMailboxCheckError>;
 
     fn resume(
         &mut self,
@@ -130,7 +130,10 @@ impl ImapCoroutine for ImapMailboxCheck {
                 };
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
+                    StatusKind::Ok => {
+                        let updates = ImapMailboxUpdates::from_data(out.data);
+                        ImapCoroutineState::Complete(Ok(updates))
+                    }
                     StatusKind::No => {
                         let err = ImapMailboxCheckError::No(body.text.to_string());
                         ImapCoroutineState::Complete(Err(err))
@@ -263,7 +266,7 @@ mod tests {
 
     fn expect_complete_ok(cor: &mut ImapMailboxCheck, frag: &mut Fragmentizer, reply: &[u8]) {
         match cor.resume(frag, Some(reply)) {
-            ImapCoroutineState::Complete(Ok(())) => {}
+            ImapCoroutineState::Complete(Ok(_)) => {}
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }

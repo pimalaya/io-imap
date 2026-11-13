@@ -82,10 +82,10 @@ pub type ImapMessageAppendOutput = (Option<u32>, Option<(u32, u32)>);
 pub enum ImapMessageAppendError {
     /// The server rejected the command with a NO response.
     #[error("IMAP APPEND failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP APPEND failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
@@ -192,11 +192,11 @@ impl ImapCoroutine for ImapMessageAppend {
                         ImapCoroutineState::Complete(Ok((exists, appenduid)))
                     }
                     StatusKind::No => {
-                        let err = ImapMessageAppendError::No(body.text.to_string());
+                        let err = ImapMessageAppendError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageAppendError::Bad(body.text.to_string());
+                        let err = ImapMessageAppendError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -298,12 +298,19 @@ mod tests {
         // NOTE: the server rejects at the continuation point.
         expect_wants_read(&mut append, &mut frag, None);
 
-        let reply = format!("{tag} NO mailbox is read-only\r\n");
+        let reply = format!("{tag} NO [TRYCREATE] mailbox does not exist\r\n");
         let err = expect_complete_err(&mut append, &mut frag, Some(reply.as_bytes()));
-        let ImapMessageAppendError::No(text) = err else {
+        assert_eq!(
+            "IMAP APPEND failed: NO mailbox does not exist",
+            err.to_string()
+        );
+
+        let ImapMessageAppendError::No(status) = err else {
             panic!("expected ImapMessageAppendError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox is read-only");
+        assert_eq!(StatusKind::No, status.kind);
+        assert_eq!(Some(Code::TryCreate), status.code);
+        assert_eq!(status.text, "mailbox does not exist");
     }
 
     #[test]
