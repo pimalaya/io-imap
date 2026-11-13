@@ -18,6 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed the client-side SORT fallback of `rfc5256::sort::ImapMessageSort` to follow RFC 5256: `FROM`, `TO` and `CC` sort by the first address's mailbox instead of being ignored, `SUBJECT` by the base subject (encoded words decoded, reply and forward prefixes stripped, case ignored) instead of the raw bytes, `DATE` falls back to the internal date, and ties keep the sequence order, `REVERSE` included.
 
+### Security
+
+- Fixed `send::ImapSend` writing a synchronising literal before the server's continuation request.
+
+  The literal goes out only once a `+` line is decoded, so a command refused before its literal (an APPEND over quota) no longer sends it to a server reading command lines.
+
 ## [0.8.1] - 2026-11-03
 
 ### Changed

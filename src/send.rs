@@ -365,7 +365,10 @@ impl<T: Encoder> ImapSend<T> {
                         }));
                     }
                     None if self.limbo_literal.is_some() => {
-                        self.state = State::Serialize;
+                        self.state = match self.cr.take() {
+                            Some(_) => State::Serialize,
+                            None => State::Read,
+                        };
                     }
                     None => {
                         self.state = State::Read;
@@ -461,7 +464,9 @@ impl<T: Encoder> ImapCoroutine for ImapSend<T> {
 mod tests {
     use core::str;
 
-    use imap_codec::imap_types::response::StatusKind;
+    use imap_codec::imap_types::{
+        core::Literal, extensions::binary::LiteralOrLiteral8, response::StatusKind,
+    };
 
     use crate::send::*;
 
@@ -566,5 +571,96 @@ mod tests {
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!(StatusKind::No, tagged.body.kind);
         assert!(tagged.body.text.as_ref().ends_with("exist: ??t??"));
+    }
+
+    #[test]
+    fn sync_literal_waits_through_untagged_line() {
+        let (mut send, mut frag) = append_waiting_for_continuation();
+
+        let alert = b"* OK [ALERT] mailbox almost full\r\n";
+        assert!(matches!(
+            send.resume(&mut frag, Some(alert)),
+            ImapSendResult::WantsRead
+        ));
+
+        let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"+ go\r\n")) else {
+            panic!("expected WantsWrite");
+        };
+        assert_eq!("hi\r\n", str::from_utf8(&bytes).expect("utf8 literal"));
+    }
+
+    #[test]
+    fn sync_literal_waits_through_split_continuation_request() {
+        let (mut send, mut frag) = append_waiting_for_continuation();
+
+        assert!(matches!(
+            send.resume(&mut frag, Some(b"+ g")),
+            ImapSendResult::WantsRead
+        ));
+
+        let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"o\r\n")) else {
+            panic!("expected WantsWrite");
+        };
+        assert_eq!("hi\r\n", str::from_utf8(&bytes).expect("utf8 literal"));
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsRead
+        ));
+
+        let reply = b"A1 OK APPEND completed\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply)) else {
+            panic!("expected Ok");
+        };
+
+        let tagged = out.tagged.expect("tagged completion");
+        assert_eq!(StatusKind::Ok, tagged.body.kind);
+    }
+
+    #[test]
+    fn sync_literal_stays_unsent_on_split_no() {
+        let (mut send, mut frag) = append_waiting_for_continuation();
+
+        assert!(matches!(
+            send.resume(&mut frag, Some(b"A1 NO [OVERQUOTA] quota exc")),
+            ImapSendResult::WantsRead
+        ));
+
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(b"eeded\r\n")) else {
+            panic!("expected Ok");
+        };
+
+        let tagged = out.tagged.expect("tagged completion");
+        assert_eq!(StatusKind::No, tagged.body.kind);
+    }
+
+    fn append_waiting_for_continuation() -> (ImapSend<CommandCodec>, Fragmentizer) {
+        let mut send = ImapSend::command(CommandBody::Append {
+            mailbox: "INBOX".try_into().expect("valid mailbox"),
+            flags: Vec::new(),
+            date: None,
+            message: LiteralOrLiteral8::Literal(Literal::unvalidated(b"hi".to_vec())),
+        });
+        let mut frag = Fragmentizer::new(1024);
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsTag
+        ));
+
+        let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"A1")) else {
+            panic!("expected WantsWrite");
+        };
+        assert_eq!(
+            "A1 APPEND INBOX {2}\r\n",
+            str::from_utf8(&bytes).expect("utf8 command")
+        );
+
+        assert!(matches!(
+            send.resume(&mut frag, None),
+            ImapSendResult::WantsRead
+        ));
+
+        (send, frag)
     }
 }
