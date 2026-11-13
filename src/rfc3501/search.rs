@@ -44,7 +44,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(ids)) => break ids,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -77,10 +77,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMessageSearchError {
     /// The server rejected the command with a NO response.
     #[error("IMAP SEARCH failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP SEARCH failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP SEARCH failed: BYE {0}")]
     Bye(String),
@@ -144,7 +144,7 @@ impl ImapMessageSearch {
 
 impl ImapCoroutine for ImapMessageSearch {
     type Yield = ImapYield;
-    type Return = Result<Vec<NonZeroU32>, ImapMessageSearchError>;
+    type Return = Result<ImapOutput<Vec<NonZeroU32>>, ImapMessageSearchError>;
 
     fn resume(
         &mut self,
@@ -154,6 +154,7 @@ impl ImapCoroutine for ImapMessageSearch {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageSearchError::Bye(bye.text.to_string());
@@ -173,13 +174,17 @@ impl ImapCoroutine for ImapMessageSearch {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ids)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: ids,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMessageSearchError::No(body.text.to_string());
+                        let err = ImapMessageSearchError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageSearchError::Bad(body.text.to_string());
+                        let err = ImapMessageSearchError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -227,7 +232,7 @@ mod tests {
         expect_wants_read(&mut search, &mut frag);
 
         let reply = format!("* SEARCH 1 2 5\r\n{tag} OK SEARCH completed\r\n");
-        let ids = expect_complete_ok(&mut search, &mut frag, reply.as_bytes());
+        let ids = expect_complete_ok(&mut search, &mut frag, reply.as_bytes()).data;
         assert_eq!(3, ids.len());
         assert_eq!(1, ids[0].get());
         assert_eq!(5, ids[2].get());
@@ -273,7 +278,7 @@ mod tests {
         let ImapMessageSearchError::No(text) = err else {
             panic!("expected ImapMessageSearchError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]
@@ -321,7 +326,7 @@ mod tests {
         cor: &mut ImapMessageSearch,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> Vec<NonZeroU32> {
+    ) -> ImapOutput<Vec<NonZeroU32>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

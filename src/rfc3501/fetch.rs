@@ -45,7 +45,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(messages)) => break messages,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -188,8 +188,10 @@ impl ImapMessageFetch {
 
 impl ImapCoroutine for ImapMessageFetch {
     type Yield = ImapYield;
-    type Return =
-        Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapMessageFetchError>;
+    type Return = Result<
+        ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>>,
+        ImapMessageFetchError,
+    >;
 
     fn resume(
         &mut self,
@@ -199,6 +201,7 @@ impl ImapCoroutine for ImapMessageFetch {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg.take());
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageFetchError::Bye(bye.text.to_string());
@@ -219,10 +222,18 @@ impl ImapCoroutine for ImapMessageFetch {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output
-                        .into_iter()
-                        .map(|(key, val)| (key, Vec1::unvalidated(val)))
-                        .collect())),
+                    StatusKind::Ok => {
+                        let data = output
+                            .into_iter()
+                            .map(|(key, val)| (key, Vec1::unvalidated(val)))
+                            .collect();
+
+                        ImapCoroutineState::Complete(Ok(ImapOutput {
+                            data,
+                            alerts,
+                            skipped: out.skipped,
+                        }))
+                    }
                     StatusKind::No => {
                         let err = ImapMessageFetchError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
@@ -375,7 +386,7 @@ mod tests {
         let reply =
             format!("* 1 FETCH (UID 100)\r\n* 2 FETCH (UID 101)\r\n{tag} OK FETCH completed\r\n",);
         let out = expect_complete_ok_fetch(&mut fetch, &mut frag, reply.as_bytes());
-        assert_eq!(2, out.len());
+        assert_eq!(2, out.data.len());
     }
 
     /// Mail.ru sends an empty quoted display name and a `NIL` body
@@ -400,7 +411,37 @@ mod tests {
         );
         let out = expect_complete_ok_fetch(&mut fetch, &mut frag, reply.as_bytes());
         let id = NonZeroU32::new(2010).expect("non-zero");
-        assert_eq!(4, out.get(&id).expect("fetched message").as_ref().len());
+        let items = out.data.get(&id).expect("fetched message");
+        assert_eq!(4, items.as_ref().len());
+    }
+
+    #[test]
+    fn fetch_returns_skipped_lines_and_alerts() {
+        let mut fetch = ImapMessageFetch::new(
+            "1:2".try_into().expect("valid sequence set"),
+            MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::Fast),
+            ImapMessageFetchOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag_fetch(&mut fetch, &mut frag);
+        let _ = expect_wants_write_fetch(&mut fetch, &mut frag, Some(b"A1"));
+        expect_wants_read_fetch(&mut fetch, &mut frag);
+
+        let skipped = b"* 2 FETCH (FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n";
+        let reply = [
+            b"* 1 FETCH (FLAGS (\\Seen))\r\n".as_slice(),
+            skipped,
+            b"* OK [ALERT] quota almost reached\r\n",
+            b"A1 OK FETCH completed\r\n",
+        ]
+        .concat();
+        let out = expect_complete_ok_fetch(&mut fetch, &mut frag, &reply);
+
+        assert_eq!(1, out.data.len());
+        assert_eq!(1, out.skipped.len());
+        assert_eq!(skipped, &**out.skipped[0].declassify());
+        assert_eq!(["quota almost reached"], *out.alerts);
     }
 
     #[test]
@@ -587,7 +628,7 @@ mod tests {
         cor: &mut ImapMessageFetch,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> {
+    ) -> ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

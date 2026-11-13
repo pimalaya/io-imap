@@ -44,7 +44,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(items)) => break items,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -76,10 +76,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxStatusError {
     /// The server rejected the command with a NO response.
     #[error("IMAP STATUS failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP STATUS failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP STATUS failed: BYE {0}")]
     Bye(String),
@@ -120,7 +120,7 @@ impl ImapMailboxStatus {
 
 impl ImapCoroutine for ImapMailboxStatus {
     type Yield = ImapYield;
-    type Return = Result<Vec<StatusDataItem>, ImapMailboxStatusError>;
+    type Return = Result<ImapOutput<Vec<StatusDataItem>>, ImapMailboxStatusError>;
 
     fn resume(
         &mut self,
@@ -130,6 +130,7 @@ impl ImapCoroutine for ImapMailboxStatus {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxStatusError::Bye(bye.text.to_string());
@@ -153,13 +154,17 @@ impl ImapCoroutine for ImapMailboxStatus {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(items)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: items,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMailboxStatusError::No(body.text.to_string());
+                        let err = ImapMailboxStatusError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxStatusError::Bad(body.text.to_string());
+                        let err = ImapMailboxStatusError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -209,7 +214,7 @@ mod tests {
         let reply =
             format!("* STATUS INBOX (MESSAGES 42 RECENT 3)\r\n{tag} OK STATUS completed\r\n");
         let out = expect_complete_ok(&mut status, &mut frag, reply.as_bytes());
-        assert_eq!(2, out.len());
+        assert_eq!(2, out.data.len());
     }
 
     #[test]
@@ -229,7 +234,7 @@ mod tests {
         let ImapMailboxStatusError::No(text) = err else {
             panic!("expected ImapMailboxStatusError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox does not exist");
+        assert_eq!(text.text, "mailbox does not exist");
     }
 
     #[test]
@@ -278,7 +283,7 @@ mod tests {
         cor: &mut ImapMailboxStatus,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> Vec<StatusDataItem> {
+    ) -> ImapOutput<Vec<StatusDataItem>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

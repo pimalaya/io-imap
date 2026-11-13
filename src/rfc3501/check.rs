@@ -38,7 +38,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(_updates)) => break,
+//!         ImapCoroutineState::Complete(Ok(_out)) => break,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! }
@@ -66,10 +66,10 @@ use crate::{coroutine::*, imap_try, rfc3501::updates::ImapMailboxUpdates, send::
 pub enum ImapMailboxCheckError {
     /// The server rejected the command with a NO response.
     #[error("IMAP CHECK failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP CHECK failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP CHECK failed: BYE {0}")]
     Bye(String),
@@ -108,7 +108,7 @@ impl Default for ImapMailboxCheck {
 
 impl ImapCoroutine for ImapMailboxCheck {
     type Yield = ImapYield;
-    type Return = Result<ImapMailboxUpdates, ImapMailboxCheckError>;
+    type Return = Result<ImapOutput<ImapMailboxUpdates>, ImapMailboxCheckError>;
 
     fn resume(
         &mut self,
@@ -118,6 +118,7 @@ impl ImapCoroutine for ImapMailboxCheck {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxCheckError::Bye(bye.text.to_string());
@@ -130,16 +131,17 @@ impl ImapCoroutine for ImapMailboxCheck {
                 };
 
                 match body.kind {
-                    StatusKind::Ok => {
-                        let updates = ImapMailboxUpdates::from_data(out.data);
-                        ImapCoroutineState::Complete(Ok(updates))
-                    }
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: ImapMailboxUpdates::from_data(out.data),
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMailboxCheckError::No(body.text.to_string());
+                        let err = ImapMailboxCheckError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxCheckError::Bad(body.text.to_string());
+                        let err = ImapMailboxCheckError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -201,7 +203,7 @@ mod tests {
         let ImapMailboxCheckError::No(text) = err else {
             panic!("expected ImapMailboxCheckError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]
@@ -220,7 +222,7 @@ mod tests {
         let ImapMailboxCheckError::Bad(text) = err else {
             panic!("expected ImapMailboxCheckError::Bad, got {err:?}");
         };
-        assert_eq!(text, "CHECK syntax error");
+        assert_eq!(text.text, "CHECK syntax error");
     }
 
     #[test]

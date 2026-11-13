@@ -26,7 +26,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added `send::ImapStatusError`, the kind, response code and text of a NO or BAD completion, and `client::ImapClientError::status` to read it.
 
+- Added `client::ImapClientError::is_connection_lost`.
+
+  True when the stream failed or ended, or the server closed the session with a BYE.
+
 - Added `send::ImapSendOutput::skipped`, the untagged responses skipped for not decoding.
+
+- Added `send::ImapSendOutput::alerts`, the texts of the `ALERT` response codes of an exchange.
+
+- Added `send::ImapOutput`, the result of a command with the alerts and the skipped responses of its response.
 
 - Added `read_only` and `no_mod_seq` to `rfc3501::select::ImapMailboxSelectData`.
 
@@ -38,11 +46,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
 
-- **BREAKING**: Changed the `No` and `Bad` variants of the LOGIN, AUTHENTICATE, SELECT, EXAMINE, FETCH, STORE, COPY, MOVE and buffered APPEND errors to carry a `send::ImapStatusError` instead of the text.
+- **BREAKING**: Changed the `No` and `Bad` variants of every command error but `rfc3501::starttls::ImapStartTlsError` to carry a `send::ImapStatusError` instead of the text.
 
   The response code reaches the caller. The error messages are unchanged.
 
-- **BREAKING**: Changed `rfc3501::noop::ImapNoop` and `rfc3501::check::ImapMailboxCheck` to return `rfc3501::updates::ImapMailboxUpdates` instead of `()`.
+- **BREAKING**: Changed FETCH, STORE, SEARCH, SORT, THREAD, STATUS, LIST, LSUB, EXPUNGE, UID EXPUNGE, SELECT and EXAMINE to return their result in a `send::ImapOutput`, the coroutines and the client methods alike.
+
+  The result moves to its `data` field. `rfc3501::fetch::ImapMessageFetchFirst` and `rfc3501::store::ImapMessageStoreSilent` are unchanged.
+
+- **BREAKING**: Changed `rfc3501::noop::ImapNoop` and `rfc3501::check::ImapMailboxCheck` to return a `send::ImapOutput` of `rfc3501::updates::ImapMailboxUpdates` instead of `()`.
 
 - **BREAKING**: Changed `watch::ImapMailboxWatchOptions` and `client::ImapMailboxWatchStreamOptions` to no longer be `Copy`, as they carry the state to resume from.
 
@@ -71,6 +83,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed the client-side SORT fallback returning a message the search did not match when the server adds its FETCH to the response.
 
 - Fixed `client::ImapClientStd` never flushing its stream after a write.
+
+- Fixed the six AUTHENTICATE coroutines leaving their exchange open when the mechanism refuses a challenge: they send the `*` cancellation and read its reply before failing with the mechanism error.
 
 - Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` announcing `SCRAM-SHA-256` for credentials carrying a channel binding: they run under `SCRAM-SHA-256-PLUS`.
 

@@ -70,10 +70,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapCapabilityGetError {
     /// The server rejected the command with a NO response.
     #[error("IMAP CAPABILITY failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP CAPABILITY failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP CAPABILITY failed: BYE {0}")]
     Bye(String),
@@ -143,11 +143,11 @@ impl ImapCoroutine for ImapCapabilityGet {
                 let code = match body.kind {
                     StatusKind::Ok => body.code,
                     StatusKind::No => {
-                        let err = ImapCapabilityGetError::No(body.text.to_string());
+                        let err = ImapCapabilityGetError::No(body.into());
                         return ImapCoroutineState::Complete(Err(err));
                     }
                     StatusKind::Bad => {
-                        let err = ImapCapabilityGetError::Bad(body.text.to_string());
+                        let err = ImapCapabilityGetError::Bad(body.into());
                         return ImapCoroutineState::Complete(Err(err));
                     }
                 };
@@ -338,7 +338,7 @@ mod tests {
         let ImapCapabilityGetError::No(text) = err else {
             panic!("expected ImapCapabilityGetError::No, got {err:?}");
         };
-        assert_eq!(text, "server is sulking");
+        assert_eq!(text.text, "server is sulking");
     }
 
     #[test]

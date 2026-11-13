@@ -40,7 +40,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(data)) => break data,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -133,7 +133,7 @@ impl ImapMailboxExamine {
 
 impl ImapCoroutine for ImapMailboxExamine {
     type Yield = ImapYield;
-    type Return = Result<ExamineData, ImapMailboxExamineError>;
+    type Return = Result<ImapOutput<ExamineData>, ImapMailboxExamineError>;
 
     fn resume(
         &mut self,
@@ -143,6 +143,7 @@ impl ImapCoroutine for ImapMailboxExamine {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxExamineError::Bye(bye.text.to_string());
@@ -196,7 +197,11 @@ impl ImapCoroutine for ImapMailboxExamine {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: output,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
                         let err = ImapMailboxExamineError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
@@ -254,7 +259,7 @@ mod tests {
              * OK [UIDVALIDITY 1700] uid validity\r\n\
              {tag} OK [READ-ONLY] EXAMINE completed\r\n",
         );
-        let data = expect_complete_ok(&mut examine, &mut frag, reply.as_bytes());
+        let data = expect_complete_ok(&mut examine, &mut frag, reply.as_bytes()).data;
         assert_eq!(Some(42), data.exists);
         assert_eq!(Some(7), data.recent);
         assert_eq!(1700, data.uid_validity.expect("uid validity").get());
@@ -353,7 +358,7 @@ mod tests {
         cor: &mut ImapMailboxExamine,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ExamineData {
+    ) -> ImapOutput<ExamineData> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

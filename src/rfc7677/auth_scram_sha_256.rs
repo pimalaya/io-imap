@@ -105,7 +105,9 @@ use io_sasl::{
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
+use crate::{
+    coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, sasl::auth_cancel::*, send::*,
+};
 
 /// Failure causes during the SASL SCRAM-SHA-256 flow.
 #[derive(Clone, Debug, Error)]
@@ -334,7 +336,12 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                             None => {
                                 match self.resume_sasl(SaslArg::Input(&extract_challenge(cr))) {
                                     Ok(payload) => payload.unwrap_or_default(),
-                                    Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                                    Err(err) => {
+                                        let cancel = ImapAuthCancel::new(err, out.tag);
+                                        self.state = State::Cancel(cancel);
+                                        debug!("{}", self.state);
+                                        continue;
+                                    }
                                 }
                             }
                         };
@@ -402,7 +409,12 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                         let payload = match self.resume_sasl(SaslArg::Input(&extract_challenge(cr)))
                         {
                             Ok(payload) => payload.unwrap_or_default(),
-                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                            Err(err) => {
+                                let cancel = ImapAuthCancel::new(err, out.tag);
+                                self.state = State::Cancel(cancel);
+                                debug!("{}", self.state);
+                                continue;
+                            }
                         };
 
                         self.state = Self::wants_continue(payload, out.tag);
@@ -451,6 +463,7 @@ impl ImapCoroutine for ImapAuthScramSha256 {
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
+                State::Cancel(cancel) => match imap_try!(cancel, fragmentizer, arg.take()) {},
                 State::Capability(capability) => {
                     self.observed = imap_try!(capability, fragmentizer, arg.take());
 
@@ -480,6 +493,7 @@ enum State {
         pending: Option<Vec<u8>>,
     },
     Continue(ImapSend<AuthenticateDataCodec>),
+    Cancel(ImapAuthCancel<ImapAuthScramSha256Error>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -491,6 +505,7 @@ impl fmt::Display for State {
             Self::Send { pending, .. } if pending.is_some() => f.write_str("send auth"),
             Self::Send { .. } => f.write_str("send auth with ir"),
             Self::Continue(_) => f.write_str("send response"),
+            Self::Cancel(_) => f.write_str("cancel auth"),
             Self::Capability(_) => f.write_str("fetch capabilities"),
             Self::Id(_) => f.write_str("send id"),
         }
@@ -615,7 +630,12 @@ mod tests {
 
         let server_final = "e=invalid-proof";
         let challenge2 = format!("+ {}\r\n", encode(server_final));
-        let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
+        let cancel = expect_wants_write(&mut auth, &mut frag, Some(challenge2.as_bytes()));
+        assert_eq!(cancel, b"*\r\n");
+        expect_wants_read(&mut auth, &mut frag);
+
+        let reply = b"A1 BAD AUTHENTICATE cancelled\r\n";
+        let err = expect_complete_err(&mut auth, &mut frag, reply);
         let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
             panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
         };
@@ -760,7 +780,12 @@ mod tests {
 
         let server_final = "e=invalid-proof";
         let challenge2 = format!("+ {}\r\n", encode(server_final));
-        let err = expect_complete_err(&mut auth, &mut frag, challenge2.as_bytes());
+        let cancel = expect_wants_write(&mut auth, &mut frag, Some(challenge2.as_bytes()));
+        assert_eq!(cancel, b"*\r\n");
+        expect_wants_read(&mut auth, &mut frag);
+
+        let reply = b"A1 BAD AUTHENTICATE cancelled\r\n";
+        let err = expect_complete_err(&mut auth, &mut frag, reply);
         let ImapAuthScramSha256Error::Mechanism(SaslScramError::ServerError(text)) = err else {
             panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
         };

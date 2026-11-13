@@ -270,7 +270,10 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
             }
         }
     };
-    assert!(!fetched.is_empty(), "buffered FETCH returned no message");
+    assert!(
+        !fetched.data.is_empty(),
+        "buffered FETCH returned no message"
+    );
 
     // NOTE: fetch (streamed, small chunks) step.
 
@@ -368,7 +371,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
             }
         }
     };
-    assert!(!ids.is_empty(), "SORT returned no ids after APPEND");
+    assert!(!ids.data.is_empty(), "SORT returned no ids after APPEND");
 
     // NOTE: cleanup step. Sweeps every copy by subject, so leftovers of
     // aborted runs go too.
@@ -400,7 +403,7 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     };
 
     let set =
-        SequenceSet::try_from(uids.as_slice()).expect("UID SEARCH found the appended message");
+        SequenceSet::try_from(uids.data.as_slice()).expect("UID SEARCH found the appended message");
     let mut coroutine = ImapMessageStoreSilent::new(
         set,
         StoreType::Add,
@@ -524,7 +527,7 @@ pub fn run_client(url: &str, sasl: Sasl) {
     }
 
     let all = || ListMailbox::try_from("*").unwrap();
-    let listing = client.list(mailbox("INBOX"), all()).expect("LIST");
+    let listing = client.list(mailbox("INBOX"), all()).expect("LIST").data;
     assert!(!listing.is_empty(), "LIST returned no mailbox");
     client.lsub(mailbox("INBOX"), all()).expect("LSUB");
 
@@ -588,14 +591,17 @@ fn client_body(
     let subscribed = client
         .lsub(mailbox(""), ListMailbox::try_from(name.to_owned()).unwrap())
         .expect("LSUB");
-    assert!(!subscribed.is_empty(), "LSUB misses the subscribed {name}");
+    assert!(
+        !subscribed.data.is_empty(),
+        "LSUB misses the subscribed {name}"
+    );
     client.unsubscribe(mailbox(name)).expect("UNSUBSCRIBE");
 
     let items = [StatusDataItemName::Messages, StatusDataItemName::UidNext];
     let status = client
         .status(mailbox(name), items.to_vec().into())
         .expect("STATUS");
-    assert!(!status.is_empty(), "STATUS returned no item");
+    assert!(!status.data.is_empty(), "STATUS returned no item");
 
     // --- APPEND, buffered and streamed ---
 
@@ -649,7 +655,7 @@ fn client_body(
     let examined = client
         .examine(mailbox(name), Default::default())
         .expect("EXAMINE");
-    assert_eq!(examined.exists, Some(3), "EXAMINE count mismatch");
+    assert_eq!(examined.data.exists, Some(3), "EXAMINE count mismatch");
 
     if has(Capability::Unselect) {
         client.unselect().expect("UNSELECT");
@@ -664,7 +670,7 @@ fn client_body(
 
     let uid = ImapMessageSearchOptions { uid: true };
     let all = || Vec1::from(SearchKey::All);
-    let uids = client.search(all(), uid.clone()).expect("UID SEARCH");
+    let uids = client.search(all(), uid.clone()).expect("UID SEARCH").data;
     assert_eq!(uids.len(), 3, "UID SEARCH count mismatch");
     let every = SequenceSet::try_from(uids.as_slice()).unwrap();
 
@@ -677,7 +683,7 @@ fn client_body(
     let fetched = client
         .fetch(every.clone(), envelope, fetch_opts)
         .expect("UID FETCH");
-    assert_eq!(fetched.len(), 3, "UID FETCH count mismatch");
+    assert_eq!(fetched.data.len(), 3, "UID FETCH count mismatch");
 
     let mut body = Vec::new();
     client
@@ -714,7 +720,7 @@ fn client_body(
             .any(|capability| matches!(capability, Capability::Sort(_))),
     };
     let sorted = client.sort(by_date, all(), sort_opts).expect("SORT");
-    assert_eq!(sorted.len(), 3, "SORT count mismatch");
+    assert_eq!(sorted.data.len(), 3, "SORT count mismatch");
 
     if capabilities
         .iter()
@@ -743,7 +749,8 @@ fn client_body(
     let flagged = client
         .search(Vec1::from(SearchKey::Flagged), uid.clone())
         .expect("UID SEARCH FLAGGED");
-    assert_eq!(flagged.len(), 3, "UID STORE did not flag every message");
+    let flagged = flagged.data.len();
+    assert_eq!(flagged, 3, "UID STORE did not flag every message");
 
     let first = SequenceSet::from(uids[0]);
     let second = SequenceSet::from(uids[1]);
@@ -803,7 +810,8 @@ fn purge(client: &mut ImapClientStd, name: &str, trash: Option<&Mailbox<'static>
     let uid = ImapMessageSearchOptions { uid: true };
     let uids = client
         .search(Vec1::from(SearchKey::All), uid)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .data;
 
     if let Ok(set) = SequenceSet::try_from(uids.as_slice()) {
         let moved = trash.and_then(|trash| {

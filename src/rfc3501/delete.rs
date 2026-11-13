@@ -68,10 +68,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxDeleteError {
     /// The server rejected the command with a NO response.
     #[error("IMAP DELETE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP DELETE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP DELETE failed: BYE {0}")]
     Bye(String),
@@ -129,11 +129,11 @@ impl ImapCoroutine for ImapMailboxDelete {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxDeleteError::No(body.text.to_string());
+                        let err = ImapMailboxDeleteError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxDeleteError::Bad(body.text.to_string());
+                        let err = ImapMailboxDeleteError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -195,7 +195,7 @@ mod tests {
         let ImapMailboxDeleteError::No(text) = err else {
             panic!("expected ImapMailboxDeleteError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox does not exist");
+        assert_eq!(text.text, "mailbox does not exist");
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let ImapMailboxDeleteError::Bad(text) = err else {
             panic!("expected ImapMailboxDeleteError::Bad, got {err:?}");
         };
-        assert_eq!(text, "DELETE syntax error");
+        assert_eq!(text.text, "DELETE syntax error");
     }
 
     #[test]

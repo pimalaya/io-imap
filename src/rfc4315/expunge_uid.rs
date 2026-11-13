@@ -45,7 +45,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(expunged)) => break expunged,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -76,10 +76,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMessageExpungeUidError {
     /// The server rejected the command with a NO response.
     #[error("IMAP UID EXPUNGE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP UID EXPUNGE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP UID EXPUNGE failed: BYE {0}")]
     Bye(String),
@@ -112,7 +112,7 @@ impl ImapMessageExpungeUid {
 
 impl ImapCoroutine for ImapMessageExpungeUid {
     type Yield = ImapYield;
-    type Return = Result<Vec<NonZeroU32>, ImapMessageExpungeUidError>;
+    type Return = Result<ImapOutput<Vec<NonZeroU32>>, ImapMessageExpungeUidError>;
 
     fn resume(
         &mut self,
@@ -122,6 +122,7 @@ impl ImapCoroutine for ImapMessageExpungeUid {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageExpungeUidError::Bye(bye.text.to_string());
@@ -141,13 +142,17 @@ impl ImapCoroutine for ImapMessageExpungeUid {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(expunged)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: expunged,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMessageExpungeUidError::No(body.text.to_string());
+                        let err = ImapMessageExpungeUidError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageExpungeUidError::Bad(body.text.to_string());
+                        let err = ImapMessageExpungeUidError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -194,7 +199,7 @@ mod tests {
         expect_wants_read(&mut expunge, &mut frag);
 
         let reply = format!("* 3 EXPUNGE\r\n* 3 EXPUNGE\r\n{tag} OK UID EXPUNGE completed\r\n");
-        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes()).data;
         assert_eq!(2, seqs.len());
         assert_eq!(3, seqs[0].get());
         assert_eq!(3, seqs[1].get());
@@ -212,7 +217,7 @@ mod tests {
         expect_wants_read(&mut expunge, &mut frag);
 
         let reply = format!("{tag} OK UID EXPUNGE completed\r\n");
-        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes()).data;
         assert!(seqs.is_empty());
     }
 
@@ -232,7 +237,7 @@ mod tests {
         let ImapMessageExpungeUidError::No(text) = err else {
             panic!("expected ImapMessageExpungeUidError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox is read-only");
+        assert_eq!(text.text, "mailbox is read-only");
     }
 
     fn expect_wants_tag(cor: &mut ImapMessageExpungeUid, frag: &mut Fragmentizer) {
@@ -264,7 +269,7 @@ mod tests {
         cor: &mut ImapMessageExpungeUid,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> Vec<NonZeroU32> {
+    ) -> ImapOutput<Vec<NonZeroU32>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

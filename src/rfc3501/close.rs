@@ -66,10 +66,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMailboxCloseError {
     /// The server rejected the command with a NO response.
     #[error("IMAP CLOSE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP CLOSE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP CLOSE failed: BYE {0}")]
     Bye(String),
@@ -132,11 +132,11 @@ impl ImapCoroutine for ImapMailboxClose {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxCloseError::No(body.text.to_string());
+                        let err = ImapMailboxCloseError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxCloseError::Bad(body.text.to_string());
+                        let err = ImapMailboxCloseError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -198,7 +198,7 @@ mod tests {
         let ImapMailboxCloseError::No(text) = err else {
             panic!("expected ImapMailboxCloseError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]
@@ -217,7 +217,7 @@ mod tests {
         let ImapMailboxCloseError::Bad(text) = err else {
             panic!("expected ImapMailboxCloseError::Bad, got {err:?}");
         };
-        assert_eq!(text, "CLOSE syntax error");
+        assert_eq!(text.text, "CLOSE syntax error");
     }
 
     #[test]

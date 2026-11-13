@@ -68,10 +68,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxUnsubscribeError {
     /// The server rejected the command with a NO response.
     #[error("IMAP UNSUBSCRIBE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP UNSUBSCRIBE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP UNSUBSCRIBE failed: BYE {0}")]
     Bye(String),
@@ -130,11 +130,11 @@ impl ImapCoroutine for ImapMailboxUnsubscribe {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxUnsubscribeError::No(body.text.to_string());
+                        let err = ImapMailboxUnsubscribeError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxUnsubscribeError::Bad(body.text.to_string());
+                        let err = ImapMailboxUnsubscribeError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -196,7 +196,7 @@ mod tests {
         let ImapMailboxUnsubscribeError::No(text) = err else {
             panic!("expected ImapMailboxUnsubscribeError::No, got {err:?}");
         };
-        assert_eq!(text, "not subscribed");
+        assert_eq!(text.text, "not subscribed");
     }
 
     #[test]

@@ -41,7 +41,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(data)) => break data,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -181,7 +181,7 @@ impl ImapMailboxSelect {
 
 impl ImapCoroutine for ImapMailboxSelect {
     type Yield = ImapYield;
-    type Return = Result<ImapMailboxSelectData, ImapMailboxSelectError>;
+    type Return = Result<ImapOutput<ImapMailboxSelectData>, ImapMailboxSelectError>;
 
     fn resume(
         &mut self,
@@ -191,6 +191,7 @@ impl ImapCoroutine for ImapMailboxSelect {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxSelectError::Bye(bye.text.to_string());
@@ -244,7 +245,11 @@ impl ImapCoroutine for ImapMailboxSelect {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(output)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: output,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
                         let err = ImapMailboxSelectError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
@@ -324,7 +329,7 @@ mod tests {
              * OK [NOMODSEQ] no modification sequences\r\n\
              {tag} OK [READ-WRITE] SELECT completed\r\n",
         );
-        let data = expect_complete_ok(&mut select, &mut frag, reply.as_bytes());
+        let data = expect_complete_ok(&mut select, &mut frag, reply.as_bytes()).data;
         assert_eq!(Some(42), data.exists);
         assert_eq!(Some(7), data.recent);
         assert_eq!(1700, data.uid_validity.expect("uid validity").get());
@@ -348,7 +353,7 @@ mod tests {
         let reply = b"* VANISHED (EARLIER) 1:4294967295\r\n\
                       * VANISHED (EARLIER) 9:3,12\r\n\
                       A1 OK [READ-WRITE] SELECT completed\r\n";
-        let data = expect_complete_ok(&mut select, &mut frag, reply);
+        let data = expect_complete_ok(&mut select, &mut frag, reply).data;
 
         let uid = |n| NonZeroU32::new(n).expect("non-zero");
         let expected = Vec::from([uid(1)..=NonZeroU32::MAX, uid(3)..=uid(9), uid(12)..=uid(12)]);
@@ -425,7 +430,7 @@ mod tests {
         cor: &mut ImapMailboxSelect,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapMailboxSelectData {
+    ) -> ImapOutput<ImapMailboxSelectData> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

@@ -136,6 +136,7 @@ use crate::{
         select::ImapMailboxSelectData,
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
+    send::ImapOutput,
 };
 
 /// UID-keyed mailbox change emitted by the watcher.
@@ -616,7 +617,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 bytes,
                             ));
                         }
-                        ImapCoroutineState::Complete(Ok(data)) => {
+                        ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
                             let Some(uid_validity) = data.uid_validity else {
                                 return ImapCoroutineState::Complete(Err(
                                     ImapMailboxWatchError::MissingUidValidity,
@@ -667,7 +668,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                             bytes,
                         ));
                     }
-                    ImapCoroutineState::Complete(Ok(data)) => {
+                    ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
                         for (_seq, items) in data {
                             let items_vec = items.into_inner();
                             if let (Some(uid), flags) = extract_uid_flags(&items_vec) {
@@ -784,7 +785,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 bytes,
                             ));
                         }
-                        ImapCoroutineState::Complete(Ok(data)) => {
+                        ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
                             if let Err(err) = self.check_uid_validity(&data) {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
@@ -817,7 +818,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 bytes,
                             ));
                         }
-                        ImapCoroutineState::Complete(Ok(data)) => {
+                        ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
                             if let Err(err) = self.check_uid_validity(&data) {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
@@ -849,7 +850,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                             bytes,
                         ));
                     }
-                    ImapCoroutineState::Complete(Ok(data)) => {
+                    ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
                         let mut snapshot = BTreeMap::new();
 
                         for (_seq, items) in data {

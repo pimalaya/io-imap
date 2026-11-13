@@ -40,7 +40,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(mailboxes)) => break mailboxes,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -79,10 +79,10 @@ use crate::{
 pub enum ImapMailboxLsubError {
     /// The server rejected the command with a NO response.
     #[error("IMAP LSUB failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP LSUB failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP LSUB failed: BYE {0}")]
     Bye(String),
@@ -124,7 +124,7 @@ impl ImapMailboxLsub {
 
 impl ImapCoroutine for ImapMailboxLsub {
     type Yield = ImapYield;
-    type Return = Result<ImapMailboxListing, ImapMailboxLsubError>;
+    type Return = Result<ImapOutput<ImapMailboxListing>, ImapMailboxLsubError>;
 
     fn resume(
         &mut self,
@@ -134,6 +134,7 @@ impl ImapCoroutine for ImapMailboxLsub {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxLsubError::Bye(bye.text.to_string());
@@ -160,13 +161,17 @@ impl ImapCoroutine for ImapMailboxLsub {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: mailboxes,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMailboxLsubError::No(body.text.to_string());
+                        let err = ImapMailboxLsubError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxLsubError::Bad(body.text.to_string());
+                        let err = ImapMailboxLsubError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -211,7 +216,7 @@ mod tests {
 
         let reply = format!("* LSUB () \"/\" INBOX\r\n{tag} OK LSUB completed\r\n");
         let rows = expect_complete_ok(&mut lsub, &mut frag, reply.as_bytes());
-        assert_eq!(1, rows.len());
+        assert_eq!(1, rows.data.len());
     }
 
     #[test]
@@ -233,7 +238,7 @@ mod tests {
         let ImapMailboxLsubError::No(text) = err else {
             panic!("expected ImapMailboxLsubError::No, got {err:?}");
         };
-        assert_eq!(text, "not allowed");
+        assert_eq!(text.text, "not allowed");
     }
 
     #[test]
@@ -284,7 +289,7 @@ mod tests {
         cor: &mut ImapMailboxLsub,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapMailboxListing {
+    ) -> ImapOutput<ImapMailboxListing> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

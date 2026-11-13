@@ -76,10 +76,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapExtensionEnableError {
     /// The server rejected the ENABLE command with a NO response.
     #[error("IMAP ENABLE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the ENABLE command with a BAD response.
     #[error("IMAP ENABLE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP ENABLE failed: BYE {0}")]
     Bye(String),
@@ -143,11 +143,11 @@ impl ImapCoroutine for ImapExtensionEnable {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(enabled)),
                     StatusKind::No => {
-                        let err = ImapExtensionEnableError::No(body.text.to_string());
+                        let err = ImapExtensionEnableError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapExtensionEnableError::Bad(body.text.to_string());
+                        let err = ImapExtensionEnableError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -231,7 +231,7 @@ mod tests {
         let ImapExtensionEnableError::No(text) = err else {
             panic!("expected ImapExtensionEnableError::No, got {err:?}");
         };
-        assert_eq!(text, "CONDSTORE not supported");
+        assert_eq!(text.text, "CONDSTORE not supported");
     }
 
     #[test]

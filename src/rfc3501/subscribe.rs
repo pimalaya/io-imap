@@ -68,10 +68,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxSubscribeError {
     /// The server rejected the command with a NO response.
     #[error("IMAP SUBSCRIBE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP SUBSCRIBE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP SUBSCRIBE failed: BYE {0}")]
     Bye(String),
@@ -130,11 +130,11 @@ impl ImapCoroutine for ImapMailboxSubscribe {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxSubscribeError::No(body.text.to_string());
+                        let err = ImapMailboxSubscribeError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxSubscribeError::Bad(body.text.to_string());
+                        let err = ImapMailboxSubscribeError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -196,7 +196,7 @@ mod tests {
         let ImapMailboxSubscribeError::No(text) = err else {
             panic!("expected ImapMailboxSubscribeError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox does not exist");
+        assert_eq!(text.text, "mailbox does not exist");
     }
 
     #[test]

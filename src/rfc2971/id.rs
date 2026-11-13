@@ -69,10 +69,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapServerIdError {
     /// The server rejected the ID command with a NO response.
     #[error("IMAP ID failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the ID command with a BAD response.
     #[error("IMAP ID failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP ID failed: BYE {0}")]
     Bye(String),
@@ -139,11 +139,11 @@ impl ImapCoroutine for ImapServerId {
 
                 match body.kind {
                     StatusKind::No => {
-                        let err = ImapServerIdError::No(body.text.to_string());
+                        let err = ImapServerIdError::No(body.into());
                         return ImapCoroutineState::Complete(Err(err));
                     }
                     StatusKind::Bad => {
-                        let err = ImapServerIdError::Bad(body.text.to_string());
+                        let err = ImapServerIdError::Bad(body.into());
                         return ImapCoroutineState::Complete(Err(err));
                     }
                     StatusKind::Ok => {}
@@ -234,7 +234,7 @@ mod tests {
         let ImapServerIdError::No(text) = err else {
             panic!("expected ImapServerIdError::No, got {err:?}");
         };
-        assert_eq!(text, "ID rejected");
+        assert_eq!(text.text, "ID rejected");
     }
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
         let ImapServerIdError::Bad(text) = err else {
             panic!("expected ImapServerIdError::Bad, got {err:?}");
         };
-        assert_eq!(text, "ID not supported");
+        assert_eq!(text.text, "ID not supported");
     }
 
     #[test]

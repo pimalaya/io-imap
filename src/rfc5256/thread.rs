@@ -46,7 +46,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(threads)) => break threads,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -79,10 +79,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMessageThreadError {
     /// The server rejected the THREAD command with a NO response.
     #[error("IMAP THREAD failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the THREAD command with a BAD response.
     #[error("IMAP THREAD failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP THREAD failed: BYE {0}")]
     Bye(String),
@@ -134,7 +134,7 @@ impl ImapMessageThread {
 
 impl ImapCoroutine for ImapMessageThread {
     type Yield = ImapYield;
-    type Return = Result<Vec<Thread>, ImapMessageThreadError>;
+    type Return = Result<ImapOutput<Vec<Thread>>, ImapMessageThreadError>;
 
     fn resume(
         &mut self,
@@ -144,6 +144,7 @@ impl ImapCoroutine for ImapMessageThread {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageThreadError::Bye(bye.text.to_string());
@@ -164,17 +165,21 @@ impl ImapCoroutine for ImapMessageThread {
 
                 match body.kind {
                     StatusKind::Ok => match threads {
-                        Some(threads) => ImapCoroutineState::Complete(Ok(threads)),
+                        Some(threads) => ImapCoroutineState::Complete(Ok(ImapOutput {
+                            data: threads,
+                            alerts,
+                            skipped: out.skipped,
+                        })),
                         None => {
                             ImapCoroutineState::Complete(Err(ImapMessageThreadError::MissingData))
                         }
                     },
                     StatusKind::No => {
-                        let err = ImapMessageThreadError::No(body.text.to_string());
+                        let err = ImapMessageThreadError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMessageThreadError::Bad(body.text.to_string());
+                        let err = ImapMessageThreadError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -230,7 +235,7 @@ mod tests {
 
         let reply = format!("* THREAD (1)(2 3)\r\n{tag} OK THREAD completed\r\n");
         let threads = expect_complete_ok(&mut thread, &mut frag, reply.as_bytes());
-        assert_eq!(2, threads.len());
+        assert_eq!(2, threads.data.len());
     }
 
     #[test]
@@ -273,7 +278,7 @@ mod tests {
         let ImapMessageThreadError::No(text) = err else {
             panic!("expected ImapMessageThreadError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]
@@ -325,7 +330,7 @@ mod tests {
         cor: &mut ImapMessageThread,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> Vec<Thread> {
+    ) -> ImapOutput<Vec<Thread>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

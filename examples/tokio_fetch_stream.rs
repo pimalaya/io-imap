@@ -83,9 +83,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mailbox = Mailbox::try_from(mailbox)?;
     let opts = ImapMailboxSelectOptions::default();
-    let data = session.run(ImapMailboxSelect::new(mailbox, opts)).await?;
+    let out = session.run(ImapMailboxSelect::new(mailbox, opts)).await?;
 
-    println!("{} messages in the mailbox", data.exists.unwrap_or(0));
+    println!("{} messages in the mailbox", out.data.exists.unwrap_or(0));
 
     let file = File::create(&path).await?;
 

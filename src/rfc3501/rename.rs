@@ -69,10 +69,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxRenameError {
     /// The server rejected the command with a NO response.
     #[error("IMAP RENAME failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP RENAME failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP RENAME failed: BYE {0}")]
     Bye(String),
@@ -131,11 +131,11 @@ impl ImapCoroutine for ImapMailboxRename {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxRenameError::No(body.text.to_string());
+                        let err = ImapMailboxRenameError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxRenameError::Bad(body.text.to_string());
+                        let err = ImapMailboxRenameError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -203,7 +203,7 @@ mod tests {
         let ImapMailboxRenameError::No(text) = err else {
             panic!("expected ImapMailboxRenameError::No, got {err:?}");
         };
-        assert_eq!(text, "target mailbox already exists");
+        assert_eq!(text.text, "target mailbox already exists");
     }
 
     #[test]

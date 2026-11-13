@@ -74,7 +74,9 @@
 //! accumulates is bounded by [`send::ImapSendBudget`], tight for the
 //! commands sent before authentication. Its terminal
 //! value is [`send::ImapSendOutput`]; failures surface as
-//! [`send::ImapSendError`]. Messages without a tag of their own (SASL
+//! [`send::ImapSendError`]. A command returning data hands it back in
+//! a [`send::ImapOutput`], beside the alerts and the skipped lines of
+//! its response. Messages without a tag of their own (SASL
 //! continuations, IDLE DONE) go through [`send::ImapSend::new`] with
 //! the tag of the command they continue, and the receive-only
 //! [`send::ImapSend::receive`] parses the response of a request whose

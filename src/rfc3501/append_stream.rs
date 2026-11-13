@@ -108,10 +108,10 @@ use crate::{
 pub enum ImapMessageAppendStreamError {
     /// The server rejected the command with a NO response.
     #[error("IMAP APPEND failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP APPEND failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
@@ -302,10 +302,8 @@ impl ImapCoroutine for ImapMessageAppendStream {
                     // means the server refused the append up front.
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
-                            StatusKind::No => {
-                                ImapMessageAppendStreamError::No(body.text.to_string())
-                            }
-                            _ => ImapMessageAppendStreamError::Bad(body.text.to_string()),
+                            StatusKind::No => ImapMessageAppendStreamError::No(body.into()),
+                            _ => ImapMessageAppendStreamError::Bad(body.into()),
                         };
                         return ImapCoroutineState::Complete(Err(err));
                     }
@@ -372,11 +370,11 @@ impl ImapCoroutine for ImapMessageAppendStream {
                             ImapCoroutineState::Complete(Ok((exists, appenduid)))
                         }
                         StatusKind::No => {
-                            let err = ImapMessageAppendStreamError::No(body.text.to_string());
+                            let err = ImapMessageAppendStreamError::No(body.into());
                             ImapCoroutineState::Complete(Err(err))
                         }
                         StatusKind::Bad => {
-                            let err = ImapMessageAppendStreamError::Bad(body.text.to_string());
+                            let err = ImapMessageAppendStreamError::Bad(body.into());
                             ImapCoroutineState::Complete(Err(err))
                         }
                     };
@@ -494,12 +492,14 @@ mod tests {
 
         expect_wants_read(&mut append, &mut frag, None);
 
-        let reply = format!("{tag} NO over quota\r\n");
+        let reply = format!("{tag} NO [OVERQUOTA] over quota\r\n");
         let err = expect_complete_err(&mut append, &mut frag, Some(reply.as_bytes()));
-        let ImapMessageAppendStreamError::No(text) = err else {
+        let ImapMessageAppendStreamError::No(status) = err else {
             panic!("expected ImapMessageAppendStreamError::No, got {err:?}");
         };
-        assert_eq!(text, "over quota");
+        assert_eq!(StatusKind::No, status.kind);
+        assert_eq!(Some(Code::OverQuota), status.code);
+        assert_eq!("over quota", status.text);
     }
 
     #[test]

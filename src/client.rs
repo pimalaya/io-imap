@@ -52,6 +52,7 @@ use thiserror::Error;
 use crate::rfc7677::auth_scram_sha_256::*;
 use crate::{
     coroutine::*,
+    rfc2177::idle::ImapIdleError,
     rfc2971::id::*,
     rfc3501::{
         append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
@@ -66,7 +67,7 @@ use crate::{
     rfc6851::r#move::*,
     rfc7628::auth_oauthbearer::*,
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*, auth_xoauth2::*},
-    send::ImapStatusError,
+    send::{ImapOutput, ImapSendError, ImapStatusError},
     session::*,
     watch::*,
 };
@@ -256,11 +257,13 @@ impl ImapClientError {
     /// The NO or BAD completion behind this error, with its response
     /// code.
     ///
-    /// `None` for any other failure, and for the commands whose error
-    /// keeps the text alone: it is carried by LOGIN, AUTHENTICATE,
-    /// SELECT, EXAMINE, FETCH, STORE, COPY, MOVE and the buffered
-    /// APPEND.
+    /// `None` for any other failure. It is the status of the command
+    /// itself, or of the one that failed while opening a session or a
+    /// watch; STARTTLS, read without a codec, gives none.
     pub fn status(&self) -> Option<&ImapStatusError> {
+        use ImapMailboxWatchError as Watch;
+        use ImapSessionOpenError as Session;
+
         match self {
             Self::Login(ImapLoginError::No(status) | ImapLoginError::Bad(status))
             | Self::AuthLogin(ImapAuthLoginError::No(status) | ImapAuthLoginError::Bad(status))
@@ -274,14 +277,82 @@ impl ImapClientError {
             | Self::AuthXOAuth2(
                 ImapAuthXoauth2Error::No(status) | ImapAuthXoauth2Error::Bad(status),
             )
+            | Self::Logout(ImapLogoutError::No(status) | ImapLogoutError::Bad(status))
+            | Self::Capability(
+                ImapCapabilityGetError::No(status) | ImapCapabilityGetError::Bad(status),
+            )
+            | Self::Noop(ImapNoopError::No(status) | ImapNoopError::Bad(status))
+            | Self::ServerId(ImapServerIdError::No(status) | ImapServerIdError::Bad(status))
+            | Self::ExtensionEnable(
+                ImapExtensionEnableError::No(status) | ImapExtensionEnableError::Bad(status),
+            )
+            | Self::MailboxList(
+                ImapMailboxListError::No(status) | ImapMailboxListError::Bad(status),
+            )
+            | Self::MailboxLsub(
+                ImapMailboxLsubError::No(status) | ImapMailboxLsubError::Bad(status),
+            )
+            | Self::MailboxStatus(
+                ImapMailboxStatusError::No(status) | ImapMailboxStatusError::Bad(status),
+            )
+            | Self::MailboxCreate(
+                ImapMailboxCreateError::No(status) | ImapMailboxCreateError::Bad(status),
+            )
+            | Self::MailboxDelete(
+                ImapMailboxDeleteError::No(status) | ImapMailboxDeleteError::Bad(status),
+            )
+            | Self::MailboxRename(
+                ImapMailboxRenameError::No(status) | ImapMailboxRenameError::Bad(status),
+            )
+            | Self::MailboxSubscribe(
+                ImapMailboxSubscribeError::No(status) | ImapMailboxSubscribeError::Bad(status),
+            )
+            | Self::MailboxUnsubscribe(
+                ImapMailboxUnsubscribeError::No(status) | ImapMailboxUnsubscribeError::Bad(status),
+            )
             | Self::MailboxSelect(
                 ImapMailboxSelectError::No(status) | ImapMailboxSelectError::Bad(status),
             )
             | Self::MailboxExamine(
                 ImapMailboxExamineError::No(status) | ImapMailboxExamineError::Bad(status),
             )
+            | Self::MailboxClose(
+                ImapMailboxCloseError::No(status) | ImapMailboxCloseError::Bad(status),
+            )
+            | Self::MailboxUnselect(
+                ImapMailboxUnselectError::No(status) | ImapMailboxUnselectError::Bad(status),
+            )
+            | Self::MailboxCheck(
+                ImapMailboxCheckError::No(status) | ImapMailboxCheckError::Bad(status),
+            )
+            | Self::MailboxExpunge(
+                ImapMailboxExpungeError::No(status) | ImapMailboxExpungeError::Bad(status),
+            )
+            | Self::MessageExpungeUid(
+                ImapMessageExpungeUidError::No(status) | ImapMessageExpungeUidError::Bad(status),
+            )
+            | Self::MessageSort(
+                ImapMessageSortError::No(status)
+                | ImapMessageSortError::Bad(status)
+                | ImapMessageSortError::Search(
+                    ImapMessageSearchError::No(status) | ImapMessageSearchError::Bad(status),
+                )
+                | ImapMessageSortError::Fetch(
+                    ImapMessageFetchError::No(status) | ImapMessageFetchError::Bad(status),
+                ),
+            )
             | Self::MessageFetch(
                 ImapMessageFetchError::No(status) | ImapMessageFetchError::Bad(status),
+            )
+            | Self::MessageFetchStream(
+                ImapMessageFetchStreamError::No(status) | ImapMessageFetchStreamError::Bad(status),
+            )
+            | Self::MessageFetchStreamBatch(
+                ImapMessageFetchStreamBatchError::No(status)
+                | ImapMessageFetchStreamBatchError::Bad(status),
+            )
+            | Self::MessageSearch(
+                ImapMessageSearchError::No(status) | ImapMessageSearchError::Bad(status),
             )
             | Self::MessageStore(
                 ImapMessageStoreError::No(status) | ImapMessageStoreError::Bad(status),
@@ -294,12 +365,145 @@ impl ImapClientError {
             )
             | Self::MessageAppend(
                 ImapMessageAppendError::No(status) | ImapMessageAppendError::Bad(status),
+            )
+            | Self::MessageAppendStream(
+                ImapMessageAppendStreamError::No(status)
+                | ImapMessageAppendStreamError::Bad(status),
+            )
+            | Self::MessageThread(
+                ImapMessageThreadError::No(status) | ImapMessageThreadError::Bad(status),
+            )
+            | Self::SessionOpen(
+                Session::Capability(
+                    ImapCapabilityGetError::No(status) | ImapCapabilityGetError::Bad(status),
+                )
+                | Session::Login(ImapLoginError::No(status) | ImapLoginError::Bad(status))
+                | Session::AuthLogin(
+                    ImapAuthLoginError::No(status) | ImapAuthLoginError::Bad(status),
+                )
+                | Session::AuthPlain(
+                    ImapAuthPlainError::No(status) | ImapAuthPlainError::Bad(status),
+                )
+                | Session::AuthAnonymous(
+                    ImapAuthAnonymousError::No(status) | ImapAuthAnonymousError::Bad(status),
+                )
+                | Session::AuthOauthbearer(
+                    ImapAuthOauthbearerError::No(status) | ImapAuthOauthbearerError::Bad(status),
+                )
+                | Session::AuthXoauth2(
+                    ImapAuthXoauth2Error::No(status) | ImapAuthXoauth2Error::Bad(status),
+                ),
+            )
+            | Self::MailboxWatch(
+                Watch::Examine(
+                    ImapMailboxExamineError::No(status) | ImapMailboxExamineError::Bad(status),
+                )
+                | Watch::Fetch(
+                    ImapMessageFetchError::No(status) | ImapMessageFetchError::Bad(status),
+                )
+                | Watch::Idle(ImapIdleError::No(status) | ImapIdleError::Bad(status))
+                | Watch::Enable(
+                    ImapExtensionEnableError::No(status) | ImapExtensionEnableError::Bad(status),
+                ),
             ) => Some(status),
             #[cfg(feature = "scram")]
             Self::AuthScramSha256(
                 ImapAuthScramSha256Error::No(status) | ImapAuthScramSha256Error::Bad(status),
-            ) => Some(status),
+            )
+            | Self::SessionOpen(Session::AuthScramSha256(
+                ImapAuthScramSha256Error::No(status) | ImapAuthScramSha256Error::Bad(status),
+            )) => Some(status),
             _ => None,
+        }
+    }
+
+    /// Whether the connection is gone: its stream failed or ended, or
+    /// the server closed the session with a BYE.
+    ///
+    /// The client cannot be used again, whatever command failed. A BYE
+    /// answering the CAPABILITY or ID chained after a login is not
+    /// seen: the next command fails on the end of the stream.
+    pub fn is_connection_lost(&self) -> bool {
+        use ImapMailboxWatchError as Watch;
+        use ImapSessionOpenError as Session;
+
+        let mut source: Option<&(dyn core::error::Error + 'static)> = Some(self);
+
+        while let Some(err) = source {
+            if let Some(ImapSendError::Eof) = err.downcast_ref() {
+                return true;
+            }
+
+            source = err.source();
+        }
+
+        match self {
+            Self::Io(_)
+            | Self::Transport(_)
+            | Self::Greeting(ImapGreetingGetError::Bye(_) | ImapGreetingGetError::Eof)
+            | Self::StartTls(ImapStartTlsError::Bye(_) | ImapStartTlsError::Eof)
+            | Self::Raw(ImapRawError::Eof)
+            | Self::Login(ImapLoginError::Bye(_))
+            | Self::AuthLogin(ImapAuthLoginError::Bye(_))
+            | Self::AuthPlain(ImapAuthPlainError::Bye(_))
+            | Self::AuthAnonymous(ImapAuthAnonymousError::Bye(_))
+            | Self::AuthOAuthBearer(ImapAuthOauthbearerError::Bye(_))
+            | Self::AuthXOAuth2(ImapAuthXoauth2Error::Bye(_))
+            | Self::Capability(ImapCapabilityGetError::Bye(_))
+            | Self::Noop(ImapNoopError::Bye(_))
+            | Self::ServerId(ImapServerIdError::Bye(_))
+            | Self::ExtensionEnable(ImapExtensionEnableError::Bye(_))
+            | Self::MailboxList(ImapMailboxListError::Bye(_))
+            | Self::MailboxLsub(ImapMailboxLsubError::Bye(_))
+            | Self::MailboxStatus(ImapMailboxStatusError::Bye(_))
+            | Self::MailboxCreate(ImapMailboxCreateError::Bye(_))
+            | Self::MailboxDelete(ImapMailboxDeleteError::Bye(_))
+            | Self::MailboxRename(ImapMailboxRenameError::Bye(_))
+            | Self::MailboxSubscribe(ImapMailboxSubscribeError::Bye(_))
+            | Self::MailboxUnsubscribe(ImapMailboxUnsubscribeError::Bye(_))
+            | Self::MailboxSelect(ImapMailboxSelectError::Bye(_))
+            | Self::MailboxExamine(ImapMailboxExamineError::Bye(_))
+            | Self::MailboxClose(ImapMailboxCloseError::Bye(_))
+            | Self::MailboxUnselect(ImapMailboxUnselectError::Bye(_))
+            | Self::MailboxCheck(ImapMailboxCheckError::Bye(_))
+            | Self::MailboxExpunge(ImapMailboxExpungeError::Bye(_))
+            | Self::MessageExpungeUid(ImapMessageExpungeUidError::Bye(_))
+            | Self::MessageSort(
+                ImapMessageSortError::Bye(_)
+                | ImapMessageSortError::Search(ImapMessageSearchError::Bye(_))
+                | ImapMessageSortError::Fetch(ImapMessageFetchError::Bye(_)),
+            )
+            | Self::MessageFetch(ImapMessageFetchError::Bye(_))
+            | Self::MessageFetchStream(ImapMessageFetchStreamError::Bye(_))
+            | Self::MessageFetchStreamBatch(ImapMessageFetchStreamBatchError::Bye(_))
+            | Self::MessageSearch(ImapMessageSearchError::Bye(_))
+            | Self::MessageStore(ImapMessageStoreError::Bye(_))
+            | Self::MessageCopy(ImapMessageCopyError::Bye(_))
+            | Self::MessageMove(ImapMessageMoveError::Bye(_))
+            | Self::MessageAppend(ImapMessageAppendError::Bye(_))
+            | Self::MessageAppendStream(ImapMessageAppendStreamError::Bye(_))
+            | Self::MessageThread(ImapMessageThreadError::Bye(_))
+            | Self::SessionOpen(
+                Session::Greeting(ImapGreetingGetError::Bye(_) | ImapGreetingGetError::Eof)
+                | Session::StartTls(ImapStartTlsError::Bye(_) | ImapStartTlsError::Eof)
+                | Session::Capability(ImapCapabilityGetError::Bye(_))
+                | Session::Login(ImapLoginError::Bye(_))
+                | Session::AuthLogin(ImapAuthLoginError::Bye(_))
+                | Session::AuthPlain(ImapAuthPlainError::Bye(_))
+                | Session::AuthAnonymous(ImapAuthAnonymousError::Bye(_))
+                | Session::AuthOauthbearer(ImapAuthOauthbearerError::Bye(_))
+                | Session::AuthXoauth2(ImapAuthXoauth2Error::Bye(_)),
+            )
+            | Self::MailboxWatch(
+                Watch::Examine(ImapMailboxExamineError::Bye(_))
+                | Watch::Fetch(ImapMessageFetchError::Bye(_))
+                | Watch::Idle(ImapIdleError::Bye(_))
+                | Watch::Enable(ImapExtensionEnableError::Bye(_)),
+            ) => true,
+            #[cfg(feature = "scram")]
+            Self::AuthScramSha256(ImapAuthScramSha256Error::Bye(_))
+            | Self::SessionOpen(Session::AuthScramSha256(ImapAuthScramSha256Error::Bye(_))) => true,
+            _ => false,
         }
     }
 }
@@ -390,7 +594,7 @@ macro_rules! imap_client_commands {
                 uid_validity: NonZeroU32,
                 highest_mod_seq: u64,
                 capability: &[Capability<'static>],
-            ) -> Result<ImapMailboxSelectData, ImapClientError> {
+            ) -> Result<ImapOutput<ImapMailboxSelectData>, ImapClientError> {
                 let parameters = qresync_parameters(uid_validity, highest_mod_seq, capability)?;
                 self.select(mailbox, ImapMailboxSelectOptions { parameters })
             }
@@ -479,7 +683,7 @@ macro_rules! imap_client_commands {
                 uid_validity: NonZeroU32,
                 highest_mod_seq: u64,
                 capability: &[Capability<'static>],
-            ) -> impl Future<Output = Result<ImapMailboxSelectData, ImapClientError>> + Send
+            ) -> impl Future<Output = Result<ImapOutput<ImapMailboxSelectData>, ImapClientError>> + Send
             {
                 async move {
                     let parameters =
@@ -586,7 +790,7 @@ imap_client_commands! {
 
     /// `NOOP`; round-trips to keep the connection alive or poll for
     /// updates, which it returns.
-    fn noop() -> ImapMailboxUpdates {
+    fn noop() -> ImapOutput<ImapMailboxUpdates> {
         ImapNoop::new()
     }
 
@@ -608,7 +812,7 @@ imap_client_commands! {
     fn list(
         reference: Mailbox<'static>,
         pattern: ListMailbox<'static>,
-    ) -> ImapMailboxListing {
+    ) -> ImapOutput<ImapMailboxListing> {
         ImapMailboxList::new(reference, pattern)
     }
 
@@ -617,7 +821,7 @@ imap_client_commands! {
     fn lsub(
         reference: Mailbox<'static>,
         pattern: ListMailbox<'static>,
-    ) -> ImapMailboxListing {
+    ) -> ImapOutput<ImapMailboxListing> {
         ImapMailboxLsub::new(reference, pattern)
     }
 
@@ -625,7 +829,7 @@ imap_client_commands! {
     fn status(
         mailbox: Mailbox<'static>,
         item_names: Cow<'static, [StatusDataItemName]>,
-    ) -> Vec<StatusDataItem> {
+    ) -> ImapOutput<Vec<StatusDataItem>> {
         ImapMailboxStatus::new(mailbox, item_names)
     }
 
@@ -658,7 +862,7 @@ imap_client_commands! {
     fn select(
         mailbox: Mailbox<'static>,
         opts: ImapMailboxSelectOptions,
-    ) -> ImapMailboxSelectData {
+    ) -> ImapOutput<ImapMailboxSelectData> {
         ImapMailboxSelect::new(mailbox, opts)
     }
 
@@ -666,7 +870,7 @@ imap_client_commands! {
     fn examine(
         mailbox: Mailbox<'static>,
         opts: ImapMailboxExamineOptions,
-    ) -> ImapMailboxSelectData {
+    ) -> ImapOutput<ImapMailboxSelectData> {
         ImapMailboxExamine::new(mailbox, opts)
     }
 
@@ -682,12 +886,12 @@ imap_client_commands! {
 
     /// `CHECK`; requests a mailbox checkpoint and returns the updates
     /// the server reports with it.
-    fn check() -> ImapMailboxUpdates {
+    fn check() -> ImapOutput<ImapMailboxUpdates> {
         ImapMailboxCheck::new()
     }
 
     /// `EXPUNGE`; returns the expunged sequence numbers.
-    fn expunge() -> Vec<NonZeroU32> {
+    fn expunge() -> ImapOutput<Vec<NonZeroU32>> {
         ImapMailboxExpunge::new()
     }
 
@@ -697,7 +901,7 @@ imap_client_commands! {
     ///
     /// Requires the server to advertise `UIDPLUS`; returns the expunged
     /// sequence numbers.
-    fn uid_expunge(sequence_set: SequenceSet) -> Vec<NonZeroU32> {
+    fn uid_expunge(sequence_set: SequenceSet) -> ImapOutput<Vec<NonZeroU32>> {
         ImapMessageExpungeUid::new(sequence_set)
     }
 
@@ -706,7 +910,7 @@ imap_client_commands! {
         sequence_set: SequenceSet,
         items: MacroOrMessageDataItemNames<'static>,
         opts: ImapMessageFetchOptions,
-    ) -> BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> {
+    ) -> ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>> {
         ImapMessageFetch::new(sequence_set, items, opts)
     }
 
@@ -714,7 +918,7 @@ imap_client_commands! {
     fn search(
         criteria: Vec1<SearchKey<'static>>,
         opts: ImapMessageSearchOptions,
-    ) -> Vec<NonZeroU32> {
+    ) -> ImapOutput<Vec<NonZeroU32>> {
         ImapMessageSearch::new(criteria, opts)
     }
 
@@ -724,7 +928,7 @@ imap_client_commands! {
         kind: StoreType,
         flags: Vec<Flag<'static>>,
         opts: ImapMessageStoreOptions,
-    ) -> BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> {
+    ) -> ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>> {
         ImapMessageStore::new(sequence_set, kind, flags, opts)
     }
 
@@ -770,7 +974,7 @@ imap_client_commands! {
         sort_criteria: Vec1<SortCriterion>,
         search_criteria: Vec1<SearchKey<'static>>,
         opts: ImapMessageSortOptions,
-    ) -> Vec<NonZeroU32> {
+    ) -> ImapOutput<Vec<NonZeroU32>> {
         ImapMessageSort::new(sort_criteria, search_criteria, opts)
     }
 
@@ -779,7 +983,7 @@ imap_client_commands! {
         algorithm: ThreadingAlgorithm<'static>,
         search_criteria: Vec1<SearchKey<'static>>,
         opts: ImapMessageThreadOptions,
-    ) -> Vec<Thread> {
+    ) -> ImapOutput<Vec<Thread>> {
         ImapMessageThread::new(algorithm, search_criteria, opts)
     }
 }
@@ -1423,6 +1627,55 @@ mod tests {
 
         let err = ImapClientError::from(ImapMessageCopyError::MissingTagged);
         assert_eq!(None, err.status());
+    }
+
+    #[test]
+    fn status_gives_the_response_code_of_a_refused_session() {
+        let status = ImapStatusError {
+            kind: StatusKind::No,
+            code: Some(Code::Alert),
+            text: "account disabled".into(),
+        };
+
+        let err = ImapAuthPlainError::No(status.clone());
+        let err = ImapClientError::from(ImapSessionOpenError::from(err));
+        assert_eq!(Some(&status), err.status());
+
+        let err = ImapClientError::from(ImapMailboxCreateError::No(status.clone()));
+        assert_eq!(Some(&status), err.status());
+    }
+
+    #[test]
+    fn connection_is_lost_on_eof_bye_and_io_error() {
+        let eof = ImapAuthPlainError::Send(ImapSendError::Eof);
+        let bye = ImapIdleError::Bye("going down".into());
+        let io = io::Error::from(io::ErrorKind::BrokenPipe);
+
+        for err in [
+            ImapClientError::from(ImapNoopError::Send(ImapSendError::Eof)),
+            ImapClientError::from(ImapSessionOpenError::from(eof)),
+            ImapClientError::from(ImapGreetingGetError::Eof),
+            ImapClientError::from(ImapMessageFetchError::Bye("going down".into())),
+            ImapClientError::from(ImapMailboxWatchError::from(bye)),
+            ImapClientError::from(io),
+        ] {
+            assert!(err.is_connection_lost(), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn connection_is_kept_on_a_refused_command() {
+        let status = ImapStatusError {
+            kind: StatusKind::No,
+            code: None,
+            text: "mailbox does not exist".into(),
+        };
+
+        let err = ImapClientError::from(ImapMessageCopyError::No(status));
+        assert!(!err.is_connection_lost());
+
+        let err = ImapClientError::from(ImapNoopError::Send(ImapSendError::MissingTag));
+        assert!(!err.is_connection_lost());
     }
 
     #[test]

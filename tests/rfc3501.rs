@@ -260,7 +260,7 @@ fn list_decodes_mailbox_from_modified_utf7() {
     };
 
     let mailboxes = match result {
-        ImapCoroutineState::Complete(Ok(mailboxes)) => mailboxes,
+        ImapCoroutineState::Complete(Ok(out)) => out.data,
         other => panic!(
             "expected Ok, got {other:?}",
             other = std::any::type_name_of_val(&other)
@@ -321,9 +321,13 @@ A001 OK [READ-WRITE] INBOX selected. (Success)\r\n";
     };
 
     match result {
-        ImapCoroutineState::Complete(Ok(data)) => {
-            // NOTE: the undecodable FLAGS line is dropped, the rest
-            // is still parsed.
+        ImapCoroutineState::Complete(Ok(out)) => {
+            // NOTE: the undecodable FLAGS line is skipped and handed
+            // back, the rest is still parsed.
+            assert_eq!(out.skipped.len(), 1);
+            assert!(out.skipped[0].declassify().starts_with(b"* FLAGS ("));
+
+            let data = out.data;
             assert_eq!(data.flags, None);
             assert_eq!(data.exists, Some(4));
             assert_eq!(data.recent, Some(0));

@@ -97,6 +97,18 @@ impl fmt::Display for ImapStatusError {
     }
 }
 
+/// The result of a command, with what its response held beside it.
+#[derive(Clone, Debug, Default)]
+pub struct ImapOutput<T> {
+    /// The result of the command.
+    pub data: T,
+    /// The texts of the `ALERT` response codes, to show to the user.
+    pub alerts: Vec<String>,
+    /// The untagged responses skipped for not decoding, as raw bytes:
+    /// data the result may be missing.
+    pub skipped: Vec<Secret<Box<[u8]>>>,
+}
+
 /// Bounds on the untagged responses one exchange collects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImapSendBudget {
@@ -610,6 +622,20 @@ pub struct ImapSendOutput<T: Encoder> {
     pub continuation_request: Option<CommandContinuationRequest<'static>>,
 }
 
+impl<T: Encoder> ImapSendOutput<T> {
+    /// The texts of the `ALERT` response codes of the exchange, which a
+    /// client shows to its user.
+    ///
+    /// Refs: <https://datatracker.ietf.org/doc/html/rfc3501#section-7.1>
+    pub fn alerts(&self) -> Vec<String> {
+        let tagged = self.tagged.iter().map(|tagged| &tagged.body);
+        let bodies = self.untagged.iter().chain(tagged);
+        let alerts = bodies.filter(|body| matches!(body.code, Some(Code::Alert)));
+
+        alerts.map(|body| body.text.to_string()).collect()
+    }
+}
+
 impl<T: Encoder> ImapCoroutine for ImapSend<T> {
     type Yield = ImapYield;
     type Return = Result<ImapSendOutput<T>, ImapSendError>;
@@ -786,6 +812,26 @@ mod tests {
 
         assert_eq!(1, out.skipped.len());
         assert_eq!(line, &**out.skipped[0].declassify());
+    }
+
+    #[test]
+    fn alerts_are_read_off_untagged_and_tagged_statuses() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let reply = b"* OK [ALERT] disk almost full\r\n\
+            * OK still here\r\n\
+            A1 OK [ALERT] maintenance at midnight\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply)) else {
+            panic!("expected Ok");
+        };
+
+        let expected = ["disk almost full", "maintenance at midnight"];
+        assert_eq!(expected, *out.alerts());
     }
 
     #[test]

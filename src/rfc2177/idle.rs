@@ -90,10 +90,10 @@ const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 pub enum ImapIdleError {
     /// The server rejected the IDLE command with a NO response.
     #[error("IMAP IDLE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the IDLE command with a BAD response.
     #[error("IMAP IDLE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP IDLE failed: BYE {0}")]
     Bye(String),
@@ -253,8 +253,8 @@ impl ImapCoroutine for ImapIdle {
                     if let Some(Tagged { body, .. }) = out.tagged {
                         let err = match body.kind {
                             StatusKind::Ok => ImapIdleError::UnexpectedTagged,
-                            StatusKind::No => ImapIdleError::No(body.text.to_string()),
-                            StatusKind::Bad => ImapIdleError::Bad(body.text.to_string()),
+                            StatusKind::No => ImapIdleError::No(body.into()),
+                            StatusKind::Bad => ImapIdleError::Bad(body.into()),
                         };
 
                         return ImapCoroutineState::Complete(Err(err));
@@ -410,11 +410,11 @@ impl ImapCoroutine for ImapIdle {
                     match body.kind {
                         StatusKind::Ok => {}
                         StatusKind::No => {
-                            let err = ImapIdleError::No(body.text.to_string());
+                            let err = ImapIdleError::No(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                         StatusKind::Bad => {
-                            let err = ImapIdleError::Bad(body.text.to_string());
+                            let err = ImapIdleError::Bad(body.into());
                             return ImapCoroutineState::Complete(Err(err));
                         }
                     }
@@ -673,7 +673,7 @@ mod tests {
         let ImapIdleError::Bad(text) = err else {
             panic!("expected ImapIdleError::Bad, got {err:?}");
         };
-        assert_eq!(text, "IDLE not supported");
+        assert_eq!(text.text, "IDLE not supported");
     }
 
     #[test]
@@ -698,7 +698,7 @@ mod tests {
         let ImapIdleError::No(text) = err else {
             panic!("expected ImapIdleError::No, got {err:?}");
         };
-        assert_eq!(text, "IDLE aborted");
+        assert_eq!(text.text, "IDLE aborted");
     }
 
     fn expect_wants_tag(cor: &mut ImapIdle, frag: &mut Fragmentizer) {

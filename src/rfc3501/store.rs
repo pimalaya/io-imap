@@ -46,7 +46,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(updated)) => break updated,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -185,8 +185,10 @@ impl ImapMessageStore {
 
 impl ImapCoroutine for ImapMessageStore {
     type Yield = ImapYield;
-    type Return =
-        Result<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>, ImapMessageStoreError>;
+    type Return = Result<
+        ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>>,
+        ImapMessageStoreError,
+    >;
 
     fn resume(
         &mut self,
@@ -196,6 +198,7 @@ impl ImapCoroutine for ImapMessageStore {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg.take());
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMessageStoreError::Bye(bye.text.to_string());
@@ -216,7 +219,11 @@ impl ImapCoroutine for ImapMessageStore {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(data)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
                         let err = ImapMessageStoreError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
@@ -439,7 +446,7 @@ mod tests {
         reply: &[u8],
     ) -> BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> {
         match cor.resume(frag, Some(reply)) {
-            ImapCoroutineState::Complete(Ok(value)) => value,
+            ImapCoroutineState::Complete(Ok(value)) => value.data,
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }

@@ -40,7 +40,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(mailboxes)) => break mailboxes,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -85,10 +85,10 @@ pub type ImapMailboxListing = Vec<(
 pub enum ImapMailboxListError {
     /// The server rejected the command with a NO response.
     #[error("IMAP LIST failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP LIST failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP LIST failed: BYE {0}")]
     Bye(String),
@@ -130,7 +130,7 @@ impl ImapMailboxList {
 
 impl ImapCoroutine for ImapMailboxList {
     type Yield = ImapYield;
-    type Return = Result<ImapMailboxListing, ImapMailboxListError>;
+    type Return = Result<ImapOutput<ImapMailboxListing>, ImapMailboxListError>;
 
     fn resume(
         &mut self,
@@ -140,6 +140,7 @@ impl ImapCoroutine for ImapMailboxList {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxListError::Bye(bye.text.to_string());
@@ -166,13 +167,17 @@ impl ImapCoroutine for ImapMailboxList {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(mailboxes)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: mailboxes,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMailboxListError::No(body.text.to_string());
+                        let err = ImapMailboxListError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxListError::Bad(body.text.to_string());
+                        let err = ImapMailboxListError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -220,7 +225,34 @@ mod tests {
              {tag} OK LIST completed\r\n",
         );
         let rows = expect_complete_ok(&mut list, &mut frag, reply.as_bytes());
-        assert_eq!(2, rows.len());
+        assert_eq!(2, rows.data.len());
+        assert!(rows.skipped.is_empty());
+    }
+
+    #[test]
+    fn skipped_row_is_returned_beside_the_rows() {
+        let mut list = ImapMailboxList::new(
+            "".try_into().expect("valid reference"),
+            "*".try_into().expect("valid pattern"),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut list, &mut frag);
+        let _ = expect_wants_write(&mut list, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut list, &mut frag);
+
+        let skipped = b"* LIST (\\HasNoChildren) \"//\" Archive\r\n";
+        let reply = [
+            b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n".as_slice(),
+            skipped,
+            b"A1 OK LIST completed\r\n",
+        ]
+        .concat();
+        let rows = expect_complete_ok(&mut list, &mut frag, &reply);
+
+        assert_eq!(1, rows.data.len());
+        assert_eq!(1, rows.skipped.len());
+        assert_eq!(skipped, &**rows.skipped[0].declassify());
     }
 
     #[test]
@@ -242,7 +274,7 @@ mod tests {
         let ImapMailboxListError::No(text) = err else {
             panic!("expected ImapMailboxListError::No, got {err:?}");
         };
-        assert_eq!(text, "not allowed");
+        assert_eq!(text.text, "not allowed");
     }
 
     #[test]
@@ -293,7 +325,7 @@ mod tests {
         cor: &mut ImapMailboxList,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapMailboxListing {
+    ) -> ImapOutput<ImapMailboxListing> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

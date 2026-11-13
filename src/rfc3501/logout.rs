@@ -46,8 +46,6 @@
 
 use core::fmt;
 
-use alloc::string::{String, ToString};
-
 use imap_codec::{
     CommandCodec,
     fragmentizer::Fragmentizer,
@@ -66,10 +64,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapLogoutError {
     /// The server rejected the command with a NO response.
     #[error("IMAP LOGOUT failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP LOGOUT failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server completed LOGOUT without the mandatory untagged BYE.
     #[error("IMAP LOGOUT failed: server did not send the expected BYE")]
     MissingBye,
@@ -127,11 +125,11 @@ impl ImapCoroutine for ImapLogout {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapLogoutError::No(body.text.to_string());
+                        let err = ImapLogoutError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapLogoutError::Bad(body.text.to_string());
+                        let err = ImapLogoutError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -243,7 +241,7 @@ mod tests {
         let ImapLogoutError::Bad(text) = err else {
             panic!("expected ImapLogoutError::Bad, got {err:?}");
         };
-        assert_eq!(text, "LOGOUT not allowed");
+        assert_eq!(text.text, "LOGOUT not allowed");
     }
 
     fn expect_wants_tag(cor: &mut ImapLogout, frag: &mut Fragmentizer) {

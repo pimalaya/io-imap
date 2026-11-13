@@ -38,7 +38,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(_updates)) => break,
+//!         ImapCoroutineState::Complete(Ok(_out)) => break,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! }
@@ -66,10 +66,10 @@ use crate::{coroutine::*, imap_try, rfc3501::updates::ImapMailboxUpdates, send::
 pub enum ImapNoopError {
     /// The server rejected the command with a NO response.
     #[error("IMAP NOOP failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP NOOP failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP NOOP failed: BYE {0}")]
     Bye(String),
@@ -108,7 +108,7 @@ impl Default for ImapNoop {
 
 impl ImapCoroutine for ImapNoop {
     type Yield = ImapYield;
-    type Return = Result<ImapMailboxUpdates, ImapNoopError>;
+    type Return = Result<ImapOutput<ImapMailboxUpdates>, ImapNoopError>;
 
     fn resume(
         &mut self,
@@ -118,6 +118,7 @@ impl ImapCoroutine for ImapNoop {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapNoopError::Bye(bye.text.to_string());
@@ -130,16 +131,17 @@ impl ImapCoroutine for ImapNoop {
                 };
 
                 match body.kind {
-                    StatusKind::Ok => {
-                        let updates = ImapMailboxUpdates::from_data(out.data);
-                        ImapCoroutineState::Complete(Ok(updates))
-                    }
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: ImapMailboxUpdates::from_data(out.data),
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapNoopError::No(body.text.to_string());
+                        let err = ImapNoopError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapNoopError::Bad(body.text.to_string());
+                        let err = ImapNoopError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -199,8 +201,14 @@ mod tests {
             * 5 EXISTS\r\n\
             * 1 RECENT\r\n\
             * 2 FETCH (FLAGS (\\Seen))\r\n\
+            * 4 FETCH (FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+            * OK [ALERT] maintenance at midnight\r\n\
             A1 OK NOOP completed\r\n";
-        let updates = expect_complete_ok(&mut noop, &mut frag, reply);
+        let out = expect_complete_ok(&mut noop, &mut frag, reply);
+        assert_eq!(1, out.skipped.len());
+        assert_eq!(["maintenance at midnight"], *out.alerts);
+
+        let updates = out.data;
         let expunged: Vec<u32> = updates.expunged.iter().map(|seq| seq.get()).collect();
         assert_eq!(vec![3, 3], expunged);
         assert_eq!(Some(5), updates.exists);
@@ -224,7 +232,7 @@ mod tests {
         let ImapNoopError::Bad(text) = err else {
             panic!("expected ImapNoopError::Bad, got {err:?}");
         };
-        assert_eq!(text, "NOOP syntax error");
+        assert_eq!(text.text, "NOOP syntax error");
     }
 
     #[test]
@@ -272,7 +280,7 @@ mod tests {
         cor: &mut ImapNoop,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapMailboxUpdates {
+    ) -> ImapOutput<ImapMailboxUpdates> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(updates)) => updates,
             state => panic!("expected Complete(Ok), got {state:?}"),

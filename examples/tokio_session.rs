@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Send, and this spawn would stop compiling.
     let listing = tokio::spawn(async move { client.list(reference, pattern).await }).await??;
 
-    for (mailbox, _delimiter, _attributes) in listing {
+    for (mailbox, _delimiter, _attributes) in listing.data {
         println!("{mailbox:?}");
     }
 

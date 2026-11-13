@@ -68,10 +68,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapMailboxCreateError {
     /// The server rejected the command with a NO response.
     #[error("IMAP CREATE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP CREATE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP CREATE failed: BYE {0}")]
     Bye(String),
@@ -129,11 +129,11 @@ impl ImapCoroutine for ImapMailboxCreate {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxCreateError::No(body.text.to_string());
+                        let err = ImapMailboxCreateError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxCreateError::Bad(body.text.to_string());
+                        let err = ImapMailboxCreateError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -195,7 +195,7 @@ mod tests {
         let ImapMailboxCreateError::No(text) = err else {
             panic!("expected ImapMailboxCreateError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox already exists");
+        assert_eq!(text.text, "mailbox already exists");
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let ImapMailboxCreateError::Bad(text) = err else {
             panic!("expected ImapMailboxCreateError::Bad, got {err:?}");
         };
-        assert_eq!(text, "CREATE syntax error");
+        assert_eq!(text.text, "CREATE syntax error");
     }
 
     #[test]

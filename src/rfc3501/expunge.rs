@@ -38,7 +38,7 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(expunged)) => break expunged,
+//!         ImapCoroutineState::Complete(Ok(out)) => break out.data,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
@@ -68,10 +68,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMailboxExpungeError {
     /// The server rejected the command with a NO response.
     #[error("IMAP EXPUNGE failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP EXPUNGE failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP EXPUNGE failed: BYE {0}")]
     Bye(String),
@@ -110,7 +110,7 @@ impl Default for ImapMailboxExpunge {
 
 impl ImapCoroutine for ImapMailboxExpunge {
     type Yield = ImapYield;
-    type Return = Result<Vec<NonZeroU32>, ImapMailboxExpungeError>;
+    type Return = Result<ImapOutput<Vec<NonZeroU32>>, ImapMailboxExpungeError>;
 
     fn resume(
         &mut self,
@@ -120,6 +120,7 @@ impl ImapCoroutine for ImapMailboxExpunge {
         match &mut self.state {
             State::Send(send) => {
                 let out = imap_try!(send, fragmentizer, arg);
+                let alerts = out.alerts();
 
                 if let Some(bye) = out.bye {
                     let err = ImapMailboxExpungeError::Bye(bye.text.to_string());
@@ -139,13 +140,17 @@ impl ImapCoroutine for ImapMailboxExpunge {
                 }
 
                 match body.kind {
-                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(expunged)),
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data: expunged,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
-                        let err = ImapMailboxExpungeError::No(body.text.to_string());
+                        let err = ImapMailboxExpungeError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxExpungeError::Bad(body.text.to_string());
+                        let err = ImapMailboxExpungeError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -189,7 +194,7 @@ mod tests {
 
         let reply =
             format!("* 3 EXPUNGE\r\n* 3 EXPUNGE\r\n* 7 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n",);
-        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes()).data;
         assert_eq!(3, seqs.len());
         assert_eq!(3, seqs[0].get());
         assert_eq!(3, seqs[1].get());
@@ -208,7 +213,7 @@ mod tests {
         expect_wants_read(&mut expunge, &mut frag);
 
         let reply = format!("{tag} OK EXPUNGE completed\r\n");
-        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes());
+        let seqs = expect_complete_ok(&mut expunge, &mut frag, reply.as_bytes()).data;
         assert!(seqs.is_empty());
     }
 
@@ -228,7 +233,7 @@ mod tests {
         let ImapMailboxExpungeError::No(text) = err else {
             panic!("expected ImapMailboxExpungeError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox is read-only");
+        assert_eq!(text.text, "mailbox is read-only");
     }
 
     #[test]
@@ -276,7 +281,7 @@ mod tests {
         cor: &mut ImapMailboxExpunge,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> Vec<NonZeroU32> {
+    ) -> ImapOutput<Vec<NonZeroU32>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

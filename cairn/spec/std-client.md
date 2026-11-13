@@ -38,3 +38,17 @@ The blocking client SHALL flush its stream after each write a coroutine asks for
 
 - **WHEN** the worker holds more events than the channel takes and the stream is closed without being drained
 - **THEN** `close` returns
+
+### Requirement: The client error tells a lost connection
+
+`ImapClientError::is_connection_lost` SHALL be true when reading or writing the stream failed, when the stream ended during an exchange, whatever the depth at which the error holds it, and when the command, or a command sent while opening a session, running a watch or sorting client-side, was answered with a BYE. It SHALL be false for a refused command. A BYE answering the CAPABILITY or ID chained after a login is not reported: the next command fails on the end of the stream.
+
+#### Scenario: Stream ended while opening a session
+
+- **WHEN** the AUTHENTICATE of a session being opened reads the end of the stream
+- **THEN** the client error says the connection is lost
+
+#### Scenario: Refused COPY
+
+- **WHEN** a COPY completes with `NO mailbox does not exist`
+- **THEN** the client error says the connection is not lost

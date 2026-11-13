@@ -66,10 +66,10 @@ use crate::{coroutine::*, imap_try, send::*};
 pub enum ImapMailboxUnselectError {
     /// The server rejected the UNSELECT command with a NO response.
     #[error("IMAP UNSELECT failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the UNSELECT command with a BAD response.
     #[error("IMAP UNSELECT failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP UNSELECT failed: BYE {0}")]
     Bye(String),
@@ -132,11 +132,11 @@ impl ImapCoroutine for ImapMailboxUnselect {
                 match body.kind {
                     StatusKind::Ok => ImapCoroutineState::Complete(Ok(())),
                     StatusKind::No => {
-                        let err = ImapMailboxUnselectError::No(body.text.to_string());
+                        let err = ImapMailboxUnselectError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapMailboxUnselectError::Bad(body.text.to_string());
+                        let err = ImapMailboxUnselectError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -198,7 +198,7 @@ mod tests {
         let ImapMailboxUnselectError::No(text) = err else {
             panic!("expected ImapMailboxUnselectError::No, got {err:?}");
         };
-        assert_eq!(text, "no mailbox selected");
+        assert_eq!(text.text, "no mailbox selected");
     }
 
     #[test]
@@ -217,7 +217,7 @@ mod tests {
         let ImapMailboxUnselectError::Bad(text) = err else {
             panic!("expected ImapMailboxUnselectError::Bad, got {err:?}");
         };
-        assert_eq!(text, "UNSELECT not supported");
+        assert_eq!(text.text, "UNSELECT not supported");
     }
 
     #[test]

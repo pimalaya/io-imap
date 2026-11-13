@@ -82,10 +82,10 @@ use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 pub enum ImapAppendUidError {
     /// The server rejected the APPEND command with a NO response.
     #[error("IMAP APPEND failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the APPEND command with a BAD response.
     #[error("IMAP APPEND failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the connection with a BYE response.
     #[error("IMAP APPEND failed: BYE {0}")]
     Bye(String),
@@ -170,11 +170,11 @@ impl ImapCoroutine for ImapAppendUid {
                         ImapCoroutineState::Complete(Ok(pair))
                     }
                     StatusKind::No => {
-                        let err = ImapAppendUidError::No(body.text.to_string());
+                        let err = ImapAppendUidError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                     StatusKind::Bad => {
-                        let err = ImapAppendUidError::Bad(body.text.to_string());
+                        let err = ImapAppendUidError::Bad(body.into());
                         ImapCoroutineState::Complete(Err(err))
                     }
                 }
@@ -270,7 +270,7 @@ mod tests {
         let ImapAppendUidError::No(text) = err else {
             panic!("expected ImapAppendUidError::No, got {err:?}");
         };
-        assert_eq!(text, "mailbox is read-only");
+        assert_eq!(text.text, "mailbox is read-only");
     }
 
     #[test]

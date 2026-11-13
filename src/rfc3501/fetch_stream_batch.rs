@@ -40,7 +40,7 @@ use imap_codec::{
         core::Tag,
         error::ValidationError,
         fetch::{MacroOrMessageDataItemNames, MessageDataItemName},
-        response::StatusKind,
+        response::{StatusKind, Tagged},
         sequence::SequenceSet,
     },
 };
@@ -49,7 +49,7 @@ use thiserror::Error;
 
 use crate::{
     coroutine::*,
-    send::{ImapCompletion, decode_completion},
+    send::{ImapCompletion, ImapStatusError, decode_completion},
 };
 
 /// Failure causes during the batched FETCH body-stream flow.
@@ -57,10 +57,10 @@ use crate::{
 pub enum ImapMessageFetchStreamBatchError {
     /// The server rejected the command with a NO response.
     #[error("IMAP batched FETCH failed: NO {0}")]
-    No(String),
+    No(ImapStatusError),
     /// The server rejected the command with a BAD response.
     #[error("IMAP batched FETCH failed: BAD {0}")]
-    Bad(String),
+    Bad(ImapStatusError),
     /// The server closed the session with an untagged BYE.
     #[error("IMAP batched FETCH failed: BYE {0}")]
     Bye(String),
@@ -421,15 +421,11 @@ impl ImapMessageFetchStreamBatch {
         >,
     > {
         let result = match decode_completion(fragmentizer, &self.codec, self.tag.as_ref()?)? {
-            ImapCompletion::Tagged(tagged) => {
-                let text = tagged.body.text.to_string();
-
-                match tagged.body.kind {
-                    StatusKind::Ok => Ok(()),
-                    StatusKind::No => Err(ImapMessageFetchStreamBatchError::No(text)),
-                    StatusKind::Bad => Err(ImapMessageFetchStreamBatchError::Bad(text)),
-                }
-            }
+            ImapCompletion::Tagged(Tagged { body, .. }) => match body.kind {
+                StatusKind::Ok => Ok(()),
+                StatusKind::No => Err(ImapMessageFetchStreamBatchError::No(body.into())),
+                StatusKind::Bad => Err(ImapMessageFetchStreamBatchError::Bad(body.into())),
+            },
             ImapCompletion::Bye(bye) => {
                 Err(ImapMessageFetchStreamBatchError::Bye(bye.text.to_string()))
             }
@@ -662,7 +658,7 @@ mod tests {
         let reply = format!("{tag} NO mailbox gone\r\n");
         match cor.resume(&mut frag, Some(reply.as_bytes())) {
             ImapCoroutineState::Complete(Err(ImapMessageFetchStreamBatchError::No(t))) => {
-                assert_eq!(t, "mailbox gone")
+                assert_eq!(t.text, "mailbox gone")
             }
             s => panic!("expected No error, got {s:?}"),
         }
@@ -774,9 +770,10 @@ mod tests {
     fn completion_holding_8bit_text_is_read() {
         let reply = "A1 NO Mailbox doesn't exist: Été\r\n";
         let err = run(uid_opts(), &[reply.as_bytes()]).unwrap_err();
-        assert!(
-            matches!(err, ImapMessageFetchStreamBatchError::No(text) if text.ends_with("??t??"))
-        );
+        let ImapMessageFetchStreamBatchError::No(status) = err else {
+            panic!("expected ImapMessageFetchStreamBatchError::No, got {err:?}");
+        };
+        assert!(status.text.ends_with("??t??"));
     }
 
     #[test]

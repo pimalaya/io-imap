@@ -90,7 +90,9 @@ use log::{debug, trace};
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::{coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, send::*};
+use crate::{
+    coroutine::*, imap_try, rfc2971::id::*, rfc3501::capability::*, sasl::auth_cancel::*, send::*,
+};
 
 /// Failure causes during the SASL XOAUTH2 flow.
 #[derive(Clone, Debug, Error)]
@@ -328,7 +330,12 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                             None => {
                                 match self.resume_sasl(SaslArg::Input(&extract_challenge(cr))) {
                                     Ok(payload) => payload.unwrap_or_default(),
-                                    Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                                    Err(err) => {
+                                        let cancel = ImapAuthCancel::new(err, out.tag);
+                                        self.state = State::Cancel(cancel);
+                                        debug!("{}", self.state);
+                                        continue;
+                                    }
                                 }
                             }
                         };
@@ -396,7 +403,12 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                         let payload = match self.resume_sasl(SaslArg::Input(&extract_challenge(cr)))
                         {
                             Ok(payload) => payload.unwrap_or_default(),
-                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                            Err(err) => {
+                                let cancel = ImapAuthCancel::new(err, out.tag);
+                                self.state = State::Cancel(cancel);
+                                debug!("{}", self.state);
+                                continue;
+                            }
                         };
 
                         self.state = Self::wants_continue(payload, out.tag);
@@ -444,6 +456,7 @@ impl ImapCoroutine for ImapAuthXoauth2 {
                     let capability = mem::take(&mut self.observed);
                     return ImapCoroutineState::Complete(Ok(capability));
                 }
+                State::Cancel(cancel) => match imap_try!(cancel, fragmentizer, arg.take()) {},
                 State::Capability(capability) => {
                     self.observed = imap_try!(capability, fragmentizer, arg.take());
 
@@ -473,6 +486,7 @@ enum State {
         pending: Option<Vec<u8>>,
     },
     Continue(ImapSend<AuthenticateDataCodec>),
+    Cancel(ImapAuthCancel<ImapAuthXoauth2Error>),
     Capability(ImapCapabilityGet),
     Id(ImapServerId),
 }
@@ -484,6 +498,7 @@ impl fmt::Display for State {
             Self::Send { pending, .. } if pending.is_some() => f.write_str("send auth"),
             Self::Send { .. } => f.write_str("send auth with ir"),
             Self::Continue(_) => f.write_str("send response"),
+            Self::Cancel(_) => f.write_str("cancel auth"),
             Self::Capability(_) => f.write_str("fetch capabilities"),
             Self::Id(_) => f.write_str("send id"),
         }
@@ -613,6 +628,36 @@ mod tests {
             panic!("expected ImapAuthXoauth2Error::Mechanism, got {err:?}");
         };
         assert_eq!(json, err_json);
+    }
+
+    #[test]
+    fn ir_extra_challenge_returns_mechanism_error() {
+        let opts = ImapAuthXoauth2Options {
+            initial_request: true,
+            ..Default::default()
+        };
+
+        let mut auth = ImapAuthXoauth2::new("user@example.org", "expired-token", opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut auth, &mut frag);
+        expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut auth, &mut frag);
+
+        let (err_json_b64, _) = fake_json_error();
+        let challenge = format!("+ {err_json_b64}\r\n");
+        expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
+        expect_wants_read(&mut auth, &mut frag);
+
+        let cancel = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
+        assert_eq!(cancel, b"*\r\n");
+        expect_wants_read(&mut auth, &mut frag);
+
+        let reply = b"A1 BAD AUTHENTICATE cancelled\r\n";
+        let err = expect_complete_err(&mut auth, &mut frag, reply);
+        let ImapAuthXoauth2Error::Mechanism(SaslXoauth2Error::UnexpectedChallenge) = err else {
+            panic!("expected ImapAuthXoauth2Error::Mechanism, got {err:?}");
+        };
     }
 
     #[test]
