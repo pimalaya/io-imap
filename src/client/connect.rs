@@ -178,6 +178,7 @@ impl ImapClientStd {
                 ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => {
                     let stream = stream.as_mut().ok_or_else(missing)?;
                     stream.write_all(&bytes)?;
+                    stream.flush()?;
                 }
             }
         }

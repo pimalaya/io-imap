@@ -845,8 +845,9 @@ mod tests {
             watch.shadow.insert(uid(n), Vec::new());
         }
 
+        let whole = uid(1)..=NonZeroU32::MAX;
         let data = ImapMailboxSelectData {
-            vanished_earlier: Vec::from([uid(1)..=NonZeroU32::MAX]),
+            vanished_earlier: Vec::from([whole]),
             ..Default::default()
         };
         watch.compute_deltas(&data);

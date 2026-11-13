@@ -29,3 +29,12 @@ Extracting the base subject for the client-side sort SHALL take work linear in t
 
 - **WHEN** the base subject of 1000 `[a]` blobs followed by `x` is extracted
 - **THEN** it is `x`, after at most 3000 blob strips
+
+### Requirement: The client-side sort returns searched messages only
+
+The SORT fallback SHALL return only the ids its SEARCH matched, whatever other FETCH responses arrive while it fetches the sort keys.
+
+#### Scenario: FETCH of an unmatched message
+
+- **WHEN** the search matched UIDs 1 and 2, and the key FETCH also reads `* 3 FETCH (UID 3 FLAGS (\Seen))`
+- **THEN** the sorted ids hold 1 and 2 only

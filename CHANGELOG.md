@@ -32,7 +32,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed COPY and MOVE sorting the two COPYUID sets independently, which lost the pairing of source and destination UIDs.
 
-- Fixed a tagged completion whose text holds 8-bit bytes (Dovecot echoing a UTF-8 mailbox name in a `NO`) failing the whole exchange as a decoding error: it is decoded again with those bytes read as `?`.
+- Fixed a tagged completion whose text holds 8-bit bytes (Dovecot echoing a UTF-8 mailbox name in a `NO`) failing the whole exchange as a decoding error: it is decoded again with those bytes read as `?`, and skipped when it belongs to another command.
+
+- Fixed `rfc3501::fetch_stream::ImapMessageFetchStream` and `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch` ending on the tagged completion of another command, which read as a missing message.
+
+  They end on their own completion, and read it when its text holds 8-bit bytes.
+
+- Fixed the two FETCH body streams dropping the bytes read past their completion: they go back to the fragmentizer.
+
+- Fixed `rfc3501::logout::ImapLogout` failing when the BYE and the tagged completion arrive in two reads.
+
+- Fixed `rfc3501::fetch::ImapMessageFetchFirst` returning the data of another message when the server adds its FETCH to the response.
+
+- Fixed the client-side SORT fallback returning a message the search did not match when the server adds its FETCH to the response.
+
+- Fixed `client::ImapClientStd` never flushing its stream after a write.
 
 - Fixed `rfc3501::list::ImapMailboxList` and `rfc3501::lsub::ImapMailboxLsub` sending the pattern unencoded: it now goes out in modified UTF-7, the wildcards kept, as a quoted string, which iCloud requires for LSUB.
 
@@ -59,6 +73,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed `client::ImapClientStd::append_stream` announcing a length over 4 GiB truncated to 32 bits while streaming all of it: it fails with the new `client::ImapClientError::MessageTooLong` before writing.
 
 - Fixed the client-side SORT fallback taking quadratic time on a subject made of bracketed blobs.
+
+- Fixed `client::ImapClientStd::set_stream` keeping the bytes buffered from the previous stream, which were parsed in front of what the new one delivers: the fragmentizer starts over.
+
+### Removed
+
+- **BREAKING**: Removed `rfc3501::logout::ImapLogoutError::MissingTagged`: a LOGOUT whose BYE is followed by the end of the stream succeeds.
 
 ## [0.8.1] - 2026-11-03
 

@@ -816,6 +816,7 @@ impl ImapClient for ImapClientStd {
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
+                    self.stream.flush()?;
                     arg = None;
                 }
             }
@@ -855,8 +856,12 @@ impl ImapClientStd {
     }
 
     /// Useful after a STARTTLS upgrade or on reconnection.
+    ///
+    /// The fragmentizer starts over: bytes read from the previous
+    /// stream say nothing about this one.
     pub fn set_stream<S: ImapStream + 'static>(&mut self, stream: S) {
         self.stream = Box::new(stream);
+        self.fragmentizer = Fragmentizer::new(FRAGMENTIZER_MAX_MESSAGE_SIZE);
     }
 
     /// Consumes the client into a background watcher.
@@ -937,7 +942,7 @@ impl ImapClientStd {
                         }
                     }
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
-                        if let Err(err) = stream.write_all(&bytes) {
+                        if let Err(err) = stream.write_all(&bytes).and_then(|()| stream.flush()) {
                             tx.send(Err(err.into())).ok();
                             return;
                         }
@@ -1012,6 +1017,7 @@ impl ImapClientStd {
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
+                    self.stream.flush()?;
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::BodyChunk(bytes)) => {
@@ -1081,6 +1087,7 @@ impl ImapClientStd {
                     bytes,
                 )) => {
                     self.stream.write_all(&bytes)?;
+                    self.stream.flush()?;
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageFetchStreamBatchYield::MessageStart {
@@ -1158,6 +1165,7 @@ impl ImapClientStd {
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
                     self.stream.write_all(&bytes)?;
+                    self.stream.flush()?;
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
@@ -1294,44 +1302,92 @@ pub trait ImapStream: Read + Write + Send + Any {
 
 #[cfg(test)]
 mod tests {
+    use core::mem;
+
     use crate::client::*;
 
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn append_stream_over_u32_fails_before_writing() {
-        let mut client = ImapClientStd::new(WrittenStream(Vec::new()));
+        let mut client = ImapClientStd::new(OkStream::default());
         let mailbox = "INBOX".try_into().expect("valid mailbox");
         let len = u32::MAX as usize + 101;
 
         let res = client.append_stream(mailbox, io::empty(), len, Default::default());
         assert!(matches!(res, Err(ImapClientError::MessageTooLong(n)) if n == len));
 
-        let stream = client.stream.as_any_mut().downcast_mut::<WrittenStream>();
-        let written = &stream.expect("the stream given").0;
+        let stream = client.stream.as_any_mut().downcast_mut::<OkStream>();
+        let written = &stream.expect("the stream given").written;
         assert_eq!("", String::from_utf8_lossy(written));
     }
 
-    /// A stream keeping what is written and reading nothing.
-    struct WrittenStream(Vec<u8>);
+    #[test]
+    fn commands_are_flushed_before_reading() {
+        let mut client = ImapClientStd::new(OkStream::default());
+        let id = NonZeroU32::MIN;
 
-    impl Read for WrittenStream {
-        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
+        client.noop().expect("NOOP flushed");
+        client
+            .fetch_body_stream(id, true, io::sink())
+            .expect("FETCH flushed");
+        client
+            .fetch_bodies_stream(id.into(), true, |_| Ok(io::sink()), |_, _| Ok(()))
+            .expect("batched FETCH flushed");
+    }
+
+    #[test]
+    fn set_stream_forgets_bytes_of_the_previous_stream() {
+        let mut client = ImapClientStd::new(OkStream::default());
+        let stale = b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] ";
+        client.fragmentizer.enqueue_bytes(stale);
+        client.fragmentizer.progress();
+
+        client.set_stream(OkStream::default());
+        client.fragmentizer.enqueue_bytes(b"* 1 EXISTS\r\n");
+        client.fragmentizer.progress();
+        assert_eq!(b"* 1 EXISTS\r\n", client.fragmentizer.message_bytes());
+    }
+
+    /// A stream answering each flushed command with its `OK`, and reading
+    /// nothing while the command sits unflushed.
+    #[derive(Default)]
+    struct OkStream {
+        written: Vec<u8>,
+        unflushed: Vec<u8>,
+        flushed: Vec<u8>,
+    }
+
+    impl Read for OkStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let command = mem::take(&mut self.flushed);
+            let Some(tag) = command.split(|b| *b == b' ').next() else {
+                return Ok(0);
+            };
+
+            if tag.is_empty() {
+                return Ok(0);
+            }
+
+            let reply = [tag, b" OK done\r\n"].concat();
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
         }
     }
 
-    impl Write for WrittenStream {
+    impl Write for OkStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.extend_from_slice(buf);
+            self.written.extend_from_slice(buf);
+            self.unflushed.extend_from_slice(buf);
             Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            self.flushed.append(&mut self.unflushed);
             Ok(())
         }
     }
 
-    impl ImapStream for WrittenStream {
+    impl ImapStream for OkStream {
         fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }

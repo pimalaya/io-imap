@@ -240,6 +240,8 @@ impl ImapCoroutine for ImapMessageFetch {
 /// FETCH restricted to a single message.
 pub struct ImapMessageFetchFirst {
     state: State,
+    id: NonZeroU32,
+    uid: bool,
 }
 
 impl ImapMessageFetchFirst {
@@ -261,7 +263,11 @@ impl ImapMessageFetchFirst {
 
         let state = State::Send(ImapSend::command(body));
 
-        Self { state }
+        Self {
+            state,
+            id,
+            uid: opts.uid,
+        }
     }
 }
 
@@ -288,17 +294,30 @@ impl ImapCoroutine for ImapMessageFetchFirst {
                     return ImapCoroutineState::Complete(Err(err));
                 };
 
-                let mut output = None;
+                // NOTE: a server may add the FETCH of any other message
+                // (RFC 3501 §7.4.2), so only the requested one is taken.
+                let mut output = Vec::new();
                 for data in out.data {
-                    if let Data::Fetch { items, .. } = data {
-                        output = Some(items);
+                    let Data::Fetch { seq, items } = data else {
+                        continue;
+                    };
+
+                    let requested = if self.uid {
+                        let uid = MessageDataItem::Uid(self.id);
+                        items.as_ref().contains(&uid)
+                    } else {
+                        seq == self.id
+                    };
+
+                    if requested {
+                        output.extend(items);
                     }
                 }
 
                 match body.kind {
-                    StatusKind::Ok => match output {
-                        Some(items) => ImapCoroutineState::Complete(Ok(items)),
-                        None => {
+                    StatusKind::Ok => match Vec1::try_from(output) {
+                        Ok(items) => ImapCoroutineState::Complete(Ok(items)),
+                        Err(_) => {
                             ImapCoroutineState::Complete(Err(ImapMessageFetchError::MissingData))
                         }
                     },
@@ -464,6 +483,58 @@ mod tests {
         let reply = format!("* 42 FETCH (UID 100)\r\n{tag} OK FETCH completed\r\n");
         let items = expect_complete_ok_first(&mut fetch, &mut frag, reply.as_bytes());
         assert_eq!(1, items.as_ref().len());
+    }
+
+    #[test]
+    fn first_skips_fetch_of_another_message() {
+        let unsolicited = "* 9 FETCH (FLAGS (\\Seen))\r\n";
+
+        for (uid, requested) in [
+            (false, "* 42 FETCH (UID 100)\r\n"),
+            (true, "* 7 FETCH (UID 42)\r\n"),
+        ] {
+            let mut fetch = ImapMessageFetchFirst::new(
+                NonZeroU32::new(42).expect("non-zero"),
+                MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::All),
+                ImapMessageFetchOptions {
+                    uid,
+                    ..Default::default()
+                },
+            );
+            let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+            expect_wants_tag_first(&mut fetch, &mut frag);
+            let _ = expect_wants_write_first(&mut fetch, &mut frag, Some(b"A1"));
+            expect_wants_read_first(&mut fetch, &mut frag);
+
+            let reply = format!("{requested}{unsolicited}A1 OK FETCH completed\r\n");
+            let items = expect_complete_ok_first(&mut fetch, &mut frag, reply.as_bytes());
+            assert!(
+                matches!(items.as_ref(), [MessageDataItem::Uid(_)]),
+                "{items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_with_only_another_message_returns_missing_data_error() {
+        let mut fetch = ImapMessageFetchFirst::new(
+            NonZeroU32::new(42).expect("non-zero"),
+            MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::All),
+            ImapMessageFetchOptions {
+                uid: true,
+                ..Default::default()
+            },
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag_first(&mut fetch, &mut frag);
+        let _ = expect_wants_write_first(&mut fetch, &mut frag, Some(b"A1"));
+        expect_wants_read_first(&mut fetch, &mut frag);
+
+        let reply = b"* 9 FETCH (FLAGS (\\Seen))\r\nA1 OK FETCH completed\r\n";
+        let err = expect_complete_err_first(&mut fetch, &mut frag, reply);
+        assert!(matches!(err, ImapMessageFetchError::MissingData));
     }
 
     #[test]

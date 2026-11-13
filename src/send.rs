@@ -129,6 +129,7 @@ pub struct ImapSend<T: Encoder> {
     /// Bounds on the untagged responses collected before the completion.
     pub budget: ImapSendBudget,
     octets: usize,
+    logout: bool,
 }
 
 impl<T: Encoder> ImapSend<T> {
@@ -162,6 +163,7 @@ impl<T: Encoder> ImapSend<T> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
+            logout: false,
         }
     }
 
@@ -195,28 +197,7 @@ impl<T: Encoder> ImapSend<T> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
-        }
-    }
-
-    /// The completion of this command when `bytes` only fails to decode
-    /// for the 8-bit bytes of its text, which IMAP4rev1 keeps ASCII but
-    /// servers send (Dovecot echoes a UTF-8 mailbox name in a `NO`): it
-    /// is decoded again with each of them read as `?`.
-    fn lossy_completion(&self, bytes: &[u8]) -> Option<Tagged<'static>> {
-        use imap_codec::decode::Decoder;
-
-        let ascii: Vec<u8> = bytes
-            .iter()
-            .map(|&byte| if byte.is_ascii() { byte } else { b'?' })
-            .collect();
-
-        match self.codec.decode(&ascii) {
-            Ok((_, Response::Status(Status::Tagged(tagged))))
-                if Some(&tagged.tag) == self.tag.as_ref() =>
-            {
-                Some(tagged.into_static())
-            }
-            _ => None,
+            logout: false,
         }
     }
 
@@ -309,6 +290,10 @@ impl<T: Encoder> ImapSend<T> {
                     self.state = State::Read;
                 }
                 State::Read => match arg.take() {
+                    Some(&[]) if self.logout && self.bye.is_some() => {
+                        self.done = true;
+                        self.state = State::Deserialize;
+                    }
                     Some(&[]) => {
                         return ImapSendResult::Err(ImapSendError::Eof);
                     }
@@ -362,7 +347,7 @@ impl<T: Encoder> ImapSend<T> {
                             }
                             Ok(Response::Status(Status::Bye(bye))) => {
                                 self.bye.replace(bye.into_static());
-                                self.done = true;
+                                self.done = !self.logout;
                             }
                             Ok(Response::CommandContinuationRequest(cr)) => {
                                 self.cr.replace(cr.into_static());
@@ -384,7 +369,17 @@ impl<T: Encoder> ImapSend<T> {
                                             continue;
                                         }
 
-                                        if let Some(tagged) = self.lossy_completion(bytes) {
+                                        if let Some(tagged) =
+                                            decode_lossy_tagged(&self.codec, bytes)
+                                        {
+                                            if Some(&tagged.tag) != self.tag.as_ref() {
+                                                debug!(
+                                                    "skipping tagged response of another command"
+                                                );
+                                                trace!("tag: {}", tagged.tag.as_ref());
+                                                continue;
+                                            }
+
                                             debug!("read a completion holding 8-bit text");
                                             self.tagged.replace(tagged);
                                             self.done = true;
@@ -445,6 +440,10 @@ impl ImapSend<CommandCodec> {
     /// first resume yields `WantsTag`, and the command is serialised
     /// once resumed with the tag.
     pub fn command(body: CommandBody<'static>) -> Self {
+        // NOTE: the BYE of a LOGOUT precedes its completion (RFC 3501
+        // §6.1.3), so it does not end the exchange as it does elsewhere.
+        let logout = matches!(body, CommandBody::Logout);
+
         Self {
             encoder: CommandCodec::new(),
             message: None,
@@ -468,8 +467,62 @@ impl ImapSend<CommandCodec> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
+            logout,
         }
     }
+}
+
+/// What ends the exchange of the command tagged `tag`, read from the
+/// complete message in `fragmentizer`: its tagged completion, or a BYE.
+///
+/// A completion of another command and any other response give `None`.
+/// Shared by the coroutines reading their response line by line.
+pub(crate) fn decode_completion(
+    fragmentizer: &Fragmentizer,
+    codec: &ResponseCodec,
+    tag: &Tag<'_>,
+) -> Option<ImapCompletion> {
+    let tagged = match fragmentizer.decode_message(codec) {
+        Ok(Response::Status(Status::Tagged(tagged))) => tagged.into_static(),
+        Ok(Response::Status(Status::Bye(bye))) => {
+            return Some(ImapCompletion::Bye(bye.into_static()));
+        }
+        Ok(_) => return None,
+        Err(_) => decode_lossy_tagged(codec, fragmentizer.message_bytes())?,
+    };
+
+    if tagged.tag != *tag {
+        debug!("skipping tagged response of another command");
+        trace!("tag: {}", tagged.tag.as_ref());
+        return None;
+    }
+
+    Some(ImapCompletion::Tagged(tagged))
+}
+
+/// The tagged completion `bytes` hold when they only fail to decode for
+/// the 8-bit bytes of its text, which IMAP4rev1 keeps ASCII but servers
+/// send: it is decoded again with each of them read as `?`.
+pub(crate) fn decode_lossy_tagged(codec: &ResponseCodec, bytes: &[u8]) -> Option<Tagged<'static>> {
+    use imap_codec::decode::Decoder;
+
+    let ascii: Vec<u8> = bytes
+        .iter()
+        .map(|&byte| if byte.is_ascii() { byte } else { b'?' })
+        .collect();
+
+    match codec.decode(&ascii) {
+        Ok((_, Response::Status(Status::Tagged(tagged)))) => Some(tagged.into_static()),
+        _ => None,
+    }
+}
+
+/// The response ending an exchange read line by line.
+pub(crate) enum ImapCompletion {
+    /// The tagged completion of the command.
+    Tagged(Tagged<'static>),
+    /// The BYE closing the session.
+    Bye(Bye<'static>),
 }
 
 /// A command body waiting for its tag, with the conversion from the
@@ -634,6 +687,30 @@ mod tests {
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!(StatusKind::No, tagged.body.kind);
         assert!(tagged.body.text.as_ref().ends_with("exist: ??t??"));
+    }
+
+    #[test]
+    fn a_foreign_completion_holding_8bit_text_is_skipped() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let foreign = "B9 NO [NONEXISTENT] Mailbox doesn't exist: Été\r\n";
+        assert!(matches!(
+            send.resume(&mut frag, Some(foreign.as_bytes())),
+            ImapSendResult::WantsRead
+        ));
+
+        let reply = b"A1 OK NOOP completed\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply)) else {
+            panic!("expected Ok");
+        };
+
+        let tagged = out.tagged.expect("tagged completion");
+        assert_eq!(StatusKind::Ok, tagged.body.kind);
     }
 
     #[test]

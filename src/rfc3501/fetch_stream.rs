@@ -80,7 +80,7 @@
 //! println!("fetched {} body octets", sink.len());
 //! ```
 
-use core::{fmt, num::NonZeroU32};
+use core::{fmt, mem, num::NonZeroU32};
 
 use alloc::{string::String, string::ToString, vec, vec::Vec};
 
@@ -94,14 +94,18 @@ use imap_codec::{
         core::Tag,
         error::ValidationError,
         fetch::{MacroOrMessageDataItemNames, MessageDataItemName},
-        response::{Response, Status, StatusKind},
+        response::StatusKind,
         sequence::{SeqOrUid, SequenceSet},
     },
 };
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{coroutine::*, rfc3501::fetch_stream_batch::DEFAULT_MAX_LITERAL_LEN};
+use crate::{
+    coroutine::*,
+    rfc3501::fetch_stream_batch::DEFAULT_MAX_LITERAL_LEN,
+    send::{ImapCompletion, decode_completion},
+};
 
 /// Failure causes during the IMAP FETCH body-stream flow.
 #[derive(Clone, Debug, Error)]
@@ -200,6 +204,7 @@ pub struct ImapMessageFetchStream {
     state: State,
     body: Option<CommandBody<'static>>,
     tag_requested: bool,
+    tag: Option<Tag<'static>>,
     pending: Vec<u8>,
     scanned: usize,
     remaining: u32,
@@ -236,6 +241,7 @@ impl ImapMessageFetchStream {
             state: State::SendCommand,
             body: Some(body),
             tag_requested: false,
+            tag: None,
             pending: Vec::new(),
             scanned: 0,
             remaining: 0,
@@ -266,6 +272,8 @@ impl ImapCoroutine for ImapMessageFetchStream {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
                         };
+
+                        self.tag = Some(tag.clone());
 
                         let body = self.body.take().expect("command tagged once");
                         let command = CommandCodec::new().encode(&Command { tag, body }).dump();
@@ -453,31 +461,32 @@ impl ImapMessageFetchStream {
 
     /// Decodes the completed message in `fragmentizer`.
     ///
-    /// Returns `Some` for a terminal tagged status or BYE; `None` for
-    /// undecodable or untagged lines that should be skipped (the literal
-    /// close `)`, stray untagged data).
+    /// Returns `Some` for the tagged status of the command or a BYE;
+    /// `None` for the lines to skip (the literal close `)`, untagged
+    /// data, the completion of another command).
     fn decode_terminal(
-        &self,
-        fragmentizer: &Fragmentizer,
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
     ) -> Option<
         ImapCoroutineState<ImapMessageFetchStreamYield, Result<(), ImapMessageFetchStreamError>>,
     > {
-        match fragmentizer.decode_message(&self.codec) {
-            Ok(Response::Status(Status::Tagged(tagged))) => {
+        let result = match decode_completion(fragmentizer, &self.codec, self.tag.as_ref()?)? {
+            ImapCompletion::Tagged(tagged) => {
                 let text = tagged.body.text.to_string();
-                let result = match tagged.body.kind {
+
+                match tagged.body.kind {
                     StatusKind::Ok => Ok(()),
                     StatusKind::No => Err(ImapMessageFetchStreamError::No(text)),
                     StatusKind::Bad => Err(ImapMessageFetchStreamError::Bad(text)),
-                };
-                Some(ImapCoroutineState::Complete(result))
+                }
             }
-            Ok(Response::Status(Status::Bye(bye))) => {
-                let err = ImapMessageFetchStreamError::Bye(bye.text.to_string());
-                Some(ImapCoroutineState::Complete(Err(err)))
-            }
-            _ => None,
-        }
+            ImapCompletion::Bye(bye) => Err(ImapMessageFetchStreamError::Bye(bye.text.to_string())),
+        };
+
+        // NOTE: what was read past the end belongs to the next exchange.
+        fragmentizer.enqueue_bytes(&mem::take(&mut self.pending));
+
+        Some(ImapCoroutineState::Complete(result))
     }
 }
 
@@ -690,6 +699,48 @@ mod tests {
             panic!("expected LiteralTooLong, got {err:?}");
         };
         assert_eq!((len, max), (4294967295, DEFAULT_MAX_LITERAL_LEN));
+    }
+
+    #[test]
+    fn foreign_completion_is_skipped() {
+        let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), uid_opts());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut cor, &mut frag);
+        let _ = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut cor, &mut frag, None);
+        expect_wants_read(&mut cor, &mut frag, Some(b"B9 OK stale\r\n"));
+
+        let err = expect_complete_err(&mut cor, &mut frag, Some(b"A1 NO gone\r\n"));
+        assert!(matches!(err, ImapMessageFetchStreamError::No(text) if text == "gone"));
+    }
+
+    #[test]
+    fn completion_holding_8bit_text_is_read() {
+        let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), uid_opts());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut cor, &mut frag);
+        let _ = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut cor, &mut frag, None);
+
+        let reply = "A1 NO Mailbox doesn't exist: Été\r\n";
+        let err = expect_complete_err(&mut cor, &mut frag, Some(reply.as_bytes()));
+        assert!(matches!(err, ImapMessageFetchStreamError::No(text) if text.ends_with("??t??")));
+    }
+
+    #[test]
+    fn bytes_past_completion_return_to_fragmentizer() {
+        let mut cor = ImapMessageFetchStream::new(NonZeroU32::new(1).unwrap(), uid_opts());
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut cor, &mut frag);
+        let _ = expect_wants_write(&mut cor, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut cor, &mut frag, None);
+        expect_complete_ok(&mut cor, &mut frag, Some(b"A1 OK done\r\n* BYE bye\r\n"));
+
+        assert!(frag.progress().is_some());
+        assert_eq!(b"* BYE bye\r\n", frag.message_bytes());
     }
 
     #[test]

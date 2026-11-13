@@ -74,7 +74,12 @@
 
 use core::{cmp::Ordering, fmt, mem, num::NonZeroU32, str::from_utf8};
 
-use alloc::{collections::BTreeMap, string::String, string::ToString, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    string::ToString,
+    vec::Vec,
+};
 
 use chrono::{DateTime, FixedOffset};
 
@@ -162,6 +167,7 @@ pub struct ImapMessageSort {
     sort_criteria: Vec1<SortCriterion>,
     items: Vec<MessageDataItemName<'static>>,
     remaining: Vec<NonZeroU32>,
+    searched: BTreeSet<NonZeroU32>,
     fetched: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>,
 }
 
@@ -202,6 +208,7 @@ impl ImapMessageSort {
             sort_criteria,
             items,
             remaining: Vec::new(),
+            searched: BTreeSet::new(),
             fetched: BTreeMap::new(),
         }
     }
@@ -274,7 +281,12 @@ impl ImapMessageSort {
             Ordering::Equal
         });
 
-        entries.into_iter().filter_map(|(id, _)| id).collect()
+        // NOTE: a server may add the FETCH of a message the search did
+        // not match (RFC 3501 §7.4.2).
+        let searched = &self.searched;
+        let ids = entries.into_iter().filter_map(|(id, _)| id);
+
+        ids.filter(|id| searched.contains(id)).collect()
     }
 }
 
@@ -329,6 +341,7 @@ impl ImapCoroutine for ImapMessageSort {
                 }
                 State::Search(search) => {
                     self.remaining = imap_try!(search, fragmentizer, arg.take());
+                    self.searched = self.remaining.iter().copied().collect();
 
                     match self.next_fetch() {
                         Ok(Some(fetch)) => {
@@ -957,6 +970,32 @@ mod tests {
         );
         let ids = complete_ok(&mut sort, &mut frag, Some(fetch_reply.as_bytes()));
         assert_eq!(vec![nz(1), nz(2)], ids);
+    }
+
+    #[test]
+    fn fallback_leaves_out_messages_the_search_did_not_match() {
+        let opts = ImapMessageSortOptions {
+            uid: true,
+            fallback: true,
+        };
+        let mut sort = ImapMessageSort::new(arrival(), search_criteria(), opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        wants_tag(&mut sort, &mut frag, None);
+        let _ = wants_write(&mut sort, &mut frag, Some(b"A1"));
+        wants_read(&mut sort, &mut frag, None);
+
+        let search_reply = b"* SEARCH 1 2\r\nA1 OK SEARCH completed\r\n";
+        wants_tag(&mut sort, &mut frag, Some(search_reply));
+        let _ = wants_write(&mut sort, &mut frag, Some(b"A2"));
+        wants_read(&mut sort, &mut frag, None);
+
+        let fetch_reply = b"* 1 FETCH (UID 1 INTERNALDATE \"02-Feb-2021 00:00:00 +0000\")\r\n\
+             * 2 FETCH (UID 2 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\")\r\n\
+             * 3 FETCH (UID 3 FLAGS (\\Seen))\r\n\
+             A2 OK FETCH completed\r\n";
+        let ids = complete_ok(&mut sort, &mut frag, Some(fetch_reply));
+        assert_eq!(vec![nz(2), nz(1)], ids);
     }
 
     #[test]

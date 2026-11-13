@@ -70,9 +70,6 @@ pub enum ImapLogoutError {
     /// The server rejected the command with a BAD response.
     #[error("IMAP LOGOUT failed: BAD {0}")]
     Bad(String),
-    /// The exchange ended without a tagged response from the server.
-    #[error("IMAP LOGOUT failed: server did not return a tagged response")]
-    MissingTagged,
     /// The server completed LOGOUT without the mandatory untagged BYE.
     #[error("IMAP LOGOUT failed: server did not send the expected BYE")]
     MissingBye,
@@ -122,8 +119,9 @@ impl ImapCoroutine for ImapLogout {
                     return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingBye));
                 }
 
+                // NOTE: a server closing right after its BYE has logged out.
                 let Some(Tagged { body, .. }) = out.tagged else {
-                    return ImapCoroutineState::Complete(Err(ImapLogoutError::MissingTagged));
+                    return ImapCoroutineState::Complete(Ok(()));
                 };
 
                 match body.kind {
@@ -177,6 +175,40 @@ mod tests {
 
         let reply = format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n");
         expect_complete_ok(&mut logout, &mut frag, reply.as_bytes());
+    }
+
+    #[test]
+    fn bye_and_completion_in_two_reads_return_ok() {
+        let mut logout = ImapLogout::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut logout, &mut frag);
+        let _ = expect_wants_write(&mut logout, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut logout, &mut frag);
+
+        match logout.resume(&mut frag, Some(b"* BYE bye\r\n")) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+
+        expect_complete_ok(&mut logout, &mut frag, b"A1 OK LOGOUT completed\r\n");
+    }
+
+    #[test]
+    fn bye_then_eof_returns_ok() {
+        let mut logout = ImapLogout::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut logout, &mut frag);
+        let _ = expect_wants_write(&mut logout, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut logout, &mut frag);
+
+        match logout.resume(&mut frag, Some(b"* BYE bye\r\n")) {
+            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+
+        expect_complete_ok(&mut logout, &mut frag, b"");
     }
 
     #[test]
