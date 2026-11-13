@@ -44,9 +44,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added the `EmptyNonce` variant to `rfc7677::auth_scram_sha_256::ImapAuthScramSha256Error`.
 
+- Added `scram` to `rfc7677::auth_scram_sha_256::ImapAuthScramSha256Options` and `session::ImapSessionOpenOptions`, the `SaslScramOptions` of io-sasl.
+
+  Its `min_iterations` (4096 by default) and `max_iterations` (five million by default) bound the iteration count a SCRAM server may announce. `client::ImapClientStd::connect` takes it through its session options.
+
 ### Changed
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
+
+- **BREAKING**: Changed the io-sasl dependency to 0.2.
+
+  Its error enums, carried by the `Mechanism` variant of the AUTHENTICATE errors, gained variants.
+
+- **BREAKING**: Changed AUTHENTICATE PLAIN and SCRAM-SHA-256 to prepare their credentials with SASLprep, which io-sasl 0.1 did under a feature this crate left off.
+
+  A password that SASLprep alters is sent, or derived from, in its prepared form. A credential holding a prohibited code point fails with the `Preparation` error of the mechanism.
 
 - **BREAKING**: Changed the `No` and `Bad` variants of every command error but `rfc3501::starttls::ImapStartTlsError` to carry a `send::ImapStatusError` instead of the text.
 
@@ -161,6 +173,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed the URL errors of `session::ImapSessionTransport::from_url` printing the whole URL, userinfo included.
 
 - Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` accepting an empty client nonce, which any server nonce extends.
+
+- Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` accepting a client nonce shorter than 18 bytes, or holding a comma or a byte outside printable ASCII.
+
+  Its first resume fails with the `InvalidNonce` error of the mechanism, before anything is written.
+
+- Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` deriving its key for whatever iteration count the server announced.
+
+  A count outside the bounds of the `scram` options cancels the exchange and fails with the `IterationCountTooLow` or `IterationCountTooHigh` error of the mechanism, before the derivation runs.
 
 ### Removed
 

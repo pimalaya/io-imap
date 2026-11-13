@@ -99,7 +99,7 @@ use imap_codec::{
 use io_sasl::{
     coroutine::*,
     mechanism::SaslMechanism,
-    rfc5802::{SaslScramCreds, SaslScramError},
+    rfc5802::{SaslScramCreds, SaslScramError, SaslScramOptions},
     rfc7677::scram_sha_256::SaslScramSha256,
 };
 use log::{debug, trace};
@@ -171,6 +171,10 @@ pub struct ImapAuthScramSha256Options {
     ///
     /// Defaults to `None` (no ID); an empty list sends ID NIL.
     pub auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
+    /// The bounds on the iteration count the server may announce.
+    ///
+    /// Defaults to those of io-sasl, 4096 to five million.
+    pub scram: SaslScramOptions,
 }
 
 /// I/O-free SASL SCRAM-SHA-256 coroutine.
@@ -190,7 +194,8 @@ impl ImapAuthScramSha256 {
     /// rather than something drawn here, an I/O-free coroutine having
     /// no source of randomness, and it makes the exchange
     /// deterministically testable. An empty one fails with `EmptyNonce`:
-    /// any server nonce would extend it.
+    /// any server nonce would extend it. One shorter than 18 bytes or
+    /// outside that alphabet fails the first resume with `InvalidNonce`.
     ///
     /// They also carry the channel binding, which decides whether the
     /// exchange announces `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`. This
@@ -208,9 +213,11 @@ impl ImapAuthScramSha256 {
             return Err(ImapAuthScramSha256Error::EmptyNonce);
         }
 
+        let mechanism = SaslScramSha256::new(creds, opts.scram.clone());
+
         Ok(Self {
             state: State::Start,
-            mechanism: SaslScramSha256::new(creds),
+            mechanism,
             observed: Vec::new(),
             opts,
         })
@@ -589,6 +596,24 @@ mod tests {
     }
 
     #[test]
+    fn short_nonce_fails_the_first_resume() {
+        let creds = SaslScramCreds {
+            nonce: b"fyko+d2lbbFgONRv9".to_vec(),
+            ..creds()
+        };
+        let opts = ImapAuthScramSha256Options::default();
+        let mut auth = ImapAuthScramSha256::new(creds, opts).expect("nonce given");
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        match auth.resume(&mut frag, None) {
+            ImapCoroutineState::Complete(Err(ImapAuthScramSha256Error::Mechanism(
+                SaslScramError::InvalidNonce,
+            ))) => {}
+            state => panic!("expected InvalidNonce, got {state:?}"),
+        }
+    }
+
+    #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options {
             initial_request: true,
@@ -812,6 +837,43 @@ mod tests {
             panic!("expected ImapAuthScramSha256Error::Mechanism, got {err:?}");
         };
         assert_eq!(text, "invalid-proof");
+    }
+
+    #[test]
+    fn iteration_count_above_the_ceiling_cancels_without_deriving() {
+        let opts = ImapAuthScramSha256Options {
+            scram: SaslScramOptions {
+                max_iterations: Some(8192),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut auth, &mut frag);
+        expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut auth, &mut frag);
+        expect_wants_write(&mut auth, &mut frag, Some(b"+ \r\n"));
+        expect_wants_read(&mut auth, &mut frag);
+
+        let nonce = str::from_utf8(NONCE).expect("ascii nonce");
+        let server_first = format!("r={nonce}ServerExtra,s={SALT_B64},i=8193");
+        let challenge = format!("+ {}\r\n", encode(&server_first));
+        let cancel = expect_wants_write(&mut auth, &mut frag, Some(challenge.as_bytes()));
+        assert_eq!(cancel, b"*\r\n");
+        expect_wants_read(&mut auth, &mut frag);
+
+        let reply = b"A1 BAD AUTHENTICATE cancelled\r\n";
+        let err = expect_complete_err(&mut auth, &mut frag, reply);
+        let ImapAuthScramSha256Error::Mechanism(SaslScramError::IterationCountTooHigh {
+            count: 8193,
+            max: 8192,
+        }) = err
+        else {
+            panic!("expected IterationCountTooHigh, got {err:?}");
+        };
     }
 
     const SALT_B64: &str = "QSXCR+Q6sek8bf92";

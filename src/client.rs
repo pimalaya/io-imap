@@ -579,11 +579,11 @@ macro_rules! imap_client_commands {
 
             /// SASL `AUTHENTICATE SCRAM-SHA-256`.
             ///
-            /// The credentials carry the client nonce, which RFC 5802
-            /// wants drawn from at least 18 bytes of cryptographic
-            /// randomness and which must not be empty, and the channel
-            /// binding deciding whether the exchange announces
-            /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
+            /// The credentials carry the client nonce, at least 18 bytes
+            /// of printable ASCII without commas drawn from a
+            /// cryptographic source, and the channel binding deciding
+            /// whether the exchange announces `SCRAM-SHA-256` or
+            /// `SCRAM-SHA-256-PLUS`.
             #[cfg(feature = "scram")]
             fn auth_scram_sha256(
                 &mut self,
@@ -681,11 +681,11 @@ macro_rules! imap_client_commands {
 
             /// SASL `AUTHENTICATE SCRAM-SHA-256`.
             ///
-            /// The credentials carry the client nonce, which RFC 5802
-            /// wants drawn from at least 18 bytes of cryptographic
-            /// randomness and which must not be empty, and the channel
-            /// binding deciding whether the exchange announces
-            /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
+            /// The credentials carry the client nonce, at least 18 bytes
+            /// of printable ASCII without commas drawn from a
+            /// cryptographic source, and the channel binding deciding
+            /// whether the exchange announces `SCRAM-SHA-256` or
+            /// `SCRAM-SHA-256-PLUS`.
             #[cfg(feature = "scram")]
             fn auth_scram_sha256(
                 &mut self,

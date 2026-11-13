@@ -89,6 +89,8 @@ use imap_codec::{
         response::Capability,
     },
 };
+#[cfg(feature = "scram")]
+use io_sasl::rfc5802::SaslScramOptions;
 use io_sasl::{
     login::SaslLoginCreds,
     mechanism::{Sasl, SaslMechanism},
@@ -277,6 +279,11 @@ pub struct ImapSessionOpenOptions {
     /// (126.com, 163.com) advertises it falsely, and no capability
     /// inspection can predict that.
     pub sasl_ir: Option<bool>,
+    /// The bounds on the iteration count a SCRAM server may announce.
+    ///
+    /// Defaults to those of io-sasl, 4096 to five million.
+    #[cfg(feature = "scram")]
+    pub scram: SaslScramOptions,
 }
 
 /// An opened IMAP session.
@@ -479,6 +486,7 @@ impl ImapSessionOpen {
                     initial_request,
                     ensure_capabilities,
                     auto_id,
+                    scram: self.opts.scram.clone(),
                 };
 
                 Auth::ScramSha256(ImapAuthScramSha256::new(creds, opts)?)
@@ -909,6 +917,82 @@ mod tests {
         match session.resume(&mut frag, Some(reply.as_bytes())) {
             ImapCoroutineState::Complete(Err(ImapSessionOpenError::StartTlsInjection)) => {}
             state => panic!("expected StartTlsInjection, got {state:?}"),
+        }
+    }
+
+    #[cfg(feature = "scram")]
+    #[test]
+    fn scram_iteration_ceiling_reaches_the_mechanism() {
+        use base64_codec::codec::Base64Codec;
+        use io_sasl::{
+            rfc5801::SaslGs2ChannelBinding,
+            rfc5802::{SaslScramCreds, SaslScramError},
+        };
+
+        let transport = ImapSessionTransport::Tcp {
+            host: "localhost".to_string(),
+            port: 143,
+        };
+
+        let sasl = Sasl::ScramSha256(SaslScramCreds {
+            username: "alice".to_string(),
+            password: "secret".to_string().into(),
+            nonce: b"fyko+d2lbbFgONRv9qkxdawL".to_vec(),
+            channel_binding: SaslGs2ChannelBinding::Unsupported,
+        });
+
+        let opts = ImapSessionOpenOptions {
+            sasl_ir: Some(true),
+            scram: SaslScramOptions {
+                max_iterations: Some(8192),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut session = ImapSessionOpen::new(transport, Some(sasl), opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        session.resume(&mut frag, None);
+        session.resume(&mut frag, None);
+
+        let greeting = b"* OK [CAPABILITY IMAP4REV1 AUTH=SCRAM-SHA-256] server ready\r\n";
+        assert!(matches!(
+            session.resume(&mut frag, Some(greeting)),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsTag)
+        ));
+        assert!(matches!(
+            session.resume(&mut frag, Some(b"A1")),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(_))
+        ));
+        assert!(matches!(
+            session.resume(&mut frag, None),
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsRead)
+        ));
+
+        let server_first = b"r=fyko+d2lbbFgONRv9qkxdawLServerExtra,s=QSXCR+Q6sek8bf92,i=8193";
+        let mut challenge = b"+ ".to_vec();
+        Base64Codec::default().encode_vec(server_first, &mut challenge);
+        challenge.extend_from_slice(b"\r\n");
+
+        match session.resume(&mut frag, Some(&challenge)) {
+            ImapCoroutineState::Yielded(ImapSessionOpenYield::WantsWrite(bytes)) => {
+                assert_eq!(bytes, b"*\r\n");
+            }
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+
+        session.resume(&mut frag, None);
+
+        let reply = b"A1 BAD AUTHENTICATE cancelled\r\n";
+        match session.resume(&mut frag, Some(reply)) {
+            ImapCoroutineState::Complete(Err(ImapSessionOpenError::AuthScramSha256(
+                ImapAuthScramSha256Error::Mechanism(SaslScramError::IterationCountTooHigh {
+                    count: 8193,
+                    max: 8192,
+                }),
+            ))) => {}
+            state => panic!("expected IterationCountTooHigh, got {state:?}"),
         }
     }
 

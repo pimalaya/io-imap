@@ -255,9 +255,37 @@ The errors of `ImapSessionTransport::from_url` SHALL hold and print the scheme, 
 
 ### Requirement: A SCRAM exchange needs a client nonce
 
-`ImapAuthScramSha256::new` SHALL fail with `EmptyNonce` on credentials carrying an empty client nonce, as SHALL a session opened with them. Only `ImapClientStd::connect` draws a nonce for credentials left without one.
+`ImapAuthScramSha256::new` SHALL fail with `EmptyNonce` on credentials carrying an empty client nonce, as SHALL a session opened with them. A nonce shorter than 18 bytes, or holding a comma or a byte outside printable ASCII, SHALL fail the first resume with the `InvalidNonce` error of the mechanism. Only `ImapClientStd::connect` draws a nonce for credentials left without one.
 
 #### Scenario: Empty nonce
 
 - **WHEN** the coroutine is built from credentials whose nonce is empty
 - **THEN** the constructor fails with `EmptyNonce`, and nothing is written
+
+#### Scenario: Short nonce
+
+- **WHEN** the coroutine is built from credentials whose nonce holds 17 bytes and is resumed
+- **THEN** it fails with `InvalidNonce`, and nothing is written
+
+### Requirement: A SCRAM iteration count is bounded
+
+The SCRAM-SHA-256 coroutine SHALL refuse a server-first-message whose iteration count lies outside the bounds of its `scram` options, 4096 to five million by default, before deriving a key: it cancels the exchange and fails with the `IterationCountTooLow` or `IterationCountTooHigh` error of the mechanism. `ImapSessionOpenOptions` SHALL carry the same options to the coroutine, which is how `ImapClientStd::connect` takes them.
+
+#### Scenario: Count above the ceiling
+
+- **WHEN** the options set a ceiling of 8192 and the server announces `i=8193`
+- **THEN** the coroutine writes `*`, reads the tagged reply, and fails with `IterationCountTooHigh`
+
+#### Scenario: Ceiling set on the session
+
+- **WHEN** a session opened with a ceiling of 8192 authenticates with SCRAM-SHA-256 and the server announces `i=8193`
+- **THEN** the session writes `*`, reads the tagged reply, and fails with `IterationCountTooHigh`
+
+### Requirement: PLAIN and SCRAM credentials are prepared
+
+AUTHENTICATE PLAIN and SCRAM-SHA-256 SHALL send, or derive from, the SASLprep form (RFC 4013) of their credentials in every build, and fail with the `Preparation` error of the mechanism on a credential holding a prohibited code point.
+
+#### Scenario: Password altered by preparation
+
+- **WHEN** an AUTHENTICATE PLAIN is given a password holding a soft hyphen (U+00AD)
+- **THEN** the password goes out without it

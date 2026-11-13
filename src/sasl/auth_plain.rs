@@ -525,6 +525,23 @@ mod tests {
     }
 
     #[test]
+    fn ir_password_goes_out_prepared() {
+        let opts = ImapAuthPlainOptions {
+            initial_request: true,
+            ..Default::default()
+        };
+
+        let mut auth = ImapAuthPlain::new(None::<&str>, "alice", "sec\u{ad}ret", opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut auth, &mut frag);
+        let bytes = expect_wants_write(&mut auth, &mut frag, Some(b"A1"));
+
+        // NOTE: the base64 of `\0alice\0secret`, the soft hyphen gone.
+        assert_eq!(bytes, b"A1 AUTHENTICATE PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+    }
+
+    #[test]
     fn ir_success_without_capability_fetches_capability() {
         let opts = ImapAuthPlainOptions {
             initial_request: true,
