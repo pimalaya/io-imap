@@ -6,11 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `send::ImapSendBudget`, the bounds on the untagged responses one exchange collects, set through `send::ImapSend::budget`.
+
+  16,777,216 responses and 1 GiB by default; `ImapSendBudget::PRE_AUTH` (1024 responses, 1 MiB) for CAPABILITY, ID, LOGIN and AUTHENTICATE.
+
+- Added `rfc3501::raw::ImapRaw::max_response_len`, 1 GiB by default.
+
+- Added `rfc3501::fetch_stream::ImapMessageFetchStreamOptions`.
+
+  Its `max_literal_len` (100 MiB by default) and `size` bound the body a server may announce.
+
 ### Changed
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
 
+- **BREAKING**: Changed `rfc3501::copy::ImapCopyUid` to a struct keeping the two COPYUID sets as inclusive UID ranges, in the order of the code.
+
+  `pairs` iterates over the `(source, destination)` UIDs and `count` gives their number. COPY and MOVE return `Option<ImapCopyUid>`.
+
+- **BREAKING**: Changed `rfc3501::fetch_stream::ImapMessageFetchStream::new` to take `(id, opts)`, the `uid` flag moving into its options.
+
 ### Fixed
+
+- Fixed COPY and MOVE sorting the two COPYUID sets independently, which lost the pairing of source and destination UIDs.
 
 - Fixed a tagged completion whose text holds 8-bit bytes (Dovecot echoing a UTF-8 mailbox name in a `NO`) failing the whole exchange as a decoding error: it is decoded again with those bytes read as `?`.
 
@@ -23,6 +43,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed `send::ImapSend` writing a synchronising literal before the server's continuation request.
 
   The literal goes out only once a `+` line is decoded, so a command refused before its literal (an APPEND over quota) no longer sends it to a server reading command lines.
+
+- Fixed an exchange collecting untagged responses without bound while waiting for its completion.
+
+  Past its budget `send::ImapSend` fails with the new `ResponseTooLong` error, as does `rfc3501::raw::ImapRaw` past `max_response_len`.
+
+- Fixed COPY and MOVE expanding a COPYUID set into one entry per UID.
+
+  A server announcing `1:4294967295` made the client allocate about 16 GiB per set. The sets are kept as ranges, and a COPYUID whose sets differ in length is dropped.
+
+- Fixed `rfc3501::fetch_stream::ImapMessageFetchStream` streaming a body of any announced length: past its bound it fails with the new `LiteralTooLong` error.
+
+- Fixed `rfc3501::fetch_stream_batch::ImapMessageFetchStreamBatch` streaming the body of one UID any number of times: a repeat fails with the new `UidRepeated` error.
+
+- Fixed `client::ImapClientStd::append_stream` announcing a length over 4 GiB truncated to 32 bits while streaming all of it: it fails with the new `client::ImapClientError::MessageTooLong` before writing.
+
+- Fixed the client-side SORT fallback taking quadratic time on a subject made of bracketed blobs.
 
 ## [0.8.1] - 2026-11-03
 

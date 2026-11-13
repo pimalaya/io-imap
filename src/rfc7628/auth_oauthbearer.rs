@@ -248,7 +248,10 @@ impl ImapAuthOauthbearer {
     fn wants_continue(payload: Vec<u8>, tag: Tag<'static>) -> State {
         let auth = AuthenticateData::r#continue(payload);
         let codec = AuthenticateDataCodec::new();
-        State::Continue(ImapSend::new(codec, auth, tag))
+        let mut send = ImapSend::new(codec, auth, tag);
+        send.budget = ImapSendBudget::PRE_AUTH;
+
+        State::Continue(send)
     }
 
     // helper that resumes SASL coroutine
@@ -311,10 +314,10 @@ impl ImapCoroutine for ImapAuthOauthbearer {
                     // NOTE: never log arguments, they carry credentials.
                     trace!("send IMAP command {}", body.name());
 
-                    self.state = State::Send {
-                        send: ImapSend::command(body),
-                        pending,
-                    };
+                    let mut send = ImapSend::command(body);
+                    send.budget = ImapSendBudget::PRE_AUTH;
+
+                    self.state = State::Send { send, pending };
                     debug!("{}", self.state);
                 }
                 State::Send { send, pending } => {

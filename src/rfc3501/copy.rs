@@ -1,4 +1,4 @@
-//! IMAP COPY coroutine surfacing the optional COPYUID triple.
+//! IMAP COPY coroutine surfacing the optional COPYUID code.
 //!
 //! # Example
 //!
@@ -49,7 +49,7 @@
 //! println!("{copyuid:?}");
 //! ```
 
-use core::{fmt, num::NonZeroU32};
+use core::{fmt, num::NonZeroU32, ops::RangeInclusive};
 
 use alloc::{string::String, string::ToString, vec::Vec};
 
@@ -70,11 +70,50 @@ use thiserror::Error;
 
 use crate::{coroutine::*, imap_try, rfc3501::mailbox::encode_inplace, send::*};
 
-/// `(uid_validity, source UIDs, destination UIDs)` from COPYUID.
+/// COPYUID response code of COPY and MOVE: the UIDs of the copied
+/// messages, source and destination paired in the order of the code.
 ///
-/// `uid_validity` is `0` when the server sent that forbidden value
-/// (RFC 4315 §3 wants a nz-number), which some servers do.
-pub type ImapCopyUid = Option<(u32, Vec<u32>, Vec<u32>)>;
+/// Refs: <https://datatracker.ietf.org/doc/html/rfc4315#section-3>
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapCopyUid {
+    /// UIDVALIDITY of the destination mailbox, `0` when the server sent
+    /// that forbidden value.
+    pub uid_validity: u32,
+    /// Source UIDs, as ascending ranges in the order of the code.
+    pub source: Vec<RangeInclusive<NonZeroU32>>,
+    /// Destination UIDs, as ascending ranges in the order of the code.
+    pub destination: Vec<RangeInclusive<NonZeroU32>>,
+}
+
+impl ImapCopyUid {
+    /// Builds the code from its two sets, never expanded; `None` when
+    /// they do not hold the same number of UIDs.
+    fn from_sets(uid_validity: u32, source: UidSet, destination: UidSet) -> Option<Self> {
+        let copyuid = Self {
+            uid_validity,
+            source: uid_ranges(source),
+            destination: uid_ranges(destination),
+        };
+
+        if uid_count(&copyuid.source) != uid_count(&copyuid.destination) {
+            debug!("skipping COPYUID whose sets differ in length");
+            return None;
+        }
+
+        Some(copyuid)
+    }
+
+    /// Number of copied messages, which a server may announce in the
+    /// billions: check it before collecting [`Self::pairs`].
+    pub fn count(&self) -> u64 {
+        uid_count(&self.source)
+    }
+
+    /// Iterates lazily over the `(source, destination)` UID pairs.
+    pub fn pairs(&self) -> impl Iterator<Item = (NonZeroU32, NonZeroU32)> + '_ {
+        uids(&self.source).zip(uids(&self.destination))
+    }
+}
 
 /// Failure causes during the IMAP COPY flow.
 #[derive(Clone, Debug, Error)]
@@ -134,7 +173,7 @@ impl ImapMessageCopy {
 
 impl ImapCoroutine for ImapMessageCopy {
     type Yield = ImapYield;
-    type Return = Result<ImapCopyUid, ImapMessageCopyError>;
+    type Return = Result<Option<ImapCopyUid>, ImapMessageCopyError>;
 
     fn resume(
         &mut self,
@@ -186,24 +225,19 @@ impl fmt::Display for State {
     }
 }
 
-/// Extracts the `(uid_validity, source, destination)` COPYUID triple
-/// from a response code, whether it rode a tagged or an untagged OK;
-/// shared with MOVE.
+/// Extracts the COPYUID from a response code, whether it rode a tagged
+/// or an untagged OK; shared with MOVE.
 ///
 /// A COPYUID the strict grammar rejects reaches here as [`Code::Other`]
 /// and is read again by [`copyuid_from_other`], so a known server
 /// deviation keeps its UID mapping. Any other code gives `None`.
-pub(crate) fn copyuid_from_code(code: Option<Code<'_>>) -> ImapCopyUid {
+pub(crate) fn copyuid_from_code(code: Option<Code<'_>>) -> Option<ImapCopyUid> {
     match code? {
         Code::CopyUid {
             uid_validity,
             source,
             destination,
-        } => Some((
-            uid_validity.get(),
-            uid_set_to_vec(source),
-            uid_set_to_vec(destination),
-        )),
+        } => ImapCopyUid::from_sets(uid_validity.get(), source, destination),
         Code::Other(other) => copyuid_from_other(other.inner()),
         _ => None,
     }
@@ -218,7 +252,7 @@ pub(crate) fn copyuid_from_code(code: Option<Code<'_>>) -> ImapCopyUid {
 /// `0`, everything else follows the grammar (no leading zero, no `*`,
 /// no UID `0`, a single space between the fields, nothing after the
 /// destination set). Anything else stays unreadable and gives `None`.
-fn copyuid_from_other(bytes: &[u8]) -> ImapCopyUid {
+fn copyuid_from_other(bytes: &[u8]) -> Option<ImapCopyUid> {
     let mut fields = bytes.split(|b| *b == b' ');
 
     if !fields.next()?.eq_ignore_ascii_case(b"COPYUID") {
@@ -238,11 +272,7 @@ fn copyuid_from_other(bytes: &[u8]) -> ImapCopyUid {
 
     debug!("read COPYUID with UIDVALIDITY {uid_validity}, rejected by the strict grammar");
 
-    Some((
-        uid_validity,
-        uid_set_to_vec(source),
-        uid_set_to_vec(destination),
-    ))
+    ImapCopyUid::from_sets(uid_validity, source, destination)
 }
 
 /// `uid-set = (uniqueid / uid-range) *("," uid-set)` (RFC 4315 §4).
@@ -274,28 +304,32 @@ fn nz_number(bytes: &[u8]) -> Option<NonZeroU32> {
     core::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
-/// Expand a `UidSet` into a sorted `Vec<u32>`; shared with MOVE.
-pub(crate) fn uid_set_to_vec(uid_set: UidSet) -> Vec<u32> {
-    let mut uids = Vec::new();
+/// Reads a `uid-set` as ranges in wire order, never expanded; a range
+/// is ascending whichever way it is written (RFC 4315 §4).
+fn uid_ranges(uid_set: UidSet) -> Vec<RangeInclusive<NonZeroU32>> {
+    let ranges = uid_set.0.into_iter().map(|element| match element {
+        UidElement::Single(uid) => uid..=uid,
+        UidElement::Range(a, b) => a.min(b)..=a.max(b),
+    });
 
-    for elem in uid_set.0 {
-        match elem {
-            UidElement::Single(uid) => uids.push(uid.get()),
-            UidElement::Range(start, end) => {
-                let (lo, hi) = if start <= end {
-                    (start.get(), end.get())
-                } else {
-                    (end.get(), start.get())
-                };
-                for uid in lo..=hi {
-                    uids.push(uid);
-                }
-            }
-        }
-    }
+    ranges.collect()
+}
 
-    uids.sort_unstable();
-    uids
+/// Number of UIDs the ranges hold.
+fn uid_count(ranges: &[RangeInclusive<NonZeroU32>]) -> u64 {
+    let counts = ranges
+        .iter()
+        .map(|range| u64::from(range.end().get() - range.start().get()) + 1);
+
+    counts.sum()
+}
+
+/// Iterates lazily over the UIDs the ranges hold.
+fn uids(ranges: &[RangeInclusive<NonZeroU32>]) -> impl Iterator<Item = NonZeroU32> + '_ {
+    ranges
+        .iter()
+        .flat_map(|range| range.start().get()..=range.end().get())
+        .filter_map(NonZeroU32::new)
 }
 
 #[cfg(test)]
@@ -326,10 +360,8 @@ mod tests {
         let reply = format!("{tag} OK [COPYUID 1700 1:3 10:12] COPY completed\r\n");
         let copyuid = expect_complete_ok(&mut copy, &mut frag, reply.as_bytes())
             .expect("server returned COPYUID");
-        let (uid_validity, source, destination) = copyuid;
-        assert_eq!(1700, uid_validity);
-        assert_eq!(vec![1, 2, 3], source);
-        assert_eq!(vec![10, 11, 12], destination);
+        assert_eq!(1700, copyuid.uid_validity);
+        assert_eq!(vec![(1, 10), (2, 11), (3, 12)], pairs(&copyuid));
     }
 
     #[test]
@@ -352,7 +384,8 @@ mod tests {
         let reply = format!("{tag} OK [COPYUID 0 1582 22704] UID COPY done\r\n");
         let copyuid = expect_complete_ok(&mut copy, &mut frag, reply.as_bytes())
             .expect("UIDVALIDITY 0 COPYUID read");
-        assert_eq!((0, vec![1582], vec![22704]), copyuid);
+        assert_eq!(0, copyuid.uid_validity);
+        assert_eq!(vec![(1582, 22704)], pairs(&copyuid));
     }
 
     #[test]
@@ -377,17 +410,17 @@ mod tests {
 
     #[test]
     fn lenient_copyuid_takes_only_uidvalidity_zero() {
-        let read = |code: &str| copyuid_from_other(code.as_bytes());
+        let read = |code: &str| {
+            let copyuid = copyuid_from_other(code.as_bytes())?;
+            Some((copyuid.uid_validity, pairs(&copyuid)))
+        };
 
+        assert_eq!(Some((0, vec![(1582, 22704)])), read("COPYUID 0 1582 22704"));
         assert_eq!(
-            Some((0, vec![1582], vec![22704])),
-            read("COPYUID 0 1582 22704")
-        );
-        assert_eq!(
-            Some((0, vec![1, 2, 3, 7], vec![10, 11, 12, 13])),
+            Some((0, vec![(1, 10), (2, 11), (3, 12), (7, 13)])),
             read("copyuid 0 1:3,7 10:13"),
         );
-        assert_eq!(Some((0, vec![2, 3], vec![5, 6])), read("COPYUID 0 3:2 6:5"));
+        assert_eq!(Some((0, vec![(2, 5), (3, 6)])), read("COPYUID 0 3:2 6:5"));
 
         for garbage in [
             "",
@@ -415,6 +448,63 @@ mod tests {
         ] {
             assert_eq!(None, read(garbage), "{garbage:?} read as COPYUID");
         }
+    }
+
+    #[test]
+    fn copyuid_ranges_stay_unexpanded() {
+        let mut copy = ImapMessageCopy::new(
+            "1".try_into().expect("valid sequence set"),
+            "Archive".try_into().expect("valid mailbox"),
+            ImapMessageCopyOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut copy, &mut frag);
+        let _ = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut copy, &mut frag);
+
+        let reply = b"A1 OK [COPYUID 1 1:4294967295 4294967295:1] done\r\n";
+        let copyuid = expect_complete_ok(&mut copy, &mut frag, reply).expect("COPYUID");
+        let whole = NonZeroU32::MIN..=NonZeroU32::MAX;
+        assert_eq!(vec![whole.clone()], copyuid.source);
+        assert_eq!(vec![whole], copyuid.destination);
+        assert_eq!(4294967295, copyuid.count());
+    }
+
+    #[test]
+    fn copyuid_pairs_follow_wire_order() {
+        let mut copy = ImapMessageCopy::new(
+            "5,3".try_into().expect("valid sequence set"),
+            "Archive".try_into().expect("valid mailbox"),
+            ImapMessageCopyOptions { uid: true },
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut copy, &mut frag);
+        let _ = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut copy, &mut frag);
+
+        let reply = b"A1 OK [COPYUID 7 5,3 10:11] done\r\n";
+        let copyuid = expect_complete_ok(&mut copy, &mut frag, reply).expect("COPYUID");
+        assert_eq!(vec![(5, 10), (3, 11)], pairs(&copyuid));
+    }
+
+    #[test]
+    fn copyuid_sets_of_different_lengths_give_none() {
+        let mut copy = ImapMessageCopy::new(
+            "1:3".try_into().expect("valid sequence set"),
+            "Archive".try_into().expect("valid mailbox"),
+            ImapMessageCopyOptions { uid: true },
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut copy, &mut frag);
+        let _ = expect_wants_write(&mut copy, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut copy, &mut frag);
+
+        let reply = b"A1 OK [COPYUID 7 1:3 10:11] done\r\n";
+        assert_eq!(None, expect_complete_ok(&mut copy, &mut frag, reply));
+        assert_eq!(None, copyuid_from_other(b"COPYUID 0 1:3 10:11"));
     }
 
     #[test]
@@ -524,11 +614,16 @@ mod tests {
         cor: &mut ImapMessageCopy,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapCopyUid {
+    ) -> Option<ImapCopyUid> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
+    }
+
+    fn pairs(copyuid: &ImapCopyUid) -> Vec<(u32, u32)> {
+        let pairs = copyuid.pairs();
+        pairs.map(|(src, dst)| (src.get(), dst.get())).collect()
     }
 
     fn expect_complete_err(

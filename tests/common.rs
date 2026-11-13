@@ -277,7 +277,11 @@ fn run(mut stream: impl Read + Write, username: &str, password: &str) {
     // NOTE: a deliberately tiny buffer fragments even a small body
     // into many reads, exercising the streaming reassembly as if the
     // content were heavy.
-    let mut coroutine = ImapMessageFetchStream::new(id, uid);
+    let opts = ImapMessageFetchStreamOptions {
+        uid,
+        ..Default::default()
+    };
+    let mut coroutine = ImapMessageFetchStream::new(id, opts);
     let mut chunk = [0u8; 64];
     let mut body: Vec<u8> = Vec::new();
     let mut arg: Option<&[u8]> = None;
@@ -808,7 +812,8 @@ fn purge(client: &mut ImapClientStd, name: &str, trash: Option<&Mailbox<'static>
         });
 
         match (trash, moved) {
-            (Some(trash), Some(Some((_, _, trashed)))) => {
+            (Some(trash), Some(Some(copyuid))) => {
+                let trashed: Vec<u32> = copyuid.pairs().map(|(_, uid)| uid.get()).collect();
                 let _ = client.select(trash.clone(), Default::default());
                 expunge(client, &trashed);
             }

@@ -106,9 +106,12 @@ impl ImapServerId {
 
         trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::command(body));
+        let mut send = ImapSend::command(body);
+        send.budget = ImapSendBudget::PRE_AUTH;
 
-        Self { state }
+        Self {
+            state: State::Send(send),
+        }
     }
 }
 

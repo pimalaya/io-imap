@@ -20,3 +20,12 @@ capability: message-sort
 
 - **WHEN** the fallback sorts by `REVERSE FROM` messages 1 to 4 from `alice`, `bob`, `ALICE` and `bob`
 - **THEN** the order is 2, 4, 1, 3
+
+### Requirement: The base subject is extracted in linear work
+
+Extracting the base subject for the client-side sort SHALL take work linear in the length of the subject.
+
+#### Scenario: Subject made of blobs
+
+- **WHEN** the base subject of 1000 `[a]` blobs followed by `x` is extracted
+- **THEN** it is `x`, after at most 3000 blob strips

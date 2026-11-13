@@ -71,3 +71,17 @@ A send SHALL write a synchronising literal only after decoding a command continu
 
 - **WHEN** a send wrote `A1 APPEND INBOX {2}` and reads `A1 NO [OVERQUOTA] quota exc`, then `eeded` and the line end
 - **THEN** it completes with the `NO` status and never writes the literal
+
+### Requirement: An exchange collects responses within a budget
+
+A send SHALL collect the untagged data and status responses read before its completion within a budget of responses and of summed wire octets, and fail with `ResponseTooLong` on the first response past either bound. The default budget is 16,777,216 responses and 1 GiB. CAPABILITY, ID, LOGIN and every AUTHENTICATE exchange, the commands sent before authentication, SHALL use a budget of 1024 responses and 1 MiB. The raw passthrough SHALL capture at most `max_response_len` octets, 1 GiB by default.
+
+#### Scenario: Endless untagged run before authentication
+
+- **WHEN** a CAPABILITY exchange reads 2000 `* 1 EXISTS` lines and no tagged completion
+- **THEN** it fails with `ResponseTooLong` carrying the budget of 1024 responses and 1 MiB
+
+#### Scenario: Budget filled exactly
+
+- **WHEN** a send with a budget of 2 responses and 24 octets reads `* 1 EXISTS`, `* 2 EXISTS`, then its `OK`
+- **THEN** it completes with both responses

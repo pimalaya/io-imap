@@ -102,9 +102,12 @@ impl ImapCapabilityGet {
 
         trace!("send IMAP command {body:?}");
 
-        let state = State::Send(ImapSend::command(body));
+        let mut send = ImapSend::command(body);
+        send.budget = ImapSendBudget::PRE_AUTH;
 
-        Self { state }
+        Self {
+            state: State::Send(send),
+        }
     }
 }
 
@@ -300,6 +303,23 @@ mod tests {
         let reply = format!("{tag} OK CAPABILITY completed\r\n");
         let err = expect_complete_err(&mut cap, &mut frag, reply.as_bytes());
         assert!(matches!(err, ImapCapabilityGetError::MissingCapability));
+    }
+
+    #[test]
+    fn endless_untagged_run_returns_too_long_error() {
+        let mut cap = ImapCapabilityGet::new();
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut cap, &mut frag);
+        let _ = expect_wants_write(&mut cap, &mut frag, Some(b"A1"));
+        expect_wants_read(&mut cap, &mut frag);
+
+        let reply = "* 1 EXISTS\r\n".repeat(2000);
+        let err = expect_complete_err(&mut cap, &mut frag, reply.as_bytes());
+        let ImapCapabilityGetError::Send(ImapSendError::ResponseTooLong(budget)) = err else {
+            panic!("expected ImapSendError::ResponseTooLong, got {err:?}");
+        };
+        assert_eq!(ImapSendBudget::PRE_AUTH, budget);
     }
 
     #[test]

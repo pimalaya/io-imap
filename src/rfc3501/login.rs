@@ -132,7 +132,8 @@ impl ImapLogin {
         let body = CommandBody::Login { username, password };
         // NOTE: never log arguments, they carry credentials.
         trace!("send IMAP command {}", body.name());
-        let send = ImapSend::command(body);
+        let mut send = ImapSend::command(body);
+        send.budget = ImapSendBudget::PRE_AUTH;
 
         Ok(Self {
             state: State::Send(send),

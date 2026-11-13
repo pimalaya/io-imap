@@ -238,6 +238,10 @@ pub enum ImapClientError {
     /// A QRESYNC SELECT was requested with a zero mod-sequence.
     #[error("Invalid mod-sequence value: 0")]
     InvalidModSeq,
+    /// A streamed APPEND was given more octets than a literal can
+    /// announce.
+    #[error("IMAP APPEND failed: message of {0} octets does not fit a literal")]
+    MessageTooLong(usize),
     /// The implementor's own transport failed.
     ///
     /// [`ImapClientStd`] reports I/O through [`Self::Io`]; this variant
@@ -671,22 +675,22 @@ imap_client_commands! {
     }
 
     /// `COPY`; copies messages to `mailbox` and returns the optional
-    /// COPYUID pair.
+    /// COPYUID code.
     fn copy(
         sequence_set: SequenceSet,
         mailbox: Mailbox<'static>,
         opts: ImapMessageCopyOptions,
-    ) -> ImapCopyUid {
+    ) -> Option<ImapCopyUid> {
         ImapMessageCopy::new(sequence_set, mailbox, opts)
     }
 
     /// `MOVE`; moves messages to `mailbox` and returns the optional
-    /// COPYUID pair.
+    /// COPYUID code.
     fn r#move(
         sequence_set: SequenceSet,
         mailbox: Mailbox<'static>,
         opts: ImapMessageMoveOptions,
-    ) -> ImapCopyUid {
+    ) -> Option<ImapCopyUid> {
         ImapMessageMove::new(sequence_set, mailbox, opts)
     }
 
@@ -984,7 +988,11 @@ impl ImapClientStd {
         uid: bool,
         mut sink: impl Write,
     ) -> Result<(), ImapClientError> {
-        let mut coroutine = ImapMessageFetchStream::new(id, uid);
+        let opts = ImapMessageFetchStreamOptions {
+            uid,
+            ..Default::default()
+        };
+        let mut coroutine = ImapMessageFetchStream::new(id, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
@@ -1127,7 +1135,11 @@ impl ImapClientStd {
         len: usize,
         opts: ImapMessageAppendOptions,
     ) -> Result<ImapMessageAppendOutput, ImapClientError> {
-        let mut coroutine = ImapMessageAppendStream::new(mailbox, len as u32, opts);
+        let Ok(literal_len) = u32::try_from(len) else {
+            return Err(ImapClientError::MessageTooLong(len));
+        };
+
+        let mut coroutine = ImapMessageAppendStream::new(mailbox, literal_len, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;
         let mut tag;
@@ -1149,7 +1161,7 @@ impl ImapClientStd {
                     arg = None;
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
-                    let len = len as u64;
+                    let len = u64::from(literal_len);
                     let mut sink = source.by_ref().take(len);
                     let n = io::copy(&mut sink, &mut self.stream)?;
                     arg = (n != len).then_some(&[]);
@@ -1278,4 +1290,54 @@ pub trait ImapStream: Read + Write + Send + Any {
     /// server speaks. A transport that never retries has nothing to
     /// turn off.
     fn stop_retrying(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn append_stream_over_u32_fails_before_writing() {
+        let mut client = ImapClientStd::new(WrittenStream(Vec::new()));
+        let mailbox = "INBOX".try_into().expect("valid mailbox");
+        let len = u32::MAX as usize + 101;
+
+        let res = client.append_stream(mailbox, io::empty(), len, Default::default());
+        assert!(matches!(res, Err(ImapClientError::MessageTooLong(n)) if n == len));
+
+        let stream = client.stream.as_any_mut().downcast_mut::<WrittenStream>();
+        let written = &stream.expect("the stream given").0;
+        assert_eq!("", String::from_utf8_lossy(written));
+    }
+
+    /// A stream keeping what is written and reading nothing.
+    struct WrittenStream(Vec<u8>);
+
+    impl Read for WrittenStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for WrittenStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ImapStream for WrittenStream {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }

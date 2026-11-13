@@ -224,7 +224,11 @@ impl TokioSession {
         uid: bool,
         mut sink: impl AsyncWrite + Unpin,
     ) -> Result<(), Box<dyn Error>> {
-        let mut coroutine = ImapMessageFetchStream::new(id, uid);
+        let opts = ImapMessageFetchStreamOptions {
+            uid,
+            ..Default::default()
+        };
+        let mut coroutine = ImapMessageFetchStream::new(id, opts);
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let mut body_buf = vec![0u8; BODY_COPY_BUFFER_SIZE];
         let mut arg: Option<&[u8]> = None;

@@ -51,6 +51,37 @@ pub enum ImapSendError {
     /// carries the raw bytes.
     #[error("Parse IMAP response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
+    /// The untagged responses collected before the completion exceeded
+    /// the given budget.
+    #[error("Read IMAP response error: over {} responses or {} octets", .0.responses, .0.octets)]
+    ResponseTooLong(ImapSendBudget),
+}
+
+/// Bounds on the untagged responses one exchange collects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImapSendBudget {
+    /// Largest number of responses collected.
+    pub responses: usize,
+    /// Largest number of octets these responses add up to on the wire.
+    pub octets: usize,
+}
+
+impl ImapSendBudget {
+    /// Budget of the commands sent before authentication, which are
+    /// answered in a handful of lines.
+    pub const PRE_AUTH: Self = Self {
+        responses: 1024,
+        octets: 1024 * 1024,
+    };
+}
+
+impl Default for ImapSendBudget {
+    fn default() -> Self {
+        Self {
+            responses: 16 * 1024 * 1024,
+            octets: 1024 * 1024 * 1024,
+        }
+    }
 }
 
 /// Step output emitted by [`ImapSend::resume`].
@@ -95,6 +126,9 @@ pub struct ImapSend<T: Encoder> {
     cr: Option<CommandContinuationRequest<'static>>,
     limbo_literal: Option<Vec<u8>>,
     done: bool,
+    /// Bounds on the untagged responses collected before the completion.
+    pub budget: ImapSendBudget,
+    octets: usize,
 }
 
 impl<T: Encoder> ImapSend<T> {
@@ -126,6 +160,8 @@ impl<T: Encoder> ImapSend<T> {
             cr: None,
             limbo_literal: None,
             done: false,
+            budget: ImapSendBudget::default(),
+            octets: 0,
         }
     }
 
@@ -157,6 +193,8 @@ impl<T: Encoder> ImapSend<T> {
             cr: None,
             limbo_literal: None,
             done: false,
+            budget: ImapSendBudget::default(),
+            octets: 0,
         }
     }
 
@@ -180,6 +218,19 @@ impl<T: Encoder> ImapSend<T> {
             }
             _ => None,
         }
+    }
+
+    /// Charges one more collected response of `octets` to the budget.
+    fn spend(&mut self, octets: usize) -> Result<(), ImapSendError> {
+        let responses = self.data.len() + self.untagged.len();
+        self.octets = self.octets.saturating_add(octets);
+
+        if responses >= self.budget.responses || self.octets > self.budget.octets {
+            debug!("collected responses exceed the budget");
+            return Err(ImapSendError::ResponseTooLong(self.budget));
+        }
+
+        Ok(())
     }
 
     /// Pass `None` initially or after `WantsWrite`, `Some(tag)` after
@@ -279,11 +330,21 @@ impl<T: Encoder> ImapSend<T> {
                             continue;
                         }
 
+                        let octets = fragmentizer.message_bytes().len();
+
                         match fragmentizer.decode_message(&self.codec) {
                             Ok(Response::Data(data)) => {
+                                if let Err(err) = self.spend(octets) {
+                                    return ImapSendResult::Err(err);
+                                }
+
                                 self.data.push(data.into_static());
                             }
                             Ok(Response::Status(Status::Untagged(status))) => {
+                                if let Err(err) = self.spend(octets) {
+                                    return ImapSendResult::Err(err);
+                                }
+
                                 self.untagged.push(status.into_static());
                             }
                             Ok(Response::Status(Status::Tagged(tagged)))
@@ -405,6 +466,8 @@ impl ImapSend<CommandCodec> {
             cr: None,
             limbo_literal: None,
             done: false,
+            budget: ImapSendBudget::default(),
+            octets: 0,
         }
     }
 }
@@ -571,6 +634,62 @@ mod tests {
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!(StatusKind::No, tagged.body.kind);
         assert!(tagged.body.text.as_ref().ends_with("exist: ??t??"));
+    }
+
+    #[test]
+    fn responses_over_budget_return_too_long_error() {
+        for budget in [
+            ImapSendBudget {
+                responses: 2,
+                octets: usize::MAX,
+            },
+            ImapSendBudget {
+                responses: usize::MAX,
+                octets: 24,
+            },
+        ] {
+            let mut send = ImapSend::command(CommandBody::Noop);
+            send.budget = budget;
+            let mut frag = Fragmentizer::new(1024);
+
+            send.resume(&mut frag, None);
+            send.resume(&mut frag, Some(b"A1"));
+            send.resume(&mut frag, None);
+
+            let within = b"* 1 EXISTS\r\n* 2 EXISTS\r\n";
+            assert!(matches!(
+                send.resume(&mut frag, Some(within)),
+                ImapSendResult::WantsRead
+            ));
+
+            let ImapSendResult::Err(err) = send.resume(&mut frag, Some(b"* 3 EXISTS\r\n")) else {
+                panic!("expected Err for {budget:?}");
+            };
+            let ImapSendError::ResponseTooLong(exceeded) = err else {
+                panic!("expected ImapSendError::ResponseTooLong, got {err:?}");
+            };
+            assert_eq!(budget, exceeded);
+        }
+    }
+
+    #[test]
+    fn responses_filling_budget_are_collected() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        send.budget = ImapSendBudget {
+            responses: 2,
+            octets: 24,
+        };
+        let mut frag = Fragmentizer::new(1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let reply = b"* 1 EXISTS\r\n* 2 EXISTS\r\nA1 OK NOOP completed\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply)) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(2, out.data.len());
     }
 
     #[test]

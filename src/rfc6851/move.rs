@@ -1,4 +1,4 @@
-//! IMAP MOVE coroutine surfacing the optional COPYUID triple.
+//! IMAP MOVE coroutine surfacing the optional COPYUID code.
 //!
 //! # Example
 //!
@@ -110,7 +110,7 @@ pub struct ImapMessageMove {
 
 impl ImapMessageMove {
     /// Creates a coroutine that MOVEs the messages in `sequence_set`
-    /// to `mailbox` and returns the COPYUID triple when present.
+    /// to `mailbox` and returns the COPYUID code when present.
     pub fn new(
         sequence_set: SequenceSet,
         mut mailbox: Mailbox<'static>,
@@ -134,7 +134,7 @@ impl ImapMessageMove {
 
 impl ImapCoroutine for ImapMessageMove {
     type Yield = ImapYield;
-    type Return = Result<ImapCopyUid, ImapMessageMoveError>;
+    type Return = Result<Option<ImapCopyUid>, ImapMessageMoveError>;
 
     fn resume(
         &mut self,
@@ -222,10 +222,8 @@ mod tests {
         let reply = format!("{tag} OK [COPYUID 1700 1:3 10:12] MOVE completed\r\n");
         let copyuid = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes())
             .expect("server returned COPYUID");
-        let (uid_validity, source, destination) = copyuid;
-        assert_eq!(1700, uid_validity);
-        assert_eq!(vec![1, 2, 3], source);
-        assert_eq!(vec![10, 11, 12], destination);
+        assert_eq!(1700, copyuid.uid_validity);
+        assert_eq!(vec![(1, 10), (2, 11), (3, 12)], pairs(&copyuid));
     }
 
     #[test]
@@ -253,10 +251,8 @@ mod tests {
         );
         let copyuid = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes())
             .expect("server returned untagged COPYUID");
-        let (uid_validity, source, destination) = copyuid;
-        assert_eq!(1700, uid_validity);
-        assert_eq!(vec![1, 2, 3], source);
-        assert_eq!(vec![10, 11, 12], destination);
+        assert_eq!(1700, copyuid.uid_validity);
+        assert_eq!(vec![(1, 10), (2, 11), (3, 12)], pairs(&copyuid));
     }
 
     #[test]
@@ -268,12 +264,12 @@ mod tests {
                 "* OK [COPYUID 0 1582 22704] Completed\r\n\
                  * 1 EXPUNGE\r\n\
                  {tag} OK UID MOVE done\r\n",
-                Some((0, vec![1582], vec![22704])),
+                Some((0, vec![(1582, 22704)])),
             ),
             (
                 "* 1 EXPUNGE\r\n\
                  {tag} OK [COPYUID 0 1582 22704] UID MOVE done\r\n",
-                Some((0, vec![1582], vec![22704])),
+                Some((0, vec![(1582, 22704)])),
             ),
             (
                 "* OK [COPYUID 0 1582 *] Completed\r\n\
@@ -297,6 +293,7 @@ mod tests {
 
             let reply = reply.replace("{tag}", &tag);
             let got = expect_complete_ok(&mut mov, &mut frag, reply.as_bytes());
+            let got = got.map(|got| (got.uid_validity, pairs(&got)));
             assert_eq!(copyuid, got, "{reply:?}");
         }
     }
@@ -388,11 +385,16 @@ mod tests {
         cor: &mut ImapMessageMove,
         frag: &mut Fragmentizer,
         reply: &[u8],
-    ) -> ImapCopyUid {
+    ) -> Option<ImapCopyUid> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
+    }
+
+    fn pairs(copyuid: &ImapCopyUid) -> Vec<(u32, u32)> {
+        let pairs = copyuid.pairs();
+        pairs.map(|(src, dst)| (src.get(), dst.get())).collect()
     }
 
     fn expect_complete_err(

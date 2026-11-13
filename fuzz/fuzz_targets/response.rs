@@ -16,9 +16,12 @@ use io_imap::{
     codec::fragmentizer::Fragmentizer,
     coroutine::*,
     rfc3501::{
+        copy::{ImapCopyUid, ImapMessageCopy, ImapMessageCopyOptions},
         examine::{ImapMailboxExamine, ImapMailboxExamineOptions},
         fetch::{ImapMessageFetch, ImapMessageFetchOptions},
-        fetch_stream::{ImapMessageFetchStream, ImapMessageFetchStreamYield},
+        fetch_stream::{
+            ImapMessageFetchStream, ImapMessageFetchStreamOptions, ImapMessageFetchStreamYield,
+        },
         greeting::{ImapGreetingGet, ImapGreetingGetOptions},
         list::ImapMailboxList,
         search::{ImapMessageSearch, ImapMessageSearchOptions},
@@ -26,6 +29,7 @@ use io_imap::{
         starttls::ImapStartTls,
     },
     rfc5256::sort::{ImapMessageSort, ImapMessageSortOptions},
+    rfc6851::r#move::{ImapMessageMove, ImapMessageMoveOptions},
     types::{
         core::Vec1,
         extensions::sort::{SortCriterion, SortKey},
@@ -41,19 +45,24 @@ use crate::reads::Reads;
 /// The most resumes a target allows before giving up on an input.
 const MAX_RESUMES: usize = 100_000;
 
+/// The largest streamed body the target accepts, small enough to be reached.
+const MAX_LITERAL_LEN: u32 = 4096;
+
 fuzz_target!(|data: &[u8]| {
     let Some((selector, data)) = data.split_first() else {
         return;
     };
 
-    match selector % 10 {
+    match selector % 12 {
         0 => {
             let opts = ImapGreetingGetOptions {
                 ensure_capabilities: true,
             };
             run(ImapGreetingGet::new(opts), data);
         }
-        1 => run(ImapStartTls::new(), data),
+        1 => {
+            run(ImapStartTls::new(), data);
+        }
         2 => {
             let mailbox = "INBOX".try_into().unwrap();
             run(ImapMailboxSelect::new(mailbox, Default::default()), data);
@@ -119,40 +128,78 @@ fuzz_target!(|data: &[u8]| {
             let set: SequenceSet = "1:*".try_into().unwrap();
             run(ImapMessageFetch::new(set, items, opts), data);
         }
+        9 => {
+            let set: SequenceSet = "1:*".try_into().unwrap();
+            let mailbox = "Archive".try_into().unwrap();
+            let opts = ImapMessageCopyOptions { uid: true };
+            let out = run(ImapMessageCopy::new(set, mailbox, opts), data);
+
+            if let Some(Ok(Some(copyuid))) = out {
+                check_copyuid(&copyuid);
+            }
+        }
+        10 => {
+            let set: SequenceSet = "1:*".try_into().unwrap();
+            let mailbox = "Archive".try_into().unwrap();
+            let opts = ImapMessageMoveOptions { uid: true };
+            let out = run(ImapMessageMove::new(set, mailbox, opts), data);
+
+            if let Some(Ok(Some(copyuid))) = out {
+                check_copyuid(&copyuid);
+            }
+        }
         _ => stream(data),
     }
 });
 
-/// Drives a coroutine yielding plain reads and writes.
-fn run<C: ImapCoroutine<Yield = ImapYield>>(mut coroutine: C, data: &[u8]) {
+/// Drives a coroutine yielding plain reads and writes, up to its return.
+fn run<C: ImapCoroutine<Yield = ImapYield>>(mut coroutine: C, data: &[u8]) -> Option<C::Return> {
     let mut reads = Reads::new(data);
     let mut fragmentizer = Fragmentizer::new(1024 * 1024);
     let mut arg = None;
 
     for _ in 0..MAX_RESUMES {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
-            ImapCoroutineState::Complete(_) => return,
+            ImapCoroutineState::Complete(out) => return Some(out),
             ImapCoroutineState::Yielded(ImapYield::WantsTag) => arg = Some(b"A1".as_slice()),
             ImapCoroutineState::Yielded(ImapYield::WantsWrite(_)) => {}
             ImapCoroutineState::Yielded(ImapYield::WantsRead) => arg = Some(reads.next()),
         }
     }
+
+    None
+}
+
+/// A COPYUID pairs as many UIDs as it counts, however wide its ranges.
+fn check_copyuid(copyuid: &ImapCopyUid) {
+    let pairs = copyuid.pairs().take(MAX_RESUMES).count() as u64;
+    assert_eq!(pairs, copyuid.count().min(MAX_RESUMES as u64));
 }
 
 /// Drives the single-message FETCH body stream.
 fn stream(data: &[u8]) {
     let mut reads = Reads::new(data);
     let mut fragmentizer = Fragmentizer::new(1024 * 1024);
-    let mut coroutine = ImapMessageFetchStream::new(NonZeroU32::MIN, true);
+    let opts = ImapMessageFetchStreamOptions {
+        uid: true,
+        max_literal_len: MAX_LITERAL_LEN,
+        ..Default::default()
+    };
+    let mut coroutine = ImapMessageFetchStream::new(NonZeroU32::MIN, opts);
     let mut arg = None;
 
     for _ in 0..MAX_RESUMES {
         match coroutine.resume(&mut fragmentizer, arg.take()) {
             ImapCoroutineState::Complete(_) => return,
+            ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsTag) => {
+                arg = Some(b"A1".as_slice());
+            }
             ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsRead) => {
                 arg = Some(reads.next());
             }
             ImapCoroutineState::Yielded(ImapMessageFetchStreamYield::WantsStream { len }) => {
+                assert!(len <= MAX_LITERAL_LEN);
+
                 let mut left = len as usize;
                 while left > 0 {
                     let chunk = reads.next();

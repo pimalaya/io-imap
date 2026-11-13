@@ -100,13 +100,21 @@ pub enum ImapRawError {
     /// The stream reached EOF before every tagged completion line arrived.
     #[error("IMAP raw command failed: reached unexpected EOF on stream")]
     Eof,
+    /// The captured response ran past the given number of octets.
+    #[error("IMAP raw command failed: response longer than {0} octets")]
+    ResponseTooLong(usize),
 }
+
+/// Default [`ImapRaw::max_response_len`], in octets.
+pub const DEFAULT_MAX_RESPONSE_LEN: usize = 1024 * 1024 * 1024;
 
 /// I/O-free IMAP raw passthrough coroutine.
 ///
 /// The returned String is a lossy UTF-8 decoding of the raw bytes, so binary
 /// payloads carried in literals are rendered with replacement characters.
 pub struct ImapRaw {
+    /// Largest response captured, in octets.
+    pub max_response_len: usize,
     command: Vec<u8>,
     pending: BTreeSet<Vec<u8>>,
     state: State,
@@ -165,6 +173,7 @@ impl ImapRaw {
         trace!("build raw batch ({} command(s))", pending.len());
 
         Ok(Self {
+            max_response_len: DEFAULT_MAX_RESPONSE_LEN,
             command,
             pending,
             state: State::Write,
@@ -220,6 +229,14 @@ impl ImapCoroutine for ImapRaw {
 
                         let bytes = fragmentizer.message_bytes();
                         trace!("captured response message: {}", escape_byte_string(bytes));
+
+                        let room = self.max_response_len.saturating_sub(self.response.len());
+
+                        if bytes.len() > room {
+                            let err = ImapRawError::ResponseTooLong(self.max_response_len);
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+
                         self.response.extend_from_slice(bytes);
 
                         // NOTE: untagged responses decode to no tag and are
@@ -311,6 +328,22 @@ mod tests {
         let second = "* 3 EXISTS\r\na1 OK [READ-WRITE] SELECT completed\r\n";
         let out = expect_complete_ok(&mut raw, &mut frag, second.as_bytes());
         assert_eq!(out, format!("{first}{second}"));
+    }
+
+    #[test]
+    fn response_over_max_len_returns_too_long_error() {
+        let mut raw = ImapRaw::new(b"a1 NOOP\r\n").unwrap();
+        raw.max_response_len = 24;
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
+
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
+        expect_wants_read(&mut raw, &mut frag);
+        expect_wants_read_after(&mut raw, &mut frag, b"* 1 EXISTS\r\n* 2 EXISTS\r\n");
+
+        match raw.resume(&mut frag, Some(b"* 3 EXISTS\r\n")) {
+            ImapCoroutineState::Complete(Err(ImapRawError::ResponseTooLong(24))) => {}
+            state => panic!("expected ResponseTooLong, got {state:?}"),
+        }
     }
 
     #[test]

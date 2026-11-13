@@ -70,7 +70,9 @@
 //! then collects the response: data and untagged status lines
 //! accumulate, the tagged completion of its own command, a bye or a
 //! continuation request terminates, and undecodable untagged lines and
-//! the tagged completions of other commands are skipped. Its terminal
+//! the tagged completions of other commands are skipped. What
+//! accumulates is bounded by [`send::ImapSendBudget`], tight for the
+//! commands sent before authentication. Its terminal
 //! value is [`send::ImapSendOutput`]; failures surface as
 //! [`send::ImapSendError`]. Messages without a tag of their own (SASL
 //! continuations, IDLE DONE) go through [`send::ImapSend::new`] with

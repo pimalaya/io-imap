@@ -22,7 +22,13 @@
 
 use core::fmt;
 
-use alloc::{collections::BTreeMap, string::String, string::ToString, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    string::ToString,
+    vec,
+    vec::Vec,
+};
 
 use imap_codec::{
     CommandCodec, ResponseCodec,
@@ -88,6 +94,9 @@ pub enum ImapMessageFetchStreamBatchError {
         /// The largest length accepted for this body.
         max: u32,
     },
+    /// The server sent the body of the given UID a second time.
+    #[error("IMAP batched FETCH failed: body of UID {0} sent twice")]
+    UidRepeated(u32),
 }
 
 /// Options for [`ImapMessageFetchStreamBatch::new`].
@@ -163,6 +172,7 @@ pub struct ImapMessageFetchStreamBatch {
     codec: ResponseCodec,
     max_literal_len: u32,
     sizes: BTreeMap<u32, u32>,
+    seen: BTreeSet<u32>,
 }
 
 impl ImapMessageFetchStreamBatch {
@@ -198,6 +208,7 @@ impl ImapMessageFetchStreamBatch {
             codec: ResponseCodec::new(),
             max_literal_len: opts.max_literal_len,
             sizes: opts.sizes,
+            seen: BTreeSet::new(),
         }
     }
 }
@@ -278,8 +289,13 @@ impl ImapCoroutine for ImapMessageFetchStreamBatch {
                                     ));
                                 };
 
-                                let max = match self.sizes.get(&uid) {
-                                    Some(&size) => size.min(self.max_literal_len),
+                                if !self.seen.insert(uid) {
+                                    let err = ImapMessageFetchStreamBatchError::UidRepeated(uid);
+                                    return ImapCoroutineState::Complete(Err(err));
+                                }
+
+                                let max = match self.sizes.remove(&uid) {
+                                    Some(size) => size.min(self.max_literal_len),
                                     None => self.max_literal_len,
                                 };
 
@@ -732,6 +748,22 @@ mod tests {
             panic!("expected LiteralTooLong, got {err:?}");
         };
         assert_eq!((uid, len, max), (11, 5, 3));
+    }
+
+    #[test]
+    fn repeated_uid_fails() {
+        let opts = ImapMessageFetchStreamBatchOptions {
+            sizes: BTreeMap::from([(10, 5)]),
+            ..uid_opts()
+        };
+        let chunks: [&[u8]; 1] = [b"* 1 FETCH (UID 10 BODY[] {5}\r\nhello)\r\n\
+              * 1 FETCH (UID 10 BODY[] {5}\r\nworld)\r\n\
+              A1 OK done\r\n"];
+        let err = run(opts, &chunks).unwrap_err();
+        assert!(matches!(
+            err,
+            ImapMessageFetchStreamBatchError::UidRepeated(10)
+        ));
     }
 
     fn uid_opts() -> ImapMessageFetchStreamBatchOptions {

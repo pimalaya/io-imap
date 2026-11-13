@@ -533,21 +533,20 @@ fn base_subject(raw: &[u8]) -> String {
             }
         }
 
-        // Steps 3 to 5: the leaders, then a blob leaving a non-empty base.
+        // Steps 3 to 5: the leaders, then the blobs leaving a non-empty base.
         loop {
-            let len = subject.len();
-
             if let Some(rest) = subject.strip_prefix(' ') {
                 subject = rest;
             } else if let Some(rest) = strip_leader(subject) {
                 subject = rest;
-            } else if let Some(rest) = strip_blob(subject)
-                && !rest.is_empty()
-            {
-                subject = rest;
-            }
+            } else {
+                // NOTE: one pass, a leader search per blob being quadratic.
+                while let Some(rest) = strip_blob(subject)
+                    && !rest.is_empty()
+                {
+                    subject = rest;
+                }
 
-            if subject.len() == len {
                 break;
             }
         }
@@ -596,6 +595,9 @@ fn strip_leader(mut subject: &str) -> Option<&str> {
 /// Any character but a bracket is taken inside, as Dovecot does, rather
 /// than the ASCII the ABNF lists, so a tag in another script is a blob.
 fn strip_blob(subject: &str) -> Option<&str> {
+    #[cfg(test)]
+    tests::STRIP_BLOB_CALLS.set(tests::STRIP_BLOB_CALLS.get() + 1);
+
     let rest = subject.strip_prefix('[')?;
     let end = rest.find(['[', ']'])?;
 
@@ -608,11 +610,18 @@ fn strip_blob(subject: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use core::str;
+    extern crate std;
+
+    use core::{cell::Cell, str};
 
     use alloc::{borrow::ToOwned, format, vec, vec::Vec};
 
     use crate::rfc5256::sort::*;
+
+    std::thread_local! {
+        /// Calls to `strip_blob` made by the current test.
+        pub(crate) static STRIP_BLOB_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
 
     fn arrival() -> Vec1<SortCriterion> {
         Vec1::try_from(vec![SortCriterion {
@@ -786,6 +795,18 @@ mod tests {
             let raw_str = str::from_utf8(raw).expect("utf8 subject");
             assert_eq!(base_subject(raw), expected, "base subject of {raw_str:?}");
         }
+    }
+
+    #[test]
+    fn base_subject_work_is_linear_in_blobs() {
+        let blobs = 1000;
+        let raw = format!("{}x", "[a]".repeat(blobs));
+
+        STRIP_BLOB_CALLS.set(0);
+        assert_eq!("x", base_subject(raw.as_bytes()));
+
+        let calls = STRIP_BLOB_CALLS.get();
+        assert!(calls <= 3 * blobs, "{calls} blob strips for {blobs} blobs");
     }
 
     #[test]
