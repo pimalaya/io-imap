@@ -7,7 +7,10 @@
 use alloc::{string::String, vec::Vec};
 
 use base64_codec::codec::Base64Codec;
-use imap_codec::imap_types::mailbox::Mailbox;
+use imap_codec::imap_types::{
+    core::{IString, Quoted},
+    mailbox::{ListMailbox, Mailbox},
+};
 use log::trace;
 
 /// Rewrites `mbox` to its modified UTF-7 wire form; no-op on Inbox
@@ -30,6 +33,34 @@ pub(crate) fn encode_inplace(mbox: &mut Mailbox<'static>) {
     match Mailbox::try_from(encoded) {
         Ok(new) => *mbox = new,
         Err(err) => trace!("skipped mailbox re-encode: {err}"),
+    }
+}
+
+/// Rewrites a LIST or LSUB pattern to its wire form: modified UTF-7,
+/// the ASCII wildcards `*` and `%` passing through, then a quoted
+/// string when it fits one.
+///
+/// iCloud answers `BAD Parse Error` to an LSUB pattern sent as a bare
+/// `list-char` token, which every server must read quoted as well.
+pub(crate) fn encode_list_inplace(pattern: &mut ListMailbox<'static>) {
+    let bytes: &[u8] = match &*pattern {
+        ListMailbox::Token(token) => token.as_ref(),
+        ListMailbox::String(string) => string.as_ref(),
+    };
+    let Ok(name) = core::str::from_utf8(bytes) else {
+        return;
+    };
+
+    let encoded = encode(name);
+
+    if encoded.as_bytes() != bytes {
+        trace!("encoded list pattern {name:?} as {encoded:?}");
+    }
+
+    if let Ok(quoted) = Quoted::try_from(encoded.clone()) {
+        *pattern = ListMailbox::String(IString::Quoted(quoted));
+    } else if let Ok(new) = ListMailbox::try_from(encoded) {
+        *pattern = new;
     }
 }
 
@@ -305,5 +336,21 @@ mod tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_list_inplace_encodes_and_quotes_the_pattern() {
+        let quoted = |s: &str| {
+            ListMailbox::String(IString::Quoted(Quoted::try_from(s.to_string()).unwrap()))
+        };
+
+        let mut pattern = ListMailbox::try_from("Test-\u{c9}t\u{e9}%".to_string()).unwrap();
+        encode_list_inplace(&mut pattern);
+        assert_eq!(pattern, quoted("Test-&AMk-t&AOk-%"));
+
+        let mut pattern = ListMailbox::try_from("Test*".to_string()).unwrap();
+        assert!(matches!(pattern, ListMailbox::Token(_)));
+        encode_list_inplace(&mut pattern);
+        assert_eq!(pattern, quoted("Test*"));
     }
 }

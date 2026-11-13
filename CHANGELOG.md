@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
+
+### Fixed
+
+- Fixed a tagged completion whose text holds 8-bit bytes (Dovecot echoing a UTF-8 mailbox name in a `NO`) failing the whole exchange as a decoding error: it is decoded again with those bytes read as `?`.
+
+- Fixed `rfc3501::list::ImapMailboxList` and `rfc3501::lsub::ImapMailboxLsub` sending the pattern unencoded: it now goes out in modified UTF-7, the wildcards kept, as a quoted string, which iCloud requires for LSUB.
+
+- Fixed the client-side SORT fallback of `rfc5256::sort::ImapMessageSort` to follow RFC 5256: `FROM`, `TO` and `CC` sort by the first address's mailbox instead of being ignored, `SUBJECT` by the base subject (encoded words decoded, reply and forward prefixes stripped, case ignored) instead of the raw bytes, `DATE` falls back to the internal date, and ties keep the sequence order, `REVERSE` included.
+
 ## [0.8.1] - 2026-11-03
 
 ### Changed

@@ -160,6 +160,28 @@ impl<T: Encoder> ImapSend<T> {
         }
     }
 
+    /// The completion of this command when `bytes` only fails to decode
+    /// for the 8-bit bytes of its text, which IMAP4rev1 keeps ASCII but
+    /// servers send (Dovecot echoes a UTF-8 mailbox name in a `NO`): it
+    /// is decoded again with each of them read as `?`.
+    fn lossy_completion(&self, bytes: &[u8]) -> Option<Tagged<'static>> {
+        use imap_codec::decode::Decoder;
+
+        let ascii: Vec<u8> = bytes
+            .iter()
+            .map(|&byte| if byte.is_ascii() { byte } else { b'?' })
+            .collect();
+
+        match self.codec.decode(&ascii) {
+            Ok((_, Response::Status(Status::Tagged(tagged))))
+                if Some(&tagged.tag) == self.tag.as_ref() =>
+            {
+                Some(tagged.into_static())
+            }
+            _ => None,
+        }
+    }
+
     /// Pass `None` initially or after `WantsWrite`, `Some(tag)` after
     /// `WantsTag`, `Some(bytes)` after `WantsRead`, `Some(&[])` on EOF.
     pub fn resume(
@@ -298,6 +320,13 @@ impl<T: Encoder> ImapSend<T> {
                                         if bytes.starts_with(b"* ") {
                                             debug!("skipping undecodable untagged response");
                                             trace!("{}", escape_byte_string(bytes));
+                                            continue;
+                                        }
+
+                                        if let Some(tagged) = self.lossy_completion(bytes) {
+                                            debug!("read a completion holding 8-bit text");
+                                            self.tagged.replace(tagged);
+                                            self.done = true;
                                             continue;
                                         }
 
@@ -516,5 +545,26 @@ mod tests {
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!("A1", tagged.tag.as_ref());
         assert_eq!(StatusKind::Ok, tagged.body.kind);
+    }
+
+    /// Dovecot echoes a UTF-8 mailbox name in the text of a `NO`, which
+    /// IMAP4rev1 keeps ASCII: the completion still ends the exchange.
+    #[test]
+    fn a_completion_holding_8bit_text_is_read() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let reply = "A1 NO [NONEXISTENT] Mailbox doesn't exist: Été\r\n";
+        let ImapSendResult::Ok(out) = send.resume(&mut frag, Some(reply.as_bytes())) else {
+            panic!("expected Ok");
+        };
+
+        let tagged = out.tagged.expect("tagged completion");
+        assert_eq!(StatusKind::No, tagged.body.kind);
+        assert!(tagged.body.text.as_ref().ends_with("exist: ??t??"));
     }
 }

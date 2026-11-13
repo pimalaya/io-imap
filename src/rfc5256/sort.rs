@@ -6,6 +6,11 @@
 //! SEARCH + FETCH + a local sort. Both paths return the same
 //! `Vec<NonZeroU32>`.
 //!
+//! The local sort follows RFC 5256: subjects compare by their base
+//! subject, addresses by the first address's `addr-mailbox`, strings
+//! under `i;ascii-casemap`, and ties keep the sequence order. The RFC
+//! 5957 display keys are not sorted on.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -79,6 +84,7 @@ use imap_codec::{
     imap_types::{
         command::CommandBody,
         core::{Charset, Vec1},
+        envelope::Address,
         extensions::sort::{SortCriterion, SortKey},
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
         response::{Data, StatusKind, Tagged},
@@ -87,6 +93,7 @@ use imap_codec::{
     },
 };
 use log::{debug, trace};
+use mime::codec::rfc2047;
 use thiserror::Error;
 
 use crate::{
@@ -223,41 +230,51 @@ impl ImapMessageSort {
     }
 
     /// Sorts the fetched messages locally and returns their ids in order.
+    ///
+    /// Messages equal on every criterion keep their sequence order, the
+    /// implicit last criterion of RFC 5256 section 3, which `REVERSE`
+    /// does not flip: the map iterates by sequence number and the sort
+    /// is stable.
     fn local_sort(&mut self) -> Vec<NonZeroU32> {
         let uid = self.uid;
-        let criteria = self.sort_criteria.clone();
-        let mut entries: Vec<(NonZeroU32, Vec1<MessageDataItem<'static>>)> =
-            mem::take(&mut self.fetched).into_iter().collect();
-
-        entries.sort_by(|(_, a), (_, b)| {
-            for criterion in criteria.as_ref() {
-                let mut cmp = cmp_fetch_items(&criterion.key, a, b);
-
-                if criterion.reverse {
-                    cmp = cmp.reverse();
-                }
-
-                if cmp.is_ne() {
-                    return cmp;
-                }
-            }
-
-            cmp_fetch_items(&SortKey::Date, a, b)
-        });
-
-        entries
+        let criteria = &self.sort_criteria;
+        let mut entries: Vec<(Option<NonZeroU32>, Vec<SortValue>)> = mem::take(&mut self.fetched)
             .into_iter()
-            .filter_map(|(seq, items)| {
-                if uid {
+            .map(|(seq, items)| {
+                let id = if uid {
                     items.as_ref().iter().find_map(|item| match item {
                         MessageDataItem::Uid(uid) => Some(*uid),
                         _ => None,
                     })
                 } else {
                     Some(seq)
-                }
+                };
+                let values = criteria
+                    .as_ref()
+                    .iter()
+                    .map(|criterion| sort_value(&criterion.key, &items))
+                    .collect();
+                (id, values)
             })
-            .collect()
+            .collect();
+
+        entries.sort_by(|(_, a), (_, b)| {
+            for ((criterion, a), b) in criteria.as_ref().iter().zip(a).zip(b) {
+                let cmp = if criterion.reverse {
+                    b.cmp(a)
+                } else {
+                    a.cmp(b)
+                };
+
+                if cmp.is_ne() {
+                    return cmp;
+                }
+            }
+
+            Ordering::Equal
+        });
+
+        entries.into_iter().filter_map(|(id, _)| id).collect()
     }
 }
 
@@ -358,9 +375,9 @@ impl fmt::Display for State {
 
 /// The FETCH items needed to sort by `sort_criteria` locally.
 ///
-/// Display keys have no comparable data and are skipped; UID is added
-/// in UID mode to recover the sorted ids; an Envelope is always
-/// present so the Date tie-break works.
+/// Display keys have no comparable data and are skipped; Date also
+/// fetches the internal date it falls back to; UID is added in UID mode
+/// to recover the sorted ids.
 fn fetch_items(
     sort_criteria: &Vec1<SortCriterion>,
     uid: bool,
@@ -368,109 +385,225 @@ fn fetch_items(
     let mut items: Vec<MessageDataItemName<'static>> = Vec::new();
 
     for criterion in sort_criteria.as_ref() {
-        let item = match &criterion.key {
-            SortKey::Arrival => Some(MessageDataItemName::InternalDate),
-            SortKey::Size => Some(MessageDataItemName::Rfc822Size),
-            SortKey::Cc | SortKey::Date | SortKey::From | SortKey::Subject | SortKey::To => {
-                Some(MessageDataItemName::Envelope)
+        let needed: &[MessageDataItemName<'static>] = match &criterion.key {
+            SortKey::Arrival => &[MessageDataItemName::InternalDate],
+            SortKey::Size => &[MessageDataItemName::Rfc822Size],
+            SortKey::Date => &[
+                MessageDataItemName::Envelope,
+                MessageDataItemName::InternalDate,
+            ],
+            SortKey::Cc | SortKey::From | SortKey::Subject | SortKey::To => {
+                &[MessageDataItemName::Envelope]
             }
-            SortKey::DisplayFrom | SortKey::DisplayTo => None,
+            SortKey::DisplayFrom | SortKey::DisplayTo => &[],
         };
 
-        if let Some(item) = item
-            && !items.contains(&item)
-        {
-            items.push(item);
+        for item in needed {
+            if !items.contains(item) {
+                items.push(item.clone());
+            }
         }
-    }
-
-    if !items.contains(&MessageDataItemName::Envelope) {
-        items.push(MessageDataItemName::Envelope);
     }
 
     if uid && !items.contains(&MessageDataItemName::Uid) {
         items.push(MessageDataItemName::Uid);
     }
 
+    // NOTE: a FETCH needs at least one item; a sort by display keys
+    // alone keeps the sequence order.
+    if items.is_empty() {
+        items.push(MessageDataItemName::Rfc822Size);
+    }
+
     items
 }
 
-/// Compares two fetched messages by a single sort key.
+/// The value one sort key reads off a fetched message.
 ///
-/// From/To/Cc/Display fall through to `Equal`: imap-types `Address`
-/// has no `Ord`, so (matching himalaya 1.2.0) those keys are a no-op
-/// and defer to the Date tie-break.
-fn cmp_fetch_items(
-    key: &SortKey,
-    a: &Vec1<MessageDataItem<'static>>,
-    b: &Vec1<MessageDataItem<'static>>,
-) -> Ordering {
+/// One criterion always yields the same variant, so the derived order
+/// compares like with like; `None` sorts before any value.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SortValue {
+    Instant(Option<DateTime<FixedOffset>>),
+    Size(Option<u32>),
+    Text(Vec<u8>),
+    Unsorted,
+}
+
+/// Reads the value of `key` off a fetched message (RFC 5256 section 3).
+///
+/// Strings compare under `i;ascii-casemap`, the default collation; a
+/// missing string is empty. The RFC 5957 display keys are not sorted on.
+fn sort_value(key: &SortKey, items: &Vec1<MessageDataItem<'static>>) -> SortValue {
+    let internal_date = || {
+        items.as_ref().iter().find_map(|item| match item {
+            MessageDataItem::InternalDate(date) => Some(*date.as_ref()),
+            _ => None,
+        })
+    };
+    let envelope = || {
+        items.as_ref().iter().find_map(|item| match item {
+            MessageDataItem::Envelope(envelope) => Some(envelope),
+            _ => None,
+        })
+    };
+
     match key {
-        SortKey::Arrival => {
-            let a = a.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::InternalDate(date) => Some(date.as_ref()),
-                _ => None,
-            });
-            let b = b.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::InternalDate(date) => Some(date.as_ref()),
-                _ => None,
-            });
-            a.cmp(&b)
-        }
-        SortKey::Size => {
-            let a = a.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Rfc822Size(size) => Some(size),
-                _ => None,
-            });
-            let b = b.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Rfc822Size(size) => Some(size),
-                _ => None,
-            });
-            a.cmp(&b)
-        }
+        SortKey::Arrival => SortValue::Instant(internal_date()),
+        SortKey::Size => SortValue::Size(items.as_ref().iter().find_map(|item| match item {
+            MessageDataItem::Rfc822Size(size) => Some(*size),
+            _ => None,
+        })),
         SortKey::Date => {
-            // The ENVELOPE `date` is the raw `Date:` header (RFC 5322),
-            // so it must be parsed to an instant before comparing: a
-            // lexical string compare orders by weekday name, not time.
-            let a = a.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Envelope(envelope) => envelope.date.0.as_ref().map(AsRef::as_ref),
-                _ => None,
-            });
-            let b = b.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Envelope(envelope) => envelope.date.0.as_ref().map(AsRef::as_ref),
-                _ => None,
-            });
-            date_sort_key(a).cmp(&date_sort_key(b))
+            let date = envelope().and_then(|envelope| envelope.date.0.as_ref());
+            let date = date_sort_key(date.map(AsRef::as_ref));
+            SortValue::Instant(date.or_else(internal_date))
         }
         SortKey::Subject => {
-            let a = a.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Envelope(envelope) => {
-                    envelope.subject.0.as_ref().map(AsRef::as_ref)
-                }
-                _ => None,
-            });
-            let b = b.as_ref().iter().find_map(|item| match item {
-                MessageDataItem::Envelope(envelope) => {
-                    envelope.subject.0.as_ref().map(AsRef::as_ref)
-                }
-                _ => None,
-            });
-            a.cmp(&b)
+            let subject = envelope().and_then(|envelope| envelope.subject.0.as_ref());
+            let subject = subject.map(AsRef::as_ref).unwrap_or_default();
+            SortValue::Text(base_subject(subject).into_bytes().to_ascii_uppercase())
         }
-        SortKey::Cc | SortKey::From | SortKey::To | SortKey::DisplayFrom | SortKey::DisplayTo => {
-            Ordering::Equal
-        }
+        SortKey::From => SortValue::Text(addr_mailbox(envelope().map(|e| &e.from))),
+        SortKey::To => SortValue::Text(addr_mailbox(envelope().map(|e| &e.to))),
+        SortKey::Cc => SortValue::Text(addr_mailbox(envelope().map(|e| &e.cc))),
+        SortKey::DisplayFrom | SortKey::DisplayTo => SortValue::Unsorted,
     }
+}
+
+/// The `addr-mailbox` of the first address of a list, uppercased.
+///
+/// Group markers carry no host and are skipped (RFC 3501 section 7.4.2).
+fn addr_mailbox(addresses: Option<&Vec<Address<'static>>>) -> Vec<u8> {
+    let first = addresses
+        .into_iter()
+        .flatten()
+        .find(|address| address.host.0.is_some());
+    let mailbox = first.and_then(|address| address.mailbox.0.as_ref());
+
+    mailbox
+        .map(|mailbox| AsRef::<[u8]>::as_ref(mailbox).to_ascii_uppercase())
+        .unwrap_or_default()
 }
 
 /// Parses a raw `Date:` header (RFC 5322 / 2822) into a comparable
 /// instant, so `SortKey::Date` orders chronologically rather than by the
 /// header's leading weekday. The ENVELOPE date arrives as bytes; a
-/// non-UTF-8, unparsable, or absent header yields `None`, which sorts
-/// before any real date.
+/// non-UTF-8, unparsable, or absent header yields `None`.
 fn date_sort_key(raw: Option<&[u8]>) -> Option<DateTime<FixedOffset>> {
     let raw = from_utf8(raw?).ok()?;
     DateTime::parse_from_rfc2822(raw).ok()
+}
+
+/// Extracts the base subject of a raw subject (RFC 5256 section 2.1).
+///
+/// Encoded words are decoded, blanks collapsed to one space, then the
+/// reply and forward leaders, the `(fwd)` trailers, the leading
+/// `[blob]`s and the `[fwd: ...]` wrapper are stripped until none is
+/// left.
+fn base_subject(raw: &[u8]) -> String {
+    let decoded = rfc2047::decode_text(raw);
+    let mut text = String::with_capacity(decoded.len());
+
+    for c in decoded.chars() {
+        let c = if matches!(c, '\t' | '\r' | '\n') {
+            ' '
+        } else {
+            c
+        };
+
+        if c != ' ' || !text.ends_with(' ') {
+            text.push(c);
+        }
+    }
+
+    let mut subject = text.as_str();
+
+    loop {
+        // Step 2: the trailers.
+        loop {
+            let bytes = subject.as_bytes();
+
+            if let Some(rest) = subject.strip_suffix(' ') {
+                subject = rest;
+            } else if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b"(fwd)") {
+                subject = &subject[..subject.len() - 5];
+            } else {
+                break;
+            }
+        }
+
+        // Steps 3 to 5: the leaders, then a blob leaving a non-empty base.
+        loop {
+            let len = subject.len();
+
+            if let Some(rest) = subject.strip_prefix(' ') {
+                subject = rest;
+            } else if let Some(rest) = strip_leader(subject) {
+                subject = rest;
+            } else if let Some(rest) = strip_blob(subject)
+                && !rest.is_empty()
+            {
+                subject = rest;
+            }
+
+            if subject.len() == len {
+                break;
+            }
+        }
+
+        // Step 6: the `[fwd: ...]` wrapper.
+        let bytes = subject.as_bytes();
+
+        if bytes.len() >= 6 && bytes[..5].eq_ignore_ascii_case(b"[fwd:") && bytes.ends_with(b"]") {
+            subject = &subject[5..subject.len() - 1];
+        } else {
+            break;
+        }
+    }
+
+    String::from(subject)
+}
+
+/// Strips one `subj-leader` but its WSP form: `*subj-blob subj-refwd`.
+fn strip_leader(mut subject: &str) -> Option<&str> {
+    while let Some(rest) = strip_blob(subject) {
+        subject = rest;
+    }
+
+    let bytes = subject.as_bytes();
+    let prefix = if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"fwd") {
+        3
+    } else if bytes.len() >= 2
+        && (bytes[..2].eq_ignore_ascii_case(b"fw") || bytes[..2].eq_ignore_ascii_case(b"re"))
+    {
+        2
+    } else {
+        return None;
+    };
+
+    subject = subject[prefix..].trim_start_matches(' ');
+
+    if let Some(rest) = strip_blob(subject) {
+        subject = rest;
+    }
+
+    subject.strip_prefix(':')
+}
+
+/// Strips one `subj-blob`: a bracketed run and the blanks after it.
+///
+/// Any character but a bracket is taken inside, as Dovecot does, rather
+/// than the ASCII the ABNF lists, so a tag in another script is a blob.
+fn strip_blob(subject: &str) -> Option<&str> {
+    let rest = subject.strip_prefix('[')?;
+    let end = rest.find(['[', ']'])?;
+
+    if rest.as_bytes()[end] != b']' {
+        return None;
+    }
+
+    Some(rest[end + 1..].trim_start_matches(' '))
 }
 
 #[cfg(test)]
@@ -627,6 +760,145 @@ mod tests {
         );
         let ids = complete_ok(&mut sort, &mut frag, Some(fetch_reply.as_bytes()));
         assert_eq!(vec![nz(2), nz(1)], ids);
+    }
+
+    #[test]
+    fn base_subject_strips_what_rfc5256_lists() {
+        let cases: [(&[u8], &str); 12] = [
+            (b"Re: echo thread start", "echo thread start"),
+            (b"RE: re:Fwd: FW: echo", "echo"),
+            (b"Re [2]: echo", "echo"),
+            (b"[list] Re: echo", "echo"),
+            (b"[list] [tag] echo", "echo"),
+            (b"[list]", "[list]"),
+            (b"echo (fwd) (FWD)  ", "echo"),
+            (b"[Fwd: Re: echo]", "echo"),
+            (b"[fwd: [list] echo (fwd)]", "echo"),
+            (b"  echo \t\r\n  thread  ", "echo thread"),
+            (
+                b"=?UTF-8?B?Q2Fmw6kgZMOpasOgIHZ1?= charlie",
+                "Café déjà vu charlie",
+            ),
+            (b"Regarding: echo", "Regarding: echo"),
+        ];
+
+        for (raw, expected) in cases {
+            let raw_str = str::from_utf8(raw).expect("utf8 subject");
+            assert_eq!(base_subject(raw), expected, "base subject of {raw_str:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_sorts_subjects_by_base_subject_ignoring_case() {
+        let ids = sort_fetched(
+            SortKey::Subject,
+            false,
+            &[
+                "(NIL \"Bravo two\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+                "(NIL \"delta four\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+                "(NIL \"Echo\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+                "(NIL \"=?UTF-8?B?Q2Fmw6kgZMOpasOgIHZ1?= charlie\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+                "(NIL \"[list] alpha (fwd)\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+                "(NIL \"Re: echo thread start\" NIL NIL NIL NIL NIL NIL NIL NIL)",
+            ],
+        );
+
+        assert_eq!(ids, [5, 1, 4, 2, 3, 6].map(nz));
+    }
+
+    #[test]
+    fn fallback_sorts_addresses_by_first_mailbox() {
+        let from = |from: &str| format!("(NIL NIL {from} NIL NIL NIL NIL NIL NIL NIL)");
+        let ids = sort_fetched(
+            SortKey::From,
+            false,
+            &[
+                from("((\"Zed\" NIL \"fx\" \"example.org\"))"),
+                from("((\"Ann\" NIL \"Eve\" \"a.example\"))"),
+                // A group opens the list: its marker carries no host.
+                from("((NIL NIL \"team\" NIL)(NIL NIL \"bob\" \"z.example\")(NIL NIL NIL NIL))"),
+                from("((NIL NIL \"alice\" \"z.example\")(NIL NIL \"aaron\" \"example.org\"))"),
+                from("NIL"),
+            ],
+        );
+
+        assert_eq!(ids, [5, 4, 3, 2, 1].map(nz));
+    }
+
+    #[test]
+    fn fallback_ties_keep_sequence_order_when_reversed() {
+        let from = |from: &str| format!("(NIL NIL (({from})) NIL NIL NIL NIL NIL NIL NIL)");
+        let ids = sort_fetched(
+            SortKey::From,
+            true,
+            &[
+                from("NIL NIL \"alice\" \"example.org\""),
+                from("NIL NIL \"bob\" \"example.org\""),
+                from("NIL NIL \"ALICE\" \"example.net\""),
+                from("NIL NIL \"bob\" \"example.net\""),
+            ],
+        );
+
+        assert_eq!(ids, [2, 4, 1, 3].map(nz));
+    }
+
+    #[test]
+    fn fallback_date_falls_back_to_the_internal_date() {
+        let date = |date: &str| format!("({date} NIL NIL NIL NIL NIL NIL NIL NIL NIL)");
+        let ids = sort_fetched(
+            SortKey::Date,
+            false,
+            &[
+                date("\"Sun, 04 Jan 2026 00:00:00 +0000\""),
+                date("NIL"),
+                date("\"Thu, 01 Jan 2026 00:00:00 +0000\""),
+                date("\"not a date\""),
+            ],
+        );
+
+        // The undated 2 and 4 take their internal dates, 2 and 4 Jan.
+        assert_eq!(ids, [3, 2, 1, 4].map(nz));
+    }
+
+    /// Runs the UID fallback over messages whose envelopes are given in
+    /// sequence order, UID `n` and internal date `n` Jan 2026 for the
+    /// `n`th one.
+    fn sort_fetched(key: SortKey, reverse: bool, envelopes: &[impl AsRef<str>]) -> Vec<NonZeroU32> {
+        let criteria = Vec1::try_from(vec![SortCriterion { reverse, key }]).expect("criterion");
+        let opts = ImapMessageSortOptions {
+            uid: true,
+            fallback: true,
+        };
+        let mut sort = ImapMessageSort::new(criteria, search_criteria(), opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        wants_tag(&mut sort, &mut frag, None);
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A1"));
+        let search_tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+        wants_read(&mut sort, &mut frag, None);
+
+        let ids: Vec<String> = (1..=envelopes.len()).map(|n| n.to_string()).collect();
+        let search_reply = format!(
+            "* SEARCH {}\r\n{search_tag} OK SEARCH completed\r\n",
+            ids.join(" ")
+        );
+        wants_tag(&mut sort, &mut frag, Some(search_reply.as_bytes()));
+        let bytes = wants_write(&mut sort, &mut frag, Some(b"A2"));
+        let fetch_tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
+        wants_read(&mut sort, &mut frag, None);
+
+        let mut fetch_reply = String::new();
+        for (i, envelope) in envelopes.iter().enumerate() {
+            let n = i + 1;
+            fetch_reply.push_str(&format!(
+                "* {n} FETCH (UID {n} INTERNALDATE \"{n:02}-Jan-2026 00:00:00 +0000\" \
+                 ENVELOPE {})\r\n",
+                envelope.as_ref()
+            ));
+        }
+        fetch_reply.push_str(&format!("{fetch_tag} OK FETCH completed\r\n"));
+
+        complete_ok(&mut sort, &mut frag, Some(fetch_reply.as_bytes()))
     }
 
     #[test]

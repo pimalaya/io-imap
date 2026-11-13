@@ -43,3 +43,12 @@ A send ends only on the tagged completion carrying the tag of the command it bel
 
 - **WHEN** a send for the command tagged `A1` reads `B9 NO not yours`, then `A1 OK`
 - **THEN** it keeps reading after `B9`, and completes with the `A1 OK` status
+
+### Requirement: A completion holding 8-bit text is read
+
+A tagged completion of the command that fails to decode only for the 8-bit bytes of its text, which IMAP4rev1 keeps ASCII but servers send (Dovecot echoes a UTF-8 mailbox name in a `NO`), SHALL be decoded again with each such byte read as `?`, and end the exchange with its status. An untagged response that does not decode SHALL be skipped.
+
+#### Scenario: Dovecot names a missing mailbox
+
+- **WHEN** a send for the command tagged `A1` reads `A1 NO [NONEXISTENT] Mailbox doesn't exist: Été`
+- **THEN** it completes with the `NO` status and the text `Mailbox doesn't exist: ??t??`

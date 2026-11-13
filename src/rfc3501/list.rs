@@ -69,7 +69,7 @@ use thiserror::Error;
 use crate::{
     coroutine::*,
     imap_try,
-    rfc3501::mailbox::{decode_inplace, encode_inplace},
+    rfc3501::mailbox::{decode_inplace, encode_inplace, encode_list_inplace},
     send::*,
 };
 
@@ -108,8 +108,12 @@ pub struct ImapMailboxList {
 impl ImapMailboxList {
     /// Builds a LIST coroutine listing mailboxes matching
     /// `mailbox_wildcard` under `reference`.
-    pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
+    pub fn new(
+        mut reference: Mailbox<'static>,
+        mut mailbox_wildcard: ListMailbox<'static>,
+    ) -> Self {
         encode_inplace(&mut reference);
+        encode_list_inplace(&mut mailbox_wildcard);
 
         let body = CommandBody::List {
             reference,

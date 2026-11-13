@@ -69,7 +69,7 @@ use crate::{
     imap_try,
     rfc3501::{
         list::ImapMailboxListing,
-        mailbox::{decode_inplace, encode_inplace},
+        mailbox::{decode_inplace, encode_inplace, encode_list_inplace},
     },
     send::*,
 };
@@ -102,8 +102,12 @@ pub struct ImapMailboxLsub {
 impl ImapMailboxLsub {
     /// Builds an LSUB coroutine listing subscribed mailboxes matching
     /// `mailbox_wildcard` under `reference`.
-    pub fn new(mut reference: Mailbox<'static>, mailbox_wildcard: ListMailbox<'static>) -> Self {
+    pub fn new(
+        mut reference: Mailbox<'static>,
+        mut mailbox_wildcard: ListMailbox<'static>,
+    ) -> Self {
         encode_inplace(&mut reference);
+        encode_list_inplace(&mut mailbox_wildcard);
 
         let body = CommandBody::Lsub {
             reference,
