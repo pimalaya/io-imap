@@ -80,3 +80,17 @@ A watch SHALL hand out what it knows of its mailbox once its baseline is taken: 
 
 - **WHEN** a watch is resumed from UIDVALIDITY 1700 and resync point 42
 - **THEN** after ENABLE it writes `EXAMINE INBOX (QRESYNC (1700 42))`, and emits what the reply reports
+
+### Requirement: An incomplete listing removes nothing
+
+A whole-mailbox re-read whose FETCH skipped a line for not decoding SHALL report no removal and keep in the shadow the messages its snapshot misses, while still reporting the additions and flag changes it read. A QRESYNC reply that skipped a line SHALL apply what it read and keep its resync point, so the next resync asks again from it.
+
+#### Scenario: One line of the re-read does not decode
+
+- **WHEN** a watch knowing UIDs 1 and 2 re-reads a mailbox whose line for UID 1 is skipped and whose UID 2 is now `\Seen`
+- **THEN** it emits the `\Seen` of 2 alone, and its state still holds UID 1
+
+#### Scenario: One line of a QRESYNC reply does not decode
+
+- **WHEN** a watch at resync point 42 reads a reply announcing `HIGHESTMODSEQ 50` and skips one of its FETCH lines
+- **THEN** its state keeps the resync point 42

@@ -474,8 +474,13 @@ impl ImapClientError {
                 | ImapMessageSortError::Fetch(ImapMessageFetchError::Bye(_)),
             )
             | Self::MessageFetch(ImapMessageFetchError::Bye(_))
-            | Self::MessageFetchStream(ImapMessageFetchStreamError::Bye(_))
-            | Self::MessageFetchStreamBatch(ImapMessageFetchStreamBatchError::Bye(_))
+            | Self::MessageFetchStream(
+                ImapMessageFetchStreamError::Bye(_) | ImapMessageFetchStreamError::ShortBody,
+            )
+            | Self::MessageFetchStreamBatch(
+                ImapMessageFetchStreamBatchError::Bye(_)
+                | ImapMessageFetchStreamBatchError::ShortBody,
+            )
             | Self::MessageSearch(ImapMessageSearchError::Bye(_))
             | Self::MessageStore(ImapMessageStoreError::Bye(_))
             | Self::MessageCopy(ImapMessageCopyError::Bye(_))
@@ -497,7 +502,7 @@ impl ImapClientError {
             | Self::MailboxWatch(
                 Watch::Examine(ImapMailboxExamineError::Bye(_))
                 | Watch::Fetch(ImapMessageFetchError::Bye(_))
-                | Watch::Idle(ImapIdleError::Bye(_))
+                | Watch::Idle(ImapIdleError::Bye(_) | ImapIdleError::Eof)
                 | Watch::Enable(ImapExtensionEnableError::Bye(_)),
             ) => true,
             #[cfg(feature = "scram")]
@@ -570,6 +575,22 @@ macro_rules! imap_client_commands {
                 opts: ImapLoginOptions,
             ) -> Result<Vec<Capability<'static>>, ImapClientError> {
                 self.run(ImapLogin::new(user, password, opts)?)
+            }
+
+            /// SASL `AUTHENTICATE SCRAM-SHA-256`.
+            ///
+            /// The credentials carry the client nonce, which RFC 5802
+            /// wants drawn from at least 18 bytes of cryptographic
+            /// randomness and which must not be empty, and the channel
+            /// binding deciding whether the exchange announces
+            /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
+            #[cfg(feature = "scram")]
+            fn auth_scram_sha256(
+                &mut self,
+                creds: SaslScramCreds,
+                opts: ImapAuthScramSha256Options,
+            ) -> Result<Vec<Capability<'static>>, ImapClientError> {
+                self.run(ImapAuthScramSha256::new(creds, opts)?)
             }
 
             /// Sends one or more caller-tagged command lines
@@ -653,6 +674,29 @@ macro_rules! imap_client_commands {
                 let fut: core::pin::Pin<alloc::boxed::Box<dyn Future<Output = _> + Send + '_>> =
                     match ImapLogin::new(user, password, opts) {
                         Ok(login) => alloc::boxed::Box::pin(self.run(login)),
+                        Err(err) => alloc::boxed::Box::pin(core::future::ready(Err(err.into()))),
+                    };
+                fut
+            }
+
+            /// SASL `AUTHENTICATE SCRAM-SHA-256`.
+            ///
+            /// The credentials carry the client nonce, which RFC 5802
+            /// wants drawn from at least 18 bytes of cryptographic
+            /// randomness and which must not be empty, and the channel
+            /// binding deciding whether the exchange announces
+            /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
+            #[cfg(feature = "scram")]
+            fn auth_scram_sha256(
+                &mut self,
+                creds: SaslScramCreds,
+                opts: ImapAuthScramSha256Options,
+            ) -> impl Future<Output = Result<Vec<Capability<'static>>, ImapClientError>> + Send
+            {
+                // Boxed for the same reason as `login`.
+                let fut: core::pin::Pin<alloc::boxed::Box<dyn Future<Output = _> + Send + '_>> =
+                    match ImapAuthScramSha256::new(creds, opts) {
+                        Ok(auth) => alloc::boxed::Box::pin(self.run(auth)),
                         Err(err) => alloc::boxed::Box::pin(core::future::ready(Err(err.into()))),
                     };
                 fut
@@ -762,20 +806,6 @@ imap_client_commands! {
         opts: ImapAuthXoauth2Options,
     ) -> Vec<Capability<'static>> {
         ImapAuthXoauth2::new(user, token, opts)
-    }
-
-    /// SASL `AUTHENTICATE SCRAM-SHA-256`.
-    ///
-    /// The credentials carry the client nonce, which RFC 5802 wants
-    /// drawn from at least 18 bytes of cryptographic randomness, and the
-    /// channel binding deciding whether the exchange announces
-    /// `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`.
-    #[cfg(feature = "scram")]
-    fn auth_scram_sha256(
-        creds: SaslScramCreds,
-        opts: ImapAuthScramSha256Options,
-    ) -> Vec<Capability<'static>> {
-        ImapAuthScramSha256::new(creds, opts)
     }
 
     /// `LOGOUT`; ends the session.
@@ -1098,10 +1128,10 @@ impl ImapClientStd {
     /// Reads the next bytes of a server response, a closed connection
     /// being an `UnexpectedEof` failure rather than an empty read.
     ///
-    /// Mid-response is the wrong place for the peer to hang up: the
-    /// coroutine waiting on those bytes would otherwise be resumed with
-    /// an empty slice forever. Not-ready failures never reach here, the
-    /// stream retrying them under its own strategy.
+    /// Mid-response is the wrong place for the peer to hang up, so it
+    /// fails here as an I/O error, whatever the coroutine waiting on
+    /// those bytes makes of an empty read. Not-ready failures never
+    /// reach here, the stream retrying them under its own strategy.
     fn read_response(&mut self, buf: &mut [u8]) -> Result<usize, ImapClientError> {
         match self.stream.read(buf)? {
             0 => {
@@ -1657,6 +1687,8 @@ mod tests {
             ImapClientError::from(ImapGreetingGetError::Eof),
             ImapClientError::from(ImapMessageFetchError::Bye("going down".into())),
             ImapClientError::from(ImapMailboxWatchError::from(bye)),
+            ImapClientError::from(ImapMailboxWatchError::from(ImapIdleError::Eof)),
+            ImapClientError::from(ImapMessageFetchStreamError::ShortBody),
             ImapClientError::from(io),
         ] {
             assert!(err.is_connection_lost(), "{err:?}");

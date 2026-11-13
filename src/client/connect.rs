@@ -70,9 +70,9 @@ pub struct ImapClientStdConnectOptions {
     /// authentication.
     ///
     /// SCRAM credentials carrying an empty nonce are given one drawn at
-    /// connect time, an empty nonce being no nonce at all as far as RFC
-    /// 5802 is concerned; a caller wanting its own passes it in the
-    /// credentials.
+    /// connect time; a caller wanting its own passes it in the
+    /// credentials. Only `connect` draws one: the SCRAM coroutine and
+    /// [`ImapSessionOpen`] refuse an empty nonce.
     pub sasl: Option<Sasl>,
     /// The protocol options handed to [`ImapSessionOpen`].
     pub session: ImapSessionOpenOptions,

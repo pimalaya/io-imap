@@ -109,13 +109,16 @@ pub enum ImapIdleError {
     /// The stream reached EOF while waiting for server responses.
     #[error("IMAP IDLE failed: reached unexpected EOF on stream")]
     Eof,
-    /// A server response could not be decoded.
+    /// A server response could not be decoded; carries its first
+    /// octets.
     #[error("IMAP IDLE failed: decode response error")]
     DecodingFailure(Secret<Box<[u8]>>),
-    /// A server response was flagged as poisoned by the fragmentizer.
+    /// A server response was flagged as poisoned by the fragmentizer;
+    /// carries its first octets.
     #[error("IMAP IDLE failed: parse response error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
-    /// A server response exceeded the fragmentizer's maximum size.
+    /// A server response exceeded the fragmentizer's maximum size;
+    /// carries its first octets.
     #[error("IMAP IDLE failed: parse response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
     /// The underlying send sub-coroutine failed.
@@ -334,16 +337,13 @@ impl ImapCoroutine for ImapIdle {
                                                     continue;
                                                 }
 
-                                                let bytes = Secret::new(bytes.into());
-                                                ImapIdleError::DecodingFailure(bytes)
+                                                ImapIdleError::DecodingFailure(error_bytes(bytes))
                                             }
                                             DecodeMessageError::MessageTooLong { .. } => {
-                                                let bytes = Secret::new(bytes.into());
-                                                ImapIdleError::MessageTooLong(bytes)
+                                                ImapIdleError::MessageTooLong(error_bytes(bytes))
                                             }
                                             DecodeMessageError::MessagePoisoned { .. } => {
-                                                let bytes = Secret::new(bytes.into());
-                                                ImapIdleError::MessageIsPoisoned(bytes)
+                                                ImapIdleError::MessageIsPoisoned(error_bytes(bytes))
                                             }
                                         };
                                         return ImapCoroutineState::Complete(Err(err));

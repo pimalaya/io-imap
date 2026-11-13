@@ -75,8 +75,7 @@ use thiserror::Error;
 
 use crate::coroutine::*;
 
-/// Upper bound on the size of a single parsed command, mirroring the
-/// read-side fragmentizer cap.
+/// Upper bound on the size of a single parsed command.
 const MAX_COMMAND_SIZE: u32 = 50 * 1024 * 1024;
 
 /// Failure causes during the IMAP raw passthrough flow.

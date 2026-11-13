@@ -50,7 +50,7 @@
 //! };
 //!
 //! let opts = ImapAuthScramSha256Options::default();
-//! let mut coroutine = ImapAuthScramSha256::new(creds, opts);
+//! let mut coroutine = ImapAuthScramSha256::new(creds, opts).unwrap();
 //! let mut tags = TagGenerator::new();
 //! let mut tag;
 //! let mut arg = None;
@@ -121,6 +121,9 @@ pub enum ImapAuthScramSha256Error {
     /// The server closed the connection with an untagged BYE.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: BYE {0}")]
     Bye(String),
+    /// The credentials carry an empty client nonce.
+    #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: client nonce is empty")]
+    EmptyNonce,
     /// The server never returned the final tagged response.
     #[error("IMAP AUTHENTICATE SCRAM-SHA-256 failed: server did not return a tagged response")]
     MissingTagged,
@@ -186,7 +189,8 @@ impl ImapAuthScramSha256 {
     /// least 18 bytes of cryptographic randomness. It is an input
     /// rather than something drawn here, an I/O-free coroutine having
     /// no source of randomness, and it makes the exchange
-    /// deterministically testable.
+    /// deterministically testable. An empty one fails with `EmptyNonce`:
+    /// any server nonce would extend it.
     ///
     /// They also carry the channel binding, which decides whether the
     /// exchange announces `SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`. This
@@ -196,13 +200,20 @@ impl ImapAuthScramSha256 {
     /// Depending on `opts.initial_request`, the client-first-message
     /// goes inline with the AUTHENTICATE command (SASL-IR) or is
     /// uploaded after the server challenge.
-    pub fn new(creds: SaslScramCreds, opts: ImapAuthScramSha256Options) -> Self {
-        Self {
+    pub fn new(
+        creds: SaslScramCreds,
+        opts: ImapAuthScramSha256Options,
+    ) -> Result<Self, ImapAuthScramSha256Error> {
+        if creds.nonce.is_empty() {
+            return Err(ImapAuthScramSha256Error::EmptyNonce);
+        }
+
+        Ok(Self {
             state: State::Start,
             mechanism: SaslScramSha256::new(creds),
             observed: Vec::new(),
             opts,
-        }
+        })
     }
 
     // helper that tells if the coroutine needs to fetch capability or not (in
@@ -548,7 +559,8 @@ mod tests {
             },
             ..creds()
         };
-        let mut auth = ImapAuthScramSha256::new(creds, Default::default());
+        let opts = ImapAuthScramSha256Options::default();
+        let mut auth = ImapAuthScramSha256::new(creds, opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -567,13 +579,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_nonce_is_refused() {
+        let creds = SaslScramCreds {
+            nonce: Vec::new(),
+            ..creds()
+        };
+        let res = ImapAuthScramSha256::new(creds, Default::default());
+        assert!(matches!(res, Err(ImapAuthScramSha256Error::EmptyNonce)));
+    }
+
+    #[test]
     fn ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options {
             initial_request: true,
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -612,7 +634,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -649,7 +671,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -673,7 +695,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -706,7 +728,7 @@ mod tests {
     #[test]
     fn non_ir_success_returns_ok() {
         let opts = ImapAuthScramSha256Options::default();
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);
@@ -753,7 +775,7 @@ mod tests {
     #[test]
     fn non_ir_server_error_returns_mechanism_error() {
         let opts = ImapAuthScramSha256Options::default();
-        let mut auth = ImapAuthScramSha256::new(creds(), opts);
+        let mut auth = ImapAuthScramSha256::new(creds(), opts).expect("nonce given");
         let mut frag = Fragmentizer::new(50 * 1024 * 1024);
 
         expect_wants_tag(&mut auth, &mut frag);

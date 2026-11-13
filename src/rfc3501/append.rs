@@ -142,7 +142,8 @@ impl ImapMessageAppend {
             message: LiteralOrLiteral8::Literal(literal),
         };
 
-        trace!("send IMAP command {body:?}");
+        // NOTE: never log the arguments, they hold the whole message.
+        trace!("send IMAP command {}", body.name());
 
         let state = State::Send(ImapSend::command(body));
 
@@ -242,10 +243,12 @@ mod tests {
         assert!(line.ends_with("{2}\r\n"));
 
         // NOTE: synchronising literal: wait for `+`, then send the
-        // body inline.
+        // body, a write of its own.
         expect_wants_read(&mut append, &mut frag, None);
         let body = expect_wants_write(&mut append, &mut frag, Some(b"+ go\r\n"));
-        assert_eq!(body, b"hi\r\n");
+        assert_eq!(body, b"hi");
+        let end = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(end, b"\r\n");
         expect_wants_read(&mut append, &mut frag, None);
 
         let reply = format!("* 1 EXISTS\r\n{tag} OK [APPENDUID 1700000000 7] APPEND completed\r\n");
@@ -256,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn non_sync_sends_body_inline() {
+    fn non_sync_sends_body_without_waiting() {
         let mut append = ImapMessageAppend::new(
             "INBOX".try_into().expect("valid mailbox"),
             b"hi".to_vec(),
@@ -271,8 +274,12 @@ mod tests {
         let header = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let line = str::from_utf8(&header).expect("utf8 header");
         let tag = first_word(line).to_owned();
-        assert!(line.contains("{2+}\r\nhi\r\n"));
+        assert!(line.ends_with("{2+}\r\n"));
 
+        let body = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(body, b"hi");
+        let end = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(end, b"\r\n");
         expect_wants_read(&mut append, &mut frag, None);
 
         let reply = format!("{tag} OK APPEND completed\r\n");

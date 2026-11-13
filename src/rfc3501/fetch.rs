@@ -106,7 +106,12 @@
 
 use core::{fmt, num::NonZeroU32};
 
-use alloc::{collections::BTreeMap, string::String, string::ToString, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, btree_map::Entry},
+    string::String,
+    string::ToString,
+    vec::Vec,
+};
 
 use imap_codec::{
     CommandCodec,
@@ -213,27 +218,35 @@ impl ImapCoroutine for ImapMessageFetch {
                     return ImapCoroutineState::Complete(Err(err));
                 };
 
-                let mut output: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>> =
+                let mut data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>> =
                     BTreeMap::new();
-                for data in out.data {
-                    if let Data::Fetch { seq, items } = data {
-                        output.entry(seq).or_default().extend(items);
+
+                for response in out.data {
+                    let Data::Fetch { seq, items } = response else {
+                        continue;
+                    };
+
+                    // NOTE: a message answered in several FETCH lines is
+                    // the rare case, the only one to rebuild its items.
+                    match data.entry(seq) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(items);
+                        }
+                        Entry::Occupied(entry) => {
+                            let (seq, known) = entry.remove_entry();
+                            let mut known = known.into_inner();
+                            known.extend(items);
+                            data.insert(seq, Vec1::unvalidated(known));
+                        }
                     }
                 }
 
                 match body.kind {
-                    StatusKind::Ok => {
-                        let data = output
-                            .into_iter()
-                            .map(|(key, val)| (key, Vec1::unvalidated(val)))
-                            .collect();
-
-                        ImapCoroutineState::Complete(Ok(ImapOutput {
-                            data,
-                            alerts,
-                            skipped: out.skipped,
-                        }))
-                    }
+                    StatusKind::Ok => ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data,
+                        alerts,
+                        skipped: out.skipped,
+                    })),
                     StatusKind::No => {
                         let err = ImapMessageFetchError::No(body.into());
                         ImapCoroutineState::Complete(Err(err))

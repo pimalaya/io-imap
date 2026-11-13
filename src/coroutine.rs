@@ -3,6 +3,8 @@
 //! `Yield` covers intermediate progress, `Return` the terminal output,
 //! [`ImapCoroutineState`] both.
 
+use core::fmt;
+
 use alloc::vec::Vec;
 
 use imap_codec::fragmentizer::Fragmentizer;
@@ -38,7 +40,6 @@ pub trait ImapCoroutine {
 
 /// Standard yield variants: the next command tag and socket I/O; pick
 /// another type when extra variants (events, etc.) are needed.
-#[derive(Debug)]
 pub enum ImapYield {
     /// The caller resumes with the tag of the next command, unique on
     /// the connection.
@@ -47,6 +48,17 @@ pub enum ImapYield {
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
+}
+
+impl fmt::Debug for ImapYield {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WantsTag => f.write_str("WantsTag"),
+            Self::WantsRead => f.write_str("WantsRead"),
+            // NOTE: a write may hold credentials, its length does not.
+            Self::WantsWrite(bytes) => write!(f, "WantsWrite({} octets)", bytes.len()),
+        }
+    }
 }
 
 /// Coroutine `?`: forwards `Yielded` (via `Into`), short-circuits on
@@ -64,4 +76,17 @@ macro_rules! imap_try {
             $crate::coroutine::ImapCoroutineState::Complete(Ok(value)) => value,
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::format;
+
+    use crate::coroutine::*;
+
+    #[test]
+    fn debug_of_a_write_prints_its_length_only() {
+        let yielded = ImapYield::WantsWrite(b"A1 LOGIN alice secret\r\n".to_vec());
+        assert_eq!("WantsWrite(23 octets)", format!("{yielded:?}"));
+    }
 }

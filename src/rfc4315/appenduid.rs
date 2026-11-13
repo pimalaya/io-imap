@@ -129,7 +129,8 @@ impl ImapAppendUid {
             message,
         };
 
-        trace!("send IMAP command {body:?}");
+        // NOTE: never log the arguments, they hold the whole message.
+        trace!("send IMAP command {}", body.name());
 
         let state = State::Send(ImapSend::command(body));
 
@@ -219,6 +220,10 @@ mod tests {
         let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
+        let literal = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(literal, b"x");
+        let end = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(end, b"\r\n");
         expect_wants_read(&mut append, &mut frag);
 
         let reply = format!("{tag} OK [APPENDUID 1700000000 7] APPEND completed\r\n");
@@ -242,6 +247,10 @@ mod tests {
         let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
+        let literal = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(literal, b"x");
+        let end = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(end, b"\r\n");
         expect_wants_read(&mut append, &mut frag);
 
         let reply = format!("{tag} OK APPEND completed\r\n");
@@ -263,6 +272,10 @@ mod tests {
         let bytes = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
         let tag = first_word(str::from_utf8(&bytes).expect("utf8 command")).to_owned();
 
+        let literal = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(literal, b"x");
+        let end = expect_wants_write(&mut append, &mut frag, None);
+        assert_eq!(end, b"\r\n");
         expect_wants_read(&mut append, &mut frag);
 
         let reply = format!("{tag} NO mailbox is read-only\r\n");
@@ -285,6 +298,8 @@ mod tests {
 
         expect_wants_tag(&mut append, &mut frag);
         let _ = expect_wants_write(&mut append, &mut frag, Some(b"A1"));
+        let _ = expect_wants_write(&mut append, &mut frag, None);
+        let _ = expect_wants_write(&mut append, &mut frag, None);
         expect_wants_read(&mut append, &mut frag);
 
         let err = expect_complete_err(&mut append, &mut frag, b"* BYE going down\r\n");

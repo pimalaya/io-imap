@@ -158,7 +158,7 @@ pub struct ImapMessageAppendStream {
     len: u32,
     tag_requested: bool,
     crlf: Option<Vec<u8>>,
-    command: Option<Command<'static>>,
+    tag: Option<Tag<'static>>,
     non_sync: bool,
     stream_pending: bool,
 }
@@ -192,7 +192,7 @@ impl ImapMessageAppendStream {
             len,
             tag_requested: false,
             crlf: None,
-            command: None,
+            tag: None,
             non_sync: opts.non_sync,
             stream_pending: false,
         }
@@ -279,12 +279,12 @@ impl ImapCoroutine for ImapMessageAppendStream {
                     self.state = if self.non_sync {
                         State::Stream
                     } else {
-                        State::Continuation(ImapSend::receive(command.clone(), command.tag.clone()))
+                        State::Continuation(ImapSend::receive(command.tag.clone()))
                     };
                     debug!("{}", self.state);
 
                     self.crlf = Some(crlf);
-                    self.command = Some(command);
+                    self.tag = Some(command.tag);
 
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         header,
@@ -330,9 +330,8 @@ impl ImapCoroutine for ImapMessageAppendStream {
                 }
                 State::WriteCrlf => {
                     let crlf = self.crlf.take().expect("crlf written once");
-                    let command = self.command.take().expect("command tagged once");
-                    let tag = command.tag.clone();
-                    self.state = State::Recv(ImapSend::receive(command, tag));
+                    let tag = self.tag.take().expect("command tagged once");
+                    self.state = State::Recv(ImapSend::receive(tag));
                     debug!("{}", self.state);
                     return ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(
                         crlf,

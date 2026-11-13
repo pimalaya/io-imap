@@ -42,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Added the `No`, `Bad` and `Bye` variants to `rfc3501::starttls::ImapStartTlsError`.
 
+- Added the `EmptyNonce` variant to `rfc7677::auth_scram_sha_256::ImapAuthScramSha256Error`.
+
 ### Changed
 
 - Added a dependency on [mime-rs](https://crates.io/crates/mime-rs) 0.1 for decoding RFC 2047 subjects.
@@ -57,6 +59,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Changed `rfc3501::noop::ImapNoop` and `rfc3501::check::ImapMailboxCheck` to return a `send::ImapOutput` of `rfc3501::updates::ImapMailboxUpdates` instead of `()`.
 
 - **BREAKING**: Changed `watch::ImapMailboxWatchOptions` and `client::ImapMailboxWatchStreamOptions` to no longer be `Copy`, as they carry the state to resume from.
+
+- **BREAKING**: Changed `send::ImapSend` to yield each literal as a write of its own, uncopied.
+
+  A buffered APPEND writes its command line, its message, then the line end, in three writes. Its peak drops from three more copies of the message to one.
+
+- **BREAKING**: Changed `send::ImapSendOutput` and `send::ImapSendResult` to no longer be generic over the encoder.
+
+- **BREAKING**: Changed `send::ImapSend::receive` to take the tag alone.
+
+- **BREAKING**: Changed the `DecodingFailure`, `MessageIsPoisoned` and `MessageTooLong` variants of `send::ImapSendError`, `rfc3501::greeting::ImapGreetingGetError` and `rfc2177::idle::ImapIdleError` to carry the first 1024 octets of the response instead of all of it.
+
+- **BREAKING**: Changed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256::new` to return a `Result`, refusing an empty client nonce.
+
+- **BREAKING**: Changed the `UrlMissingHost` and `UrlUnsupportedScheme` variants of `session::ImapSessionOpenError` to hold and print the scheme, host and port of the URL instead of the whole URL.
+
+- Changed the `scram` feature to no longer enable the rand dependency, which the three TLS features enable instead, without its default features.
+
+  A build with `scram` alone has no dependency on std again.
+
+- Changed `rfc3501::append::ImapMessageAppend` and `rfc4315::appenduid::ImapAppendUid` to trace the name of their command instead of the whole message.
 
 - **BREAKING**: Changed `rfc3501::copy::ImapCopyUid` to a struct keeping the two COPYUID sets as inclusive UID ranges, in the order of the code.
 
@@ -104,6 +126,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed `client::ImapMailboxWatchStream` hanging on close or drop when its events are not drained.
 
+- Fixed `watch::ImapMailboxWatch` reporting a message as removed when its line was skipped for not decoding: a whole-mailbox re-read that skipped a line removes nothing, and a QRESYNC reply that skipped one keeps its resync point.
+
 - Fixed `rfc3501::list::ImapMailboxList` and `rfc3501::lsub::ImapMailboxLsub` sending the pattern unencoded: it now goes out in modified UTF-7, the wildcards kept, as a quoted string, which iCloud requires for LSUB.
 
 - Fixed the client-side SORT fallback of `rfc5256::sort::ImapMessageSort` to follow RFC 5256: `FROM`, `TO` and `CC` sort by the first address's mailbox instead of being ignored, `SUBJECT` by the base subject (encoded words decoded, reply and forward prefixes stripped, case ignored) instead of the raw bytes, `DATE` falls back to the internal date, and ties keep the sequence order, `REVERSE` included.
@@ -132,9 +156,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed `client::ImapClientStd::set_stream` keeping the bytes buffered from the previous stream, which were parsed in front of what the new one delivers: the fragmentizer is emptied, its size limit kept.
 
+- Fixed the `Debug` of `coroutine::ImapYield` and `session::ImapSessionOpenYield` printing the bytes of a write, credentials included: it prints their length.
+
+- Fixed the URL errors of `session::ImapSessionTransport::from_url` printing the whole URL, userinfo included.
+
+- Fixed `rfc7677::auth_scram_sha_256::ImapAuthScramSha256` accepting an empty client nonce, which any server nonce extends.
+
 ### Removed
 
 - **BREAKING**: Removed `rfc3501::logout::ImapLogoutError::MissingTagged`: a LOGOUT whose BYE is followed by the end of the stream succeeds.
+
+- **BREAKING**: Removed `send::ImapSendOutput::message`, the echo of the command sent.
 
 ## [0.8.1] - 2026-11-03
 

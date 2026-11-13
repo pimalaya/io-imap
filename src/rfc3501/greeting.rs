@@ -67,7 +67,7 @@ use imap_codec::{
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{coroutine::*, imap_try, rfc3501::capability::*};
+use crate::{coroutine::*, imap_try, rfc3501::capability::*, send::error_bytes};
 
 /// Failure causes while reading the IMAP greeting.
 #[derive(Clone, Debug, Error)]
@@ -78,15 +78,15 @@ pub enum ImapGreetingGetError {
     /// The stream reached EOF before a complete greeting arrived.
     #[error("IMAP greeting failed: reached unexpected EOF on stream")]
     Eof,
-    /// The greeting line could not be decoded; carries the raw bytes.
+    /// The greeting line could not be decoded; carries its first octets.
     #[error("IMAP greeting failed: decode error")]
     DecodingFailure(Secret<Box<[u8]>>),
     /// The `Fragmentizer` poisoned the message after a framing error;
-    /// carries the raw bytes.
+    /// carries its first octets.
     #[error("IMAP greeting failed: parse error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
-    /// The greeting exceeded the `Fragmentizer` size limit; carries the
-    /// raw bytes.
+    /// The greeting exceeded the `Fragmentizer` size limit; carries its
+    /// first octets.
     #[error("IMAP greeting failed: parse error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
     /// The follow-up CAPABILITY round-trip failed.
@@ -174,7 +174,7 @@ impl ImapCoroutine for ImapGreetingGet {
                         ..
                     })
                     | Some(FragmentInfo::Literal { .. }) => {
-                        let bytes = Secret::new(fragmentizer.message_bytes().into());
+                        let bytes = error_bytes(fragmentizer.message_bytes());
                         let err = ImapGreetingGetError::DecodingFailure(bytes);
                         return ImapCoroutineState::Complete(Err(err));
                     }
@@ -210,8 +210,7 @@ impl ImapCoroutine for ImapGreetingGet {
                                 }));
                             }
                             Err(err) => {
-                                let bytes = fragmentizer.message_bytes();
-                                let bytes = Secret::new(bytes.into());
+                                let bytes = error_bytes(fragmentizer.message_bytes());
                                 let err = match err {
                                     DecodeMessageError::DecodingFailure(_)
                                     | DecodeMessageError::DecodingRemainder { .. } => {

@@ -77,6 +77,8 @@
 
 use core::fmt;
 
+#[cfg(feature = "url")]
+use alloc::format;
 use alloc::{string::String, vec, vec::Vec};
 
 use imap_codec::{
@@ -132,11 +134,12 @@ pub enum ImapSessionOpenError {
     /// caller learns which of its credentials this crate cannot use.
     #[error("{} SASL mechanism is not supported by this crate", .0.as_str())]
     UnsupportedMechanism(SaslMechanism),
-    /// The URL carries no host to connect to.
+    /// The URL carries no host to connect to; holds its scheme.
     #[cfg(feature = "url")]
     #[error("IMAP URL `{0}` has no host")]
     UrlMissingHost(String),
-    /// The URL scheme is none of imap, imaps and unix.
+    /// The URL scheme is none of imap, imaps and unix; holds the
+    /// scheme, host and port of the URL, then its scheme.
     #[cfg(feature = "url")]
     #[error("IMAP URL `{0}` has unsupported scheme `{1}` (expected `imap`, `imaps` or `unix`)")]
     UrlUnsupportedScheme(String, String),
@@ -218,7 +221,7 @@ impl ImapSessionTransport {
         }
 
         let Some(host) = url.host_str() else {
-            let url = String::from(url.as_str());
+            let url = url_location(url);
             return Err(ImapSessionOpenError::UrlMissingHost(url));
         };
 
@@ -231,9 +234,22 @@ impl ImapSessionTransport {
             Ok(Self::Tls { host, port })
         } else {
             let scheme = String::from(scheme);
-            let url = String::from(url.as_str());
+            let url = url_location(url);
             Err(ImapSessionOpenError::UrlUnsupportedScheme(url, scheme))
         }
+    }
+}
+
+/// The scheme, host and port of `url`, all an error shows of it: its
+/// userinfo, path and query may hold credentials.
+#[cfg(feature = "url")]
+fn url_location(url: &Url) -> String {
+    let scheme = url.scheme();
+
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{scheme}://{host}:{port}"),
+        (Some(host), None) => format!("{scheme}://{host}"),
+        (None, _) => format!("{scheme}:"),
     }
 }
 
@@ -279,7 +295,6 @@ pub struct ImapSessionOpenData {
 /// The three connect variants and the upgrade are what set this
 /// coroutine apart from a command coroutine: the caller answers them
 /// with its own sockets, whatever the runtime.
-#[derive(Debug)]
 pub enum ImapSessionOpenYield {
     /// The caller opens a plain TCP connection and resumes.
     WantsTcpConnect {
@@ -309,6 +324,25 @@ pub enum ImapSessionOpenYield {
     WantsRead,
     /// The caller writes the given bytes to its stream and resumes.
     WantsWrite(Vec<u8>),
+}
+
+impl fmt::Debug for ImapSessionOpenYield {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WantsTcpConnect { host, port } => {
+                write!(f, "WantsTcpConnect({host}:{port})")
+            }
+            Self::WantsTlsConnect { host, port } => {
+                write!(f, "WantsTlsConnect({host}:{port})")
+            }
+            Self::WantsUnixConnect(path) => write!(f, "WantsUnixConnect({path})"),
+            Self::WantsTlsUpgrade => f.write_str("WantsTlsUpgrade"),
+            Self::WantsTag => f.write_str("WantsTag"),
+            Self::WantsRead => f.write_str("WantsRead"),
+            // NOTE: a write may hold credentials, its length does not.
+            Self::WantsWrite(bytes) => write!(f, "WantsWrite({} octets)", bytes.len()),
+        }
+    }
 }
 
 impl From<ImapYield> for ImapSessionOpenYield {
@@ -447,7 +481,7 @@ impl ImapSessionOpen {
                     auto_id,
                 };
 
-                Auth::ScramSha256(ImapAuthScramSha256::new(creds, opts))
+                Auth::ScramSha256(ImapAuthScramSha256::new(creds, opts)?)
             }
             // NOTE: RFC 4422 frames any mechanism, but each one still
             // needs its own coroutine here, and these have none. The arm
@@ -905,5 +939,27 @@ mod tests {
             err,
             ImapSessionOpenError::UrlUnsupportedScheme(_, _)
         ));
+    }
+
+    #[test]
+    fn debug_of_a_write_prints_its_length_only() {
+        let yielded = ImapSessionOpenYield::WantsWrite(b"A1 LOGIN alice secret\r\n".to_vec());
+        assert_eq!("WantsWrite(23 octets)", format!("{yielded:?}"));
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_errors_show_scheme_host_and_port_only() {
+        let url = Url::parse("https://alice:hunter2@example.org:8443/inbox?token=abc").unwrap();
+        let err = ImapSessionTransport::from_url(&url).unwrap_err();
+        assert_eq!(
+            "IMAP URL `https://example.org:8443` has unsupported scheme `https` \
+             (expected `imap`, `imaps` or `unix`)",
+            err.to_string()
+        );
+
+        let url = Url::parse("imap:hunter2").unwrap();
+        let err = ImapSessionTransport::from_url(&url).unwrap_err();
+        assert_eq!("IMAP URL `imap:` has no host", err.to_string());
     }
 }

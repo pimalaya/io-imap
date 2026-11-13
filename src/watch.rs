@@ -458,16 +458,21 @@ impl ImapMailboxWatch {
     /// Diffs a whole-mailbox snapshot against the shadow, the fallback
     /// counterpart of [`Self::compute_deltas`]: absence is what reports
     /// a vanished message, since no untagged VANISHED arrives.
+    ///
+    /// A snapshot that is not `complete` skipped lines, so absence
+    /// reports nothing and the shadow keeps the messages it misses.
     fn compute_snapshot_deltas(
         &mut self,
         snapshot: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>>,
+        complete: bool,
     ) {
-        let vanished: Vec<NonZeroU32> = self
-            .shadow
-            .keys()
-            .filter(|uid| !snapshot.contains_key(uid))
-            .copied()
-            .collect();
+        let missing = self.shadow.keys().filter(|uid| !snapshot.contains_key(uid));
+        let vanished: Vec<NonZeroU32> = if complete {
+            missing.copied().collect()
+        } else {
+            debug!("incomplete snapshot, removing nothing");
+            Vec::new()
+        };
 
         for uid in vanished {
             self.shadow.remove(&uid);
@@ -488,15 +493,11 @@ impl ImapMailboxWatch {
         }
     }
 
-    fn compute_deltas(&mut self, data: &ImapMailboxSelectData) {
+    fn compute_deltas(&mut self, data: ImapMailboxSelectData) {
         // NOTE: walk the shadow within each range rather than the range
         // itself, whose span the server chose.
-        for range in &data.vanished_earlier {
-            let uids: Vec<NonZeroU32> = self
-                .shadow
-                .range(range.clone())
-                .map(|(uid, _)| *uid)
-                .collect();
+        for range in data.vanished_earlier {
+            let uids: Vec<NonZeroU32> = self.shadow.range(range).map(|(uid, _)| *uid).collect();
 
             for uid in uids {
                 self.shadow.remove(&uid);
@@ -505,9 +506,8 @@ impl ImapMailboxWatch {
             }
         }
 
-        for fetch in &data.changed {
-            let items_vec: Vec<MessageDataItem<'static>> =
-                fetch.items.clone().into_inner().into_iter().collect();
+        for fetch in data.changed {
+            let items_vec = fetch.items.into_inner();
             let (uid_opt, new_flags) = extract_uid_flags(&items_vec);
             let Some(uid) = uid_opt else {
                 continue;
@@ -785,15 +785,22 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 bytes,
                             ));
                         }
-                        ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
+                        ImapCoroutineState::Complete(Ok(ImapOutput { data, skipped, .. })) => {
                             if let Err(err) = self.check_uid_validity(&data) {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
 
-                            self.compute_deltas(&data);
-                            if let Some(new_modseq) = data.highest_mod_seq {
-                                self.highest_mod_seq = new_modseq;
+                            // NOTE: a reply that skipped a line is asked
+                            // again from the same resync point.
+                            match data.highest_mod_seq {
+                                Some(modseq) if skipped.is_empty() => {
+                                    self.highest_mod_seq = modseq;
+                                }
+                                Some(_) => debug!("incomplete resync, keeping the resync point"),
+                                None => {}
                             }
+
+                            self.compute_deltas(data);
                             self.state = State::EmitDeltas;
                         }
                         ImapCoroutineState::Complete(Err(err)) => {
@@ -850,7 +857,7 @@ impl ImapCoroutine for ImapMailboxWatch {
                             bytes,
                         ));
                     }
-                    ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
+                    ImapCoroutineState::Complete(Ok(ImapOutput { data, skipped, .. })) => {
                         let mut snapshot = BTreeMap::new();
 
                         for (_seq, items) in data {
@@ -862,7 +869,7 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                         debug!("re-read the whole mailbox");
                         trace!("uids: {}", snapshot.len());
-                        self.compute_snapshot_deltas(snapshot);
+                        self.compute_snapshot_deltas(snapshot, skipped.is_empty());
                         self.state = State::EmitDeltas;
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
@@ -936,7 +943,7 @@ mod tests {
             vanished_earlier: Vec::from([whole]),
             ..Default::default()
         };
-        watch.compute_deltas(&data);
+        watch.compute_deltas(data);
         assert!(watch.shadow.is_empty());
 
         let removed: Vec<u32> = watch
@@ -1232,6 +1239,58 @@ mod tests {
             &events[2],
             ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } if uid.get() == 3
         ));
+    }
+
+    #[test]
+    fn a_listing_that_skipped_a_line_removes_nothing() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(0, &[(1, Vec::new()), (2, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[], opts);
+        let resynced = "* 1 FETCH (UID 1 FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+            * 2 FETCH (UID 2 FLAGS (\\Seen))\r\n\
+            {tag} OK FETCH completed\r\n";
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("UID FETCH 1:* (UID FLAGS)", &[resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert_eq!(1, events.len(), "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            ImapMailboxWatchEvent::FlagsAdded { uid, .. } if uid.get() == 2
+        ));
+
+        let state = watch.state().expect("state kept");
+        assert_eq!(known(0, &[(1, Vec::new()), (2, vec![Flag::Seen])]), state);
+    }
+
+    #[test]
+    fn a_qresync_reply_that_skipped_a_line_keeps_the_resync_point() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(42, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[Capability::QResync], opts);
+        let resynced = format!(
+            "* 1 EXISTS\r\n\
+             * OK [UIDVALIDITY {UID_VALIDITY}] uid validity\r\n\
+             * OK [HIGHESTMODSEQ 50] modseq\r\n\
+             * 1 FETCH (UID 1 FLAGS (OIB-Seen-[Gmail]/All Mail) MODSEQ (50))\r\n\
+             {{tag}} OK [READ-ONLY] EXAMINE completed\r\n",
+        );
+        let steps: &[Step] = &[
+            ("ENABLE", &["* ENABLED QRESYNC\r\n{tag} OK enabled\r\n"]),
+            ("EXAMINE INBOX (QRESYNC (1700 42))", &[&resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(events.is_empty(), "got {events:?}");
+
+        let state = watch.state().expect("state kept");
+        assert_eq!(known(42, &[(1, Vec::new())]), state);
     }
 
     #[test]

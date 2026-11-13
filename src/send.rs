@@ -48,15 +48,15 @@ pub enum ImapSendError {
     /// The stream reached EOF before the tagged response arrived.
     #[error("Reached unexpected EOF on IMAP stream")]
     Eof,
-    /// A response line could not be decoded; carries the raw bytes.
+    /// A response line could not be decoded; carries its first octets.
     #[error("Decode IMAP response error")]
     DecodingFailure(Secret<Box<[u8]>>),
     /// The `Fragmentizer` poisoned the message after a framing error;
-    /// carries the raw bytes.
+    /// carries its first octets.
     #[error("Parse IMAP response error: message is poisoned")]
     MessageIsPoisoned(Secret<Box<[u8]>>),
     /// The response message exceeded the `Fragmentizer` size limit;
-    /// carries the raw bytes.
+    /// carries its first octets.
     #[error("Parse IMAP response error: message is too long")]
     MessageTooLong(Secret<Box<[u8]>>),
     /// The untagged responses collected before the completion exceeded
@@ -137,10 +137,10 @@ impl Default for ImapSendBudget {
 }
 
 /// Step output emitted by [`ImapSend::resume`].
-pub enum ImapSendResult<T: Encoder> {
+pub enum ImapSendResult {
     /// The exchange completed; carries the boxed output (boxed to keep
     /// the enum small next to the I/O variants).
-    Ok(Box<ImapSendOutput<T>>),
+    Ok(Box<ImapSendOutput>),
     /// The caller resumes with the tag of the command to send.
     WantsTag,
     /// The caller reads from its stream and resumes with the bytes.
@@ -162,7 +162,6 @@ enum State {
 /// I/O-free coroutine sending one IMAP command and parsing its response.
 pub struct ImapSend<T: Encoder> {
     encoder: T,
-    message: Option<T::Message<'static>>,
     untagged_command: Option<UntaggedCommand<T>>,
     tag_requested: bool,
     tag: Option<Tag<'static>>,
@@ -198,7 +197,6 @@ impl<T: Encoder> ImapSend<T> {
 
         Self {
             encoder,
-            message: Some(message),
             untagged_command: None,
             tag_requested: false,
             tag: Some(tag),
@@ -224,16 +222,14 @@ impl<T: Encoder> ImapSend<T> {
     /// Receive-only: skips serialisation and parses the response of a
     /// request whose bytes were written out of band.
     ///
-    /// Used by the streamed APPEND literal; `message` is echoed back
-    /// unchanged in the Ok output, and the exchange ends on the tagged
-    /// completion of the command tagged `tag`.
-    pub fn receive(message: T::Message<'static>, tag: Tag<'static>) -> Self
+    /// Used by the streamed APPEND literal; the exchange ends on the
+    /// tagged completion of the command tagged `tag`.
+    pub fn receive(tag: Tag<'static>) -> Self
     where
         T: Default,
     {
         Self {
             encoder: T::default(),
-            message: Some(message),
             untagged_command: None,
             tag_requested: false,
             tag: Some(tag),
@@ -275,7 +271,7 @@ impl<T: Encoder> ImapSend<T> {
         &mut self,
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
-    ) -> ImapSendResult<T> {
+    ) -> ImapSendResult {
         loop {
             if let Some(bytes) = self.wants_write.take() {
                 return ImapSendResult::WantsWrite(bytes);
@@ -304,7 +300,6 @@ impl<T: Encoder> ImapSend<T> {
                         });
 
                         self.fragments = self.encoder.encode(&message).collect();
-                        self.message = Some(message);
                         self.state = State::Serialize;
                     }
                     None if self.tag_requested => {
@@ -316,33 +311,40 @@ impl<T: Encoder> ImapSend<T> {
                     }
                 },
                 State::Serialize => {
-                    let mut buf = Vec::new();
+                    // NOTE: a literal is the payload of a write of its
+                    // own: appending a line to it would copy it.
+                    let mut buf = self.limbo_literal.take().unwrap_or_default();
+                    let mut literal = !buf.is_empty();
 
-                    if let Some(bytes) = self.limbo_literal.take() {
-                        buf.extend(bytes);
-                    }
-
-                    while let Some(fragment) = self.fragments.pop_front() {
-                        match fragment {
-                            Fragment::Line { data } => {
-                                buf.extend(data);
-                            }
-                            Fragment::Literal { data, mode } => match mode {
+                    while !literal {
+                        match self.fragments.pop_front() {
+                            Some(Fragment::Line { data }) => buf.extend(data),
+                            Some(Fragment::Literal { data, mode }) => match mode {
+                                LiteralMode::NonSync if buf.is_empty() => {
+                                    buf = data;
+                                    literal = true;
+                                }
                                 LiteralMode::NonSync => {
-                                    buf.extend(data);
+                                    let fragment = Fragment::Literal { data, mode };
+                                    self.fragments.push_front(fragment);
+                                    break;
                                 }
                                 LiteralMode::Sync => {
-                                    self.limbo_literal.replace(data);
+                                    self.limbo_literal = Some(data);
                                     break;
                                 }
                             },
+                            None => break,
                         }
                     }
 
                     if !buf.is_empty() {
                         self.wants_write = Some(buf);
                     }
-                    self.state = State::Read;
+
+                    if self.limbo_literal.is_some() || self.fragments.is_empty() {
+                        self.state = State::Read;
+                    }
                 }
                 State::Read => match arg.take() {
                     Some(&[]) if self.logout && self.bye.is_some() => {
@@ -449,16 +451,13 @@ impl<T: Encoder> ImapSend<T> {
                                             continue;
                                         }
 
-                                        let err = Secret::new(bytes.into());
-                                        ImapSendError::DecodingFailure(err)
+                                        ImapSendError::DecodingFailure(error_bytes(bytes))
                                     }
                                     DecodeMessageError::MessageTooLong { .. } => {
-                                        let err = Secret::new(bytes.into());
-                                        ImapSendError::MessageTooLong(err)
+                                        ImapSendError::MessageTooLong(error_bytes(bytes))
                                     }
                                     DecodeMessageError::MessagePoisoned { .. } => {
-                                        let err = Secret::new(bytes.into());
-                                        ImapSendError::MessageIsPoisoned(err)
+                                        ImapSendError::MessageIsPoisoned(error_bytes(bytes))
                                     }
                                 };
 
@@ -471,10 +470,9 @@ impl<T: Encoder> ImapSend<T> {
                         trace!("read literal fragment ({} bytes)", bytes.len());
                     }
                     None if self.done => {
-                        // NOTE: message always exists during a resume cycle.
                         return ImapSendResult::Ok(Box::new(ImapSendOutput {
-                            message: self.message.take().unwrap(),
-                            // NOTE: the tag is known once the message is.
+                            // NOTE: the tag is known before anything is
+                            // read.
                             tag: self.tag.take().unwrap(),
                             data: mem::take(&mut self.data),
                             untagged: mem::take(&mut self.untagged),
@@ -510,7 +508,6 @@ impl ImapSend<CommandCodec> {
 
         Self {
             encoder: CommandCodec::new(),
-            message: None,
             untagged_command: Some(UntaggedCommand {
                 body,
                 into_message: |command| command,
@@ -582,6 +579,17 @@ pub(crate) fn decode_lossy_tagged(codec: &ResponseCodec, bytes: &[u8]) -> Option
     }
 }
 
+/// Largest number of octets of a response an error carries.
+const MAX_ERROR_LEN: usize = 1024;
+
+/// The first octets of the response `bytes`, for an error to carry in
+/// place of a message of any length.
+pub(crate) fn error_bytes(bytes: &[u8]) -> Secret<Box<[u8]>> {
+    let len = bytes.len().min(MAX_ERROR_LEN);
+
+    Secret::new(bytes[..len].into())
+}
+
 /// The response ending an exchange read line by line.
 pub(crate) enum ImapCompletion {
     /// The tagged completion of the command.
@@ -598,12 +606,10 @@ struct UntaggedCommand<T: Encoder> {
     into_message: fn(Command<'static>) -> T::Message<'static>,
 }
 
-/// Successful output of one command exchange: the echoed message plus
-/// everything the server answered before the tagged response.
+/// Successful output of one command exchange: everything the server
+/// answered up to the tagged response.
 #[derive(Debug)]
-pub struct ImapSendOutput<T: Encoder> {
-    /// The sent message, echoed back to the caller.
-    pub message: T::Message<'static>,
+pub struct ImapSendOutput {
     /// The tag of the command the exchange belongs to.
     pub tag: Tag<'static>,
     /// The untagged data responses collected during the exchange.
@@ -622,7 +628,7 @@ pub struct ImapSendOutput<T: Encoder> {
     pub continuation_request: Option<CommandContinuationRequest<'static>>,
 }
 
-impl<T: Encoder> ImapSendOutput<T> {
+impl ImapSendOutput {
     /// The texts of the `ALERT` response codes of the exchange, which a
     /// client shows to its user.
     ///
@@ -638,7 +644,7 @@ impl<T: Encoder> ImapSendOutput<T> {
 
 impl<T: Encoder> ImapCoroutine for ImapSend<T> {
     type Yield = ImapYield;
-    type Return = Result<ImapSendOutput<T>, ImapSendError>;
+    type Return = Result<ImapSendOutput, ImapSendError>;
 
     fn resume(
         &mut self,
@@ -815,6 +821,28 @@ mod tests {
     }
 
     #[test]
+    fn undecodable_response_error_carries_its_first_octets() {
+        let mut send = ImapSend::command(CommandBody::Noop);
+        let mut frag = Fragmentizer::new(1024 * 1024);
+
+        send.resume(&mut frag, None);
+        send.resume(&mut frag, Some(b"A1"));
+        send.resume(&mut frag, None);
+
+        let mut reply = b"A1 ".to_vec();
+        reply.resize(64 * 1024, b'x');
+        reply.extend_from_slice(b"\r\n");
+
+        let ImapSendResult::Err(err) = send.resume(&mut frag, Some(&reply)) else {
+            panic!("expected Err");
+        };
+        let ImapSendError::DecodingFailure(bytes) = err else {
+            panic!("expected ImapSendError::DecodingFailure, got {err:?}");
+        };
+        assert_eq!(&reply[..1024], &**bytes.declassify());
+    }
+
+    #[test]
     fn alerts_are_read_off_untagged_and_tagged_statuses() {
         let mut send = ImapSend::command(CommandBody::Noop);
         let mut frag = Fragmentizer::new(1024);
@@ -903,7 +931,7 @@ mod tests {
         let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"+ go\r\n")) else {
             panic!("expected WantsWrite");
         };
-        assert_eq!("hi\r\n", str::from_utf8(&bytes).expect("utf8 literal"));
+        assert_eq!("hi", str::from_utf8(&bytes).expect("utf8 literal"));
     }
 
     #[test]
@@ -918,7 +946,14 @@ mod tests {
         let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, Some(b"o\r\n")) else {
             panic!("expected WantsWrite");
         };
-        assert_eq!("hi\r\n", str::from_utf8(&bytes).expect("utf8 literal"));
+        assert_eq!("hi", str::from_utf8(&bytes).expect("utf8 literal"));
+
+        // NOTE: the literal is a write of its own, never copied behind
+        // or before a line.
+        let ImapSendResult::WantsWrite(bytes) = send.resume(&mut frag, None) else {
+            panic!("expected WantsWrite");
+        };
+        assert_eq!("\r\n", str::from_utf8(&bytes).expect("utf8 line end"));
 
         assert!(matches!(
             send.resume(&mut frag, None),

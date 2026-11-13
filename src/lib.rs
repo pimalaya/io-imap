@@ -36,8 +36,8 @@
 //!
 //! Public types follow the Imap-Target-Verb naming scheme
 //! (`ImapMailboxCreate`, `ImapMessageFetchStream`) with Options, Error,
-//! Yield and Event companions; single-step coroutines hold the send
-//! directly, multi-step ones keep a private State enum.
+//! Yield and Event companions; every coroutine keeps a private State
+//! enum, of one variant when it sends a single command.
 //!
 //! ## The coroutine contract
 //!
@@ -66,8 +66,9 @@
 //! Every command-shaped coroutine delegates to one shared primitive:
 //! [`send::ImapSend`]. [`send::ImapSend::command`] first asks for the
 //! tag, then serialises the command through imap-codec (handling
-//! synchronising literals by pausing until the server continuation),
-//! then collects the response: data and untagged status lines
+//! synchronising literals by pausing until the server continuation,
+//! and yielding each literal as a write of its own, uncopied), then
+//! collects the response: data and untagged status lines
 //! accumulate, the tagged completion of its own command, a bye or a
 //! continuation request terminates, and undecodable untagged lines and
 //! the tagged completions of other commands are skipped. What
@@ -88,8 +89,11 @@
 //! and SASL-IR (RFC 4959) flows. Every auth and login coroutine offers
 //! an optional auto_id chaining an RFC 2971 ID round-trip right after
 //! authentication, required by providers such as mail.qq.com and
-//! Fastmail. Secrets ride in imap-types `Secret` wrappers so they never
-//! land in logs.
+//! Fastmail. Secrets ride in imap-types `Secret` wrappers, whose
+//! `Debug` redacts in release builds only, so this crate formats none:
+//! it logs the commands carrying credentials by name, and the `Debug`
+//! of [`coroutine::ImapYield`] prints the length of a write, not its
+//! bytes. A caller logging the bytes it writes logs the credentials.
 //!
 //! Which flow to use is decided by [`session`], not by any client: it
 //! follows the advertised `SASL-IR` capability unless
@@ -105,7 +109,7 @@
 //! yields transport requests (connect this socket, upgrade that one)
 //! alongside the usual tag, read and write requests, so a caller on any runtime
 //! answers them with its own sockets and inherits the ordering and the
-//! provider quirks. The std client is a thirty-line pump over it.
+//! provider quirks. The `connect` of the std client is a pump over it.
 //!
 //! ## Watching a mailbox
 //!

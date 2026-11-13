@@ -119,8 +119,8 @@ impl ImapLogin {
     /// Builds a LOGIN coroutine authenticating with `user` and
     /// `password`.
     ///
-    /// Fails on credentials that cannot be encoded as IMAP AStrings
-    /// (NUL, CR, LF).
+    /// Fails on a NUL, which no IMAP string carries; CR, LF and 8-bit
+    /// bytes go out as a literal.
     pub fn new(
         user: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -356,6 +356,17 @@ mod tests {
             result.is_err(),
             "expected construction to refuse NUL in password",
         );
+    }
+
+    #[test]
+    fn line_break_in_password_goes_out_as_a_literal() {
+        let opts = ImapLoginOptions::default();
+        let mut login = ImapLogin::new("alice", "two\r\nlines", opts).expect("valid credentials");
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag(&mut login, &mut frag);
+        let bytes = expect_wants_write(&mut login, &mut frag, Some(b"A1"));
+        assert_eq!(bytes, b"A1 LOGIN alice {10}\r\n");
     }
 
     fn expect_wants_tag(cor: &mut ImapLogin, frag: &mut Fragmentizer) {
