@@ -711,7 +711,7 @@ impl fmt::Display for Auth {
 
 #[cfg(test)]
 mod tests {
-    use alloc::string::ToString;
+    use alloc::{format, string::ToString};
 
     use crate::session::*;
 

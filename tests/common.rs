@@ -10,6 +10,11 @@
 //! exercises some of these helpers, so the rest end up flagged as dead
 //! code; suppress the noise at the module level.
 
+#![cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
 #![allow(dead_code)]
 
 use std::{

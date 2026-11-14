@@ -29,10 +29,12 @@ vendored = ["pimalaya-stream/vendored"]
 [[example]]
 name = "std_coroutine"
 path = "examples/std_coroutine.rs"
+required-features = ["client"]
 
 [[example]]
 name = "tokio_coroutine"
 path = "examples/tokio_coroutine.rs"
+required-features = ["client"]
 
 [[example]]
 name = "tokio_session"
@@ -42,10 +44,12 @@ required-features = ["client", "url"]
 [[example]]
 name = "tokio_watch"
 path = "examples/tokio_watch.rs"
+required-features = ["client"]
 
 [[example]]
 name = "tokio_fetch_stream"
 path = "examples/tokio_fetch_stream.rs"
+required-features = ["client"]
 
 [[example]]
 name = "std_client_light"

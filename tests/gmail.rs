@@ -30,6 +30,12 @@
 //! [`oauth_xoauth2_rejected`] needs no credentials: it sends a bogus
 //! token on purpose.
 
+#![cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+
 mod common;
 
 use std::{borrow::Cow, env, fs, time::Duration};

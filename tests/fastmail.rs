@@ -1,6 +1,12 @@
 //! Live end-to-end test against a real Fastmail account; ignored by
 //! default, needs credentials in the environment.
 
+#![cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+
 mod common;
 
 use std::env;

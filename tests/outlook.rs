@@ -22,6 +22,12 @@
 //! (`microsoft@pimalaya.onmicrosoft.com` by default, the Pimalaya test
 //! mailbox).
 
+#![cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+
 mod common;
 
 use std::{

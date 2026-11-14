@@ -8,6 +8,8 @@
 //! supertrait were dropped from `ImapClientAsync`. It is a compile-time
 //! regression test for that decision, not a behavioural one.
 
+#![cfg(feature = "client")]
+
 use std::collections::VecDeque;
 
 use io_imap::{

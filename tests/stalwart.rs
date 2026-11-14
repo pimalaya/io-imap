@@ -1,6 +1,12 @@
 //! End-to-end test against a local Stalwart IMAP server; ignored by
 //! default, spawned via tests/stalwart.sh.
 
+#![cfg(any(
+    feature = "rustls-aws",
+    feature = "rustls-ring",
+    feature = "native-tls"
+))]
+
 mod common;
 
 use io_sasl::{mechanism::Sasl, rfc4616::plain::SaslPlainCreds};
