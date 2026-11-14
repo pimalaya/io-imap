@@ -140,7 +140,7 @@ The error of a command refused with NO or BAD SHALL carry the kind, the response
 
 ### Requirement: A skipped response is kept
 
-A send SHALL keep the raw bytes of every untagged response it skipped for not decoding, in its output, counted against its budget.
+A send SHALL keep the raw bytes of every untagged response it skipped for not decoding, in its output, counted against its budget. A `FETCH` response recovered in part (message-fetch, "A FETCH line keeps the items that decode") SHALL NOT be skipped.
 
 #### Scenario: Undecodable FLAGS line
 
@@ -195,12 +195,12 @@ An AUTHENTICATE coroutine whose mechanism refuses a challenge SHALL send the `*`
 
 ### Requirement: A command returning data returns what its response held beside it
 
-FETCH over a sequence set, STORE, SEARCH, SORT, THREAD, STATUS, LIST, LSUB, EXPUNGE, UID EXPUNGE, SELECT, EXAMINE, NOOP and CHECK SHALL complete with an output holding their result, the texts of the `ALERT` response codes read in the untagged status responses and in the completion, and the untagged responses skipped for not decoding. The client-side SORT SHALL add up those of its SEARCH and of each of its FETCH commands.
+FETCH over a sequence set, STORE, SEARCH, SORT, THREAD, STATUS, LIST, LSUB, EXPUNGE, UID EXPUNGE, SELECT, EXAMINE, NOOP and CHECK SHALL complete with an output holding their result, the texts of the `ALERT` response codes read in the untagged status responses and in the completion, the untagged responses skipped for not decoding, and the `FETCH` responses recovered in part. The client-side SORT SHALL add up those of its SEARCH and of each of its FETCH commands. The mailbox watcher SHALL take a snapshot as complete only when nothing was skipped and no response recovered in part failed `UID`, `FLAGS` or `MODSEQ`.
 
 #### Scenario: One FETCH line does not decode
 
 - **WHEN** a FETCH reads `* 1 FETCH (FLAGS (\Seen))`, `* 2 FETCH (FLAGS (OIB-Seen-[Gmail]/All Mail))`, `* OK [ALERT] quota almost reached`, then its `OK`
-- **THEN** its output holds the data of message 1, the second line as skipped, and the alert `quota almost reached`
+- **THEN** its output holds the data of message 1, message 2 in `partial` with `FLAGS` failed, and the alert `quota almost reached`
 
 #### Scenario: Client-side SORT
 

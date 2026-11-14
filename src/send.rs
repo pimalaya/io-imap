@@ -4,7 +4,7 @@
 //! caller, and feeds responses back through the borrowed
 //! `Fragmentizer`.
 
-use core::{fmt, mem};
+use core::{fmt, mem, num::NonZeroU32};
 
 use alloc::{
     boxed::Box,
@@ -15,13 +15,15 @@ use alloc::{
 
 use imap_codec::{
     CommandCodec, ResponseCodec,
+    decode::Decoder,
     encode::{Encoder, Fragment},
     fragmentizer::{DecodeMessageError, FragmentInfo, Fragmentizer},
     imap_types::{
         IntoStatic,
         command::{Command, CommandBody},
-        core::{LiteralMode, Tag},
+        core::{LiteralMode, Tag, Vec1},
         error::ValidationError,
+        fetch::MessageDataItem,
         response::{
             Bye, Code, CommandContinuationRequest, Data, Response, Status, StatusBody, StatusKind,
             Tagged,
@@ -107,6 +109,32 @@ pub struct ImapOutput<T> {
     /// The untagged responses skipped for not decoding, as raw bytes:
     /// data the result may be missing.
     pub skipped: Vec<Secret<Box<[u8]>>>,
+    /// The FETCH responses recovered in part, naming the items missing
+    /// from the data.
+    pub partial: Vec<ImapFetchPartial>,
+}
+
+/// A FETCH response whose items decoded only in part.
+///
+/// The items that decoded join the data of the command under `seq`.
+#[derive(Clone, Debug)]
+pub struct ImapFetchPartial {
+    /// The sequence number of the message.
+    pub seq: NonZeroU32,
+    /// The UID of the message, when its `UID` item decoded.
+    pub uid: Option<NonZeroU32>,
+    /// The items that did not decode, in the order sent.
+    pub failed: Vec<ImapFetchFailedItem>,
+}
+
+/// An item of a FETCH response that did not decode.
+#[derive(Clone, Debug)]
+pub struct ImapFetchFailedItem {
+    /// The name of the item as sent, such as `BODY[HEADER]<0>`, read
+    /// lossily as UTF-8.
+    pub name: String,
+    /// The raw bytes of the item, its name and its value.
+    pub raw: Secret<Box<[u8]>>,
 }
 
 /// Bounds on the untagged responses one exchange collects.
@@ -173,6 +201,7 @@ pub struct ImapSend<T: Encoder> {
     data: Vec<Data<'static>>,
     untagged: Vec<StatusBody<'static>>,
     skipped: Vec<Secret<Box<[u8]>>>,
+    partial: Vec<ImapFetchPartial>,
     tagged: Option<Tagged<'static>>,
     bye: Option<Bye<'static>>,
     cr: Option<CommandContinuationRequest<'static>>,
@@ -181,6 +210,7 @@ pub struct ImapSend<T: Encoder> {
     /// Bounds on the untagged responses collected before the completion.
     pub budget: ImapSendBudget,
     octets: usize,
+    responses: usize,
     logout: bool,
 }
 
@@ -208,6 +238,7 @@ impl<T: Encoder> ImapSend<T> {
             data: Vec::new(),
             untagged: Vec::new(),
             skipped: Vec::new(),
+            partial: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -215,6 +246,7 @@ impl<T: Encoder> ImapSend<T> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
+            responses: 0,
             logout: false,
         }
     }
@@ -241,6 +273,7 @@ impl<T: Encoder> ImapSend<T> {
             data: Vec::new(),
             untagged: Vec::new(),
             skipped: Vec::new(),
+            partial: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -248,19 +281,21 @@ impl<T: Encoder> ImapSend<T> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
+            responses: 0,
             logout: false,
         }
     }
 
     /// Charges one more collected response of `octets` to the budget.
     fn spend(&mut self, octets: usize) -> Result<(), ImapSendError> {
-        let responses = self.data.len() + self.untagged.len() + self.skipped.len();
         self.octets = self.octets.saturating_add(octets);
 
-        if responses >= self.budget.responses || self.octets > self.budget.octets {
+        if self.responses >= self.budget.responses || self.octets > self.budget.octets {
             debug!("collected responses exceed the budget");
             return Err(ImapSendError::ResponseTooLong(self.budget));
         }
+
+        self.responses += 1;
 
         Ok(())
     }
@@ -420,6 +455,25 @@ impl<T: Encoder> ImapSend<T> {
                                         // response cannot be decoded:
                                         // skip it with a warning
                                         // (pimalaya/himalaya#641).
+                                        if let Some((items, partial)) =
+                                            decode_fetch_items(&self.codec, bytes)
+                                        {
+                                            if let Err(err) = self.spend(octets) {
+                                                return ImapSendResult::Err(err);
+                                            }
+
+                                            if let Ok(items) = Vec1::try_from(items) {
+                                                let seq = partial.seq;
+                                                self.data.push(Data::Fetch { seq, items });
+                                            }
+
+                                            if !partial.failed.is_empty() {
+                                                self.partial.push(partial);
+                                            }
+
+                                            continue;
+                                        }
+
                                         if bytes.starts_with(b"* ") {
                                             debug!("skipping undecodable untagged response");
                                             trace!("{}", escape_byte_string(bytes));
@@ -477,6 +531,7 @@ impl<T: Encoder> ImapSend<T> {
                             data: mem::take(&mut self.data),
                             untagged: mem::take(&mut self.untagged),
                             skipped: mem::take(&mut self.skipped),
+                            partial: mem::take(&mut self.partial),
                             tagged: self.tagged.take(),
                             bye: self.bye.take(),
                             continuation_request: self.cr.take(),
@@ -522,6 +577,7 @@ impl ImapSend<CommandCodec> {
             data: Vec::new(),
             untagged: Vec::new(),
             skipped: Vec::new(),
+            partial: Vec::new(),
             tagged: None,
             bye: None,
             cr: None,
@@ -529,6 +585,7 @@ impl ImapSend<CommandCodec> {
             done: false,
             budget: ImapSendBudget::default(),
             octets: 0,
+            responses: 0,
             logout,
         }
     }
@@ -566,8 +623,6 @@ pub(crate) fn decode_completion(
 /// the 8-bit bytes of its text, which IMAP4rev1 keeps ASCII but servers
 /// send: it is decoded again with each of them read as `?`.
 pub(crate) fn decode_lossy_tagged(codec: &ResponseCodec, bytes: &[u8]) -> Option<Tagged<'static>> {
-    use imap_codec::decode::Decoder;
-
     let ascii: Vec<u8> = bytes
         .iter()
         .map(|&byte| if byte.is_ascii() { byte } else { b'?' })
@@ -577,6 +632,52 @@ pub(crate) fn decode_lossy_tagged(codec: &ResponseCodec, bytes: &[u8]) -> Option
         Ok((_, Response::Status(Status::Tagged(tagged)))) => Some(tagged.into_static()),
         _ => None,
     }
+}
+
+/// The items of the FETCH response `bytes` that decode alone, beside
+/// those that do not, when its top level scans.
+fn decode_fetch_items(
+    codec: &ResponseCodec,
+    bytes: &[u8],
+) -> Option<(Vec<MessageDataItem<'static>>, ImapFetchPartial)> {
+    let FetchLine {
+        seq,
+        prefix,
+        items: scanned,
+    } = FetchScanner { bytes, pos: 0 }.scan()?;
+    debug!("recovering the items of a fetch response");
+
+    let mut items = Vec::new();
+    let mut failed = Vec::new();
+    let mut message = Vec::new();
+
+    for (name, raw) in scanned {
+        message.clear();
+        message.extend_from_slice(prefix);
+        message.extend_from_slice(raw);
+        message.extend_from_slice(b")\r\n");
+
+        match codec.decode(&message) {
+            Ok(([], Response::Data(Data::Fetch { items: decoded, .. }))) => {
+                items.extend(decoded.into_static());
+            }
+            _ => {
+                let name = String::from_utf8_lossy(name).into_owned();
+                debug!("fetch item {name} did not decode");
+                trace!("{}", escape_byte_string(raw));
+
+                let raw = Secret::new(raw.into());
+                failed.push(ImapFetchFailedItem { name, raw });
+            }
+        }
+    }
+
+    let uid = items.iter().find_map(|item| match item {
+        MessageDataItem::Uid(uid) => Some(*uid),
+        _ => None,
+    });
+
+    Some((items, ImapFetchPartial { seq, uid, failed }))
 }
 
 /// Largest number of octets of a response an error carries.
@@ -606,6 +707,256 @@ struct UntaggedCommand<T: Encoder> {
     into_message: fn(Command<'static>) -> T::Message<'static>,
 }
 
+/// The top level of a `* <number> FETCH (…)` message.
+struct FetchLine<'a> {
+    /// The sequence number of the message.
+    seq: NonZeroU32,
+    /// The `* <number> FETCH (` prefix, as sent.
+    prefix: &'a [u8],
+    /// The items, a name and its raw bytes each.
+    items: Vec<(&'a [u8], &'a [u8])>,
+}
+
+/// A cursor over the top level of a `* <number> FETCH (…)` message.
+///
+/// Lists are walked with a depth counter, never recursion, and quoted
+/// strings and literals are taken whole.
+struct FetchScanner<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FetchScanner<'a> {
+    /// The top level of the message, `None` when it does not scan.
+    fn scan(mut self) -> Option<FetchLine<'a>> {
+        self.tag(b"* ")?;
+        let seq = NonZeroU32::new(self.number()?)?;
+        self.tag(b" FETCH (")?;
+
+        let prefix = &self.bytes[..self.pos];
+        let mut items = Vec::new();
+
+        loop {
+            let start = self.pos;
+            let name = self.name()?;
+            self.tag(b" ")?;
+            self.value()?;
+            items.push((name, &self.bytes[start..self.pos]));
+
+            match self.next()? {
+                b' ' => continue,
+                b')' => break,
+                _ => return None,
+            }
+        }
+
+        match self.rest() {
+            b"\r\n" | b"\n" => Some(FetchLine { seq, prefix, items }),
+            _ => None,
+        }
+    }
+
+    fn rest(&self) -> &'a [u8] {
+        self.bytes.get(self.pos..).unwrap_or_default()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    /// Takes `token`, ASCII case-insensitively.
+    fn tag(&mut self, token: &[u8]) -> Option<()> {
+        let bytes = self.rest().get(..token.len())?;
+
+        if !bytes.eq_ignore_ascii_case(token) {
+            return None;
+        }
+
+        self.pos += token.len();
+        Some(())
+    }
+
+    /// Takes a run of digits.
+    fn digits(&mut self) -> Option<()> {
+        let start = self.pos;
+
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.pos += 1;
+        }
+
+        (self.pos > start).then_some(())
+    }
+
+    /// Takes a run of digits fitting a `u32`.
+    fn number(&mut self) -> Option<u32> {
+        let mut number: u32 = 0;
+        let start = self.pos;
+
+        while let Some(byte @ b'0'..=b'9') = self.peek() {
+            number = number
+                .checked_mul(10)?
+                .checked_add(u32::from(byte - b'0'))?;
+            self.pos += 1;
+        }
+
+        (self.pos > start).then_some(number)
+    }
+
+    /// Takes an item name with its section and its origin, such as
+    /// `BODY[HEADER.FIELDS (FROM TO)]<0>`.
+    fn name(&mut self) -> Option<&'a [u8]> {
+        let start = self.pos;
+
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_graphic() && !b"()[]{}<>\"".contains(&byte))
+        {
+            self.pos += 1;
+        }
+
+        if self.pos == start {
+            return None;
+        }
+
+        if self.peek() == Some(b'[') {
+            self.section()?;
+        }
+
+        if self.peek() == Some(b'<') {
+            self.pos += 1;
+            self.digits()?;
+            self.tag(b">")?;
+        }
+
+        Some(&self.bytes[start..self.pos])
+    }
+
+    /// Takes a section, from its opening bracket to its closing one.
+    fn section(&mut self) -> Option<()> {
+        self.tag(b"[")?;
+
+        loop {
+            if self.at_literal() {
+                self.literal()?;
+                continue;
+            }
+
+            match self.peek()? {
+                b']' => {
+                    self.pos += 1;
+                    return Some(());
+                }
+                b'"' => self.quoted()?,
+                b'\r' | b'\n' => return None,
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Takes a value: `NIL`, a number, a quoted string, a literal or a
+    /// parenthesised list.
+    fn value(&mut self) -> Option<()> {
+        if self.at_literal() {
+            return self.literal();
+        }
+
+        match self.peek()? {
+            b'(' => self.list(),
+            b'"' => self.quoted(),
+            b'0'..=b'9' => self.digits(),
+            _ => self.tag(b"NIL"),
+        }
+    }
+
+    /// Takes a parenthesised list, its depth counted without recursion.
+    fn list(&mut self) -> Option<()> {
+        let mut depth: usize = 0;
+
+        loop {
+            if self.at_literal() {
+                self.literal()?;
+                continue;
+            }
+
+            match self.peek()? {
+                b'(' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    self.pos += 1;
+
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                b'"' => self.quoted()?,
+                b'\r' | b'\n' => return None,
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Takes a quoted string with its `\\` and `\"` escapes.
+    fn quoted(&mut self) -> Option<()> {
+        self.tag(b"\"")?;
+
+        loop {
+            match self.next()? {
+                b'"' => return Some(()),
+                b'\\' if matches!(self.next()?, b'\r' | b'\n') => return None,
+                b'\r' | b'\n' => return None,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether a literal starts here: `{` or `~{`, then a digit.
+    fn at_literal(&self) -> bool {
+        let rest = self.rest();
+        let rest = rest.strip_prefix(b"~").unwrap_or(rest);
+
+        matches!(rest, [b'{', b'0'..=b'9', ..])
+    }
+
+    /// Takes a literal, `{n}`, `{n+}` or `~{n}`, its line end and its
+    /// octets.
+    fn literal(&mut self) -> Option<()> {
+        if self.peek() == Some(b'~') {
+            self.pos += 1;
+        }
+
+        self.tag(b"{")?;
+        let len = usize::try_from(self.number()?).ok()?;
+
+        if self.peek() == Some(b'+') {
+            self.pos += 1;
+        }
+
+        self.tag(b"}")?;
+
+        if self.peek() == Some(b'\r') {
+            self.pos += 1;
+        }
+
+        self.tag(b"\n")?;
+
+        if self.rest().len() < len {
+            return None;
+        }
+
+        self.pos += len;
+        Some(())
+    }
+}
+
 /// Successful output of one command exchange: everything the server
 /// answered up to the tagged response.
 #[derive(Debug)]
@@ -619,6 +970,9 @@ pub struct ImapSendOutput {
     /// The untagged responses that did not decode and were skipped, as
     /// raw bytes: data the result may be missing.
     pub skipped: Vec<Secret<Box<[u8]>>>,
+    /// The FETCH responses recovered in part, whose decoded items are
+    /// in `data`.
+    pub partial: Vec<ImapFetchPartial>,
     /// The tagged response terminating the exchange, when one arrived.
     pub tagged: Option<Tagged<'static>>,
     /// The BYE response, when the server closed the session instead.
@@ -984,6 +1338,102 @@ mod tests {
 
         let tagged = out.tagged.expect("tagged completion");
         assert_eq!(StatusKind::No, tagged.body.kind);
+    }
+
+    const FETCH_LINE: &[u8] = b"* 12 fetch (BODY[HEADER.FIELDS (FROM \"TO]\")]<0> {5}\r\nab)cd \
+        FLAGS (\\Seen (x) \"a\\\"b)\") X-GM-MSGID 1278455344230334865 \
+        BINARY[1] ~{2}\r\n() THREADID NIL)\r\n";
+
+    #[test]
+    fn fetch_scanner_reads_items_whole() {
+        let scanner = FetchScanner {
+            bytes: FETCH_LINE,
+            pos: 0,
+        };
+        let FetchLine { seq, prefix, items } = scanner.scan().expect("scanned line");
+
+        assert_eq!(12, seq.get());
+        assert_eq!(b"* 12 fetch (", prefix);
+
+        let names: Vec<&[u8]> = items.iter().map(|(name, _)| *name).collect();
+        let expected: [&[u8]; 5] = [
+            b"BODY[HEADER.FIELDS (FROM \"TO]\")]<0>",
+            b"FLAGS",
+            b"X-GM-MSGID",
+            b"BINARY[1]",
+            b"THREADID",
+        ];
+        assert_eq!(expected, *names);
+        assert_eq!(b"FLAGS (\\Seen (x) \"a\\\"b)\")", items[1].1);
+        assert_eq!(b"BINARY[1] ~{2}\r\n()", items[3].1);
+    }
+
+    #[test]
+    fn fetch_scanner_refuses_a_line_that_does_not_scan() {
+        let lines: [&[u8]; 12] = [
+            b"* 2 FETCH (UID 5 FLAGS (\\Seen)\r\n",
+            b"* 2 FETCH (UID 5 BODY[] {10}\r\nshort)\r\n",
+            b"* 2 FETCH (UID 5)) \r\n",
+            b"* 2 FETCH ()\r\n",
+            b"* 2 FETCH (INTERNALDATE oops)\r\n",
+            b"* 0 FETCH (UID 5)\r\n",
+            b"* 4294967296 FETCH (UID 5)\r\n",
+            b"* 2 FETCH (BODY[] {5}x)\r\n",
+            b"* 2 FETCH (ENVELOPE (\"open))\r\n",
+            b"* 2 FETCH (BODY[HEADER {2}\r\n)]\r\n",
+            b"* 2 FETCH (UID  5)\r\n",
+            b"* 2 EXISTS\r\n",
+        ];
+
+        for line in lines {
+            let scanner = FetchScanner {
+                bytes: line,
+                pos: 0,
+            };
+            let scanned = scanner.scan();
+            assert!(scanned.is_none(), "{}", escape_byte_string(line));
+        }
+    }
+
+    #[test]
+    fn fetch_scanner_survives_truncated_and_altered_lines() {
+        let check = |bytes: &[u8]| {
+            let scanner = FetchScanner { bytes, pos: 0 };
+
+            if let Some(FetchLine { prefix, items, .. }) = scanner.scan() {
+                let len: usize = items.iter().map(|(_, raw)| raw.len()).sum();
+                assert!(prefix.len() + len <= bytes.len());
+                assert!(items.iter().all(|(name, raw)| raw.starts_with(name)));
+            }
+        };
+
+        for len in 0..=FETCH_LINE.len() {
+            check(&FETCH_LINE[..len]);
+        }
+
+        for pos in 0..FETCH_LINE.len() {
+            for &byte in b"()[]{}<>\"\\~+ 0\r\nN" {
+                let mut altered = FETCH_LINE.to_vec();
+                altered[pos] = byte;
+                check(&altered);
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_scanner_walks_deep_lists_without_recursion() {
+        let depth = 1_000_000;
+        let mut line = b"* 1 FETCH (FLAGS ".to_vec();
+        line.resize(line.len() + depth, b'(');
+        line.resize(line.len() + depth, b')');
+        line.extend_from_slice(b")\r\n");
+
+        let scanner = FetchScanner {
+            bytes: &line,
+            pos: 0,
+        };
+        let FetchLine { items, .. } = scanner.scan().expect("scanned line");
+        assert_eq!(1, items.len());
     }
 
     fn append_waiting_for_continuation() -> (ImapSend<CommandCodec>, Fragmentizer) {

@@ -201,6 +201,7 @@ impl ImapCoroutine for ImapMailboxExamine {
                         data: output,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMailboxExamineError::No(body.into());

@@ -71,13 +71,16 @@
 //! collects the response: data and untagged status lines
 //! accumulate, the tagged completion of its own command, a bye or a
 //! continuation request terminates, and undecodable untagged lines and
-//! the tagged completions of other commands are skipped. What
+//! the tagged completions of other commands are skipped. A FETCH line
+//! that does not decode is split into its items by a scanner of its own,
+//! each decoded alone: the items that decode join the data, and the
+//! others are named in a [`send::ImapFetchPartial`]. What
 //! accumulates is bounded by [`send::ImapSendBudget`], tight for the
 //! commands sent before authentication. Its terminal
 //! value is [`send::ImapSendOutput`]; failures surface as
 //! [`send::ImapSendError`]. A command returning data hands it back in
-//! a [`send::ImapOutput`], beside the alerts and the skipped lines of
-//! its response. Messages without a tag of their own (SASL
+//! a [`send::ImapOutput`], beside the alerts, the skipped lines and the
+//! FETCH lines recovered in part of its response. Messages without a tag of their own (SASL
 //! continuations, IDLE DONE) go through [`send::ImapSend::new`] with
 //! the tag of the command they continue, and the receive-only
 //! [`send::ImapSend::receive`] parses the response of a request whose

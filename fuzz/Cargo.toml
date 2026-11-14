@@ -23,6 +23,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fetch_line"
+path = "fuzz_targets/fetch_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "stream_batch"
 path = "fuzz_targets/stream_batch.rs"
 test = false

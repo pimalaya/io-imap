@@ -246,6 +246,7 @@ impl ImapCoroutine for ImapMessageFetch {
                         data,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMessageFetchError::No(body.into());
@@ -429,32 +430,112 @@ mod tests {
     }
 
     #[test]
-    fn fetch_returns_skipped_lines_and_alerts() {
-        let mut fetch = ImapMessageFetch::new(
-            "1:2".try_into().expect("valid sequence set"),
-            MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::Fast),
-            ImapMessageFetchOptions::default(),
-        );
-        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
-
-        expect_wants_tag_fetch(&mut fetch, &mut frag);
-        let _ = expect_wants_write_fetch(&mut fetch, &mut frag, Some(b"A1"));
-        expect_wants_read_fetch(&mut fetch, &mut frag);
-
-        let skipped = b"* 2 FETCH (FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n";
-        let reply = [
-            b"* 1 FETCH (FLAGS (\\Seen))\r\n".as_slice(),
-            skipped,
-            b"* OK [ALERT] quota almost reached\r\n",
-            b"A1 OK FETCH completed\r\n",
-        ]
-        .concat();
-        let out = expect_complete_ok_fetch(&mut fetch, &mut frag, &reply);
+    fn fetch_returns_partial_lines_and_alerts() {
+        let reply = b"* 1 FETCH (FLAGS (\\Seen))\r\n\
+            * 2 FETCH (FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+            * OK [ALERT] quota almost reached\r\n\
+            A1 OK FETCH completed\r\n";
+        let out = fetch_reply(reply);
 
         assert_eq!(1, out.data.len());
-        assert_eq!(1, out.skipped.len());
-        assert_eq!(skipped, &**out.skipped[0].declassify());
+        assert!(out.skipped.is_empty());
+        assert_eq!(1, out.partial.len());
+        assert_eq!(2, out.partial[0].seq.get());
+        assert_eq!(None, out.partial[0].uid);
+        assert_eq!(1, out.partial[0].failed.len());
+        assert_eq!("FLAGS", out.partial[0].failed[0].name);
+        assert_eq!(
+            b"FLAGS (OIB-Seen-[Gmail]/All Mail)",
+            &**out.partial[0].failed[0].raw.declassify()
+        );
         assert_eq!(["quota almost reached"], *out.alerts);
+    }
+
+    /// pimalaya/himalaya#801: imap-codec parses no more than six nested
+    /// multiparts.
+    #[test]
+    fn fetch_keeps_items_beside_a_bodystructure_nested_too_deep() {
+        let reply = format!(
+            "* 7 FETCH (UID 34 FLAGS (\\Seen) ENVELOPE ({ENVELOPE}) BODYSTRUCTURE {})\r\n\
+             A1 OK FETCH completed\r\n",
+            nested_bodystructure(7),
+        );
+        let out = fetch_reply(reply.as_bytes());
+
+        let id = NonZeroU32::new(7).expect("non-zero");
+        let items = out.data.get(&id).expect("fetched message").as_ref();
+        assert!(matches!(
+            items,
+            [
+                MessageDataItem::Uid(uid),
+                MessageDataItem::Flags(_),
+                MessageDataItem::Envelope(_),
+            ] if uid.get() == 34
+        ));
+
+        assert_eq!(1, out.partial.len());
+        assert_eq!(7, out.partial[0].seq.get());
+        assert_eq!(Some(34), out.partial[0].uid.map(NonZeroU32::get));
+        assert_eq!(1, out.partial[0].failed.len());
+        assert_eq!("BODYSTRUCTURE", out.partial[0].failed[0].name);
+    }
+
+    #[test]
+    fn fetch_keeps_items_beside_a_literal() {
+        let reply = b"* 3 FETCH (UID 9 BODY[HEADER] {14}\r\nSubject: hey\r\n \
+            FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+            A1 OK FETCH completed\r\n";
+        let out = fetch_reply(reply);
+
+        let id = NonZeroU32::new(3).expect("non-zero");
+        let items = out.data.get(&id).expect("fetched message").as_ref();
+        let [
+            MessageDataItem::Uid(uid),
+            MessageDataItem::BodyExt { data, .. },
+        ] = items
+        else {
+            panic!("expected UID and BODY[HEADER], got {items:?}");
+        };
+        assert_eq!(9, uid.get());
+        let header: &[u8] = data.0.as_ref().expect("header").as_ref();
+        assert_eq!(b"Subject: hey\r\n", header);
+
+        assert_eq!(1, out.partial.len());
+        assert_eq!("FLAGS", out.partial[0].failed[0].name);
+    }
+
+    #[test]
+    fn fetch_skips_a_line_that_does_not_scan() {
+        let line = b"* 2 FETCH (UID 5 FLAGS (\\Seen)\r\n";
+        let reply = [line.as_slice(), b"A1 OK FETCH completed\r\n"].concat();
+        let out = fetch_reply(&reply);
+
+        assert!(out.data.is_empty());
+        assert!(out.partial.is_empty());
+        assert_eq!(1, out.skipped.len());
+        assert_eq!(line, &**out.skipped[0].declassify());
+    }
+
+    #[test]
+    fn fetch_merges_a_line_recovered_in_part_with_another() {
+        let reply = format!(
+            "* 4 FETCH (UID 8)\r\n\
+             * 4 FETCH (FLAGS (\\Seen) BODYSTRUCTURE {})\r\n\
+             A1 OK FETCH completed\r\n",
+            nested_bodystructure(7),
+        );
+        let out = fetch_reply(reply.as_bytes());
+
+        let id = NonZeroU32::new(4).expect("non-zero");
+        let items = out.data.get(&id).expect("fetched message").as_ref();
+        assert!(matches!(
+            items,
+            [MessageDataItem::Uid(_), MessageDataItem::Flags(_)]
+        ));
+
+        assert_eq!(1, out.partial.len());
+        assert_eq!(4, out.partial[0].seq.get());
+        assert_eq!(None, out.partial[0].uid);
     }
 
     #[test]
@@ -704,6 +785,38 @@ mod tests {
             ImapCoroutineState::Complete(Err(err)) => err,
             state => panic!("expected Complete(Err), got {state:?}"),
         }
+    }
+
+    const ENVELOPE: &str = "\"Fri, 17 Apr 2026 14:15:28 +0000\" \"subject\" \
+        NIL NIL NIL NIL NIL NIL NIL \"<id@example.org>\"";
+
+    /// A BODYSTRUCTURE of `levels` multiparts nested around a text part.
+    fn nested_bodystructure(levels: usize) -> String {
+        let text = "(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 2 1)";
+        let mut body = text.to_owned();
+
+        for _ in 0..levels {
+            body = format!("({body} \"mixed\")");
+        }
+
+        body
+    }
+
+    /// Runs a FETCH tagged `A1` over `reply`.
+    fn fetch_reply(
+        reply: &[u8],
+    ) -> ImapOutput<BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>> {
+        let mut fetch = ImapMessageFetch::new(
+            "1:*".try_into().expect("valid sequence set"),
+            MacroOrMessageDataItemNames::Macro(imap_codec::imap_types::fetch::Macro::Full),
+            ImapMessageFetchOptions::default(),
+        );
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag_fetch(&mut fetch, &mut frag);
+        let _ = expect_wants_write_fetch(&mut fetch, &mut frag, Some(b"A1"));
+        expect_wants_read_fetch(&mut fetch, &mut frag);
+        expect_complete_ok_fetch(&mut fetch, &mut frag, reply)
     }
 
     fn first_word(line: &str) -> &str {

@@ -223,6 +223,7 @@ impl ImapCoroutine for ImapMessageStore {
                         data,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMessageStoreError::No(body.into());

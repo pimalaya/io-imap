@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-fetch-line-keeps-what-decodes
-status: active
+status: landed
 created: 2026-11-14
 ---
 
@@ -39,7 +39,7 @@ Himalaya needs the result to list such a message with what it could read, and to
 - **Which outputs carry it.** Every output carrying `skipped` carries `partial` too: FETCH, STORE, SEARCH, SORT, THREAD, STATUS, LIST, LSUB, EXPUNGE, UID EXPUNGE, SELECT, EXAMINE, NOOP and CHECK. The client-side SORT adds up the `partial` of its FETCH commands, as it does their `skipped`.
 - **The watcher.** It treats a snapshot as complete only when `skipped` is empty and no `partial` entry failed an item it reads: `UID`, `FLAGS` or `MODSEQ`.
 - **Logging and budget.** The recovery logs the failed item's name at debug and its bytes at trace. It reads only bytes the budget already counted, and copies at most one message's size.
-- **Upstream.** Open an issue at duesee/imap-codec with a byte reproducer (#801's seven-level `BODYSTRUCTURE`). It asks that `ResponseDecodeError::Failed` carry the offset and the kind of the failure, and that the body nesting limit be configurable. A pull request waits for the maintainer's answer, as #700 showed it should.
+- **Upstream.** Open an issue at duesee/imap-codec with a byte reproducer (#801's seven-level `BODYSTRUCTURE`). It asks that `ResponseDecodeError::Failed` carry the offset and the kind of the failure, and that the body nesting limit be configurable. A pull request waits for the maintainer's answer, as #700 showed it should. Its draft is imap-codec-issue.md, beside this proposal.
 
 ## Scope / non-goals
 

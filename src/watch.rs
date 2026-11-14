@@ -104,7 +104,7 @@ use core::{
 };
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
     sync::Arc,
     vec,
@@ -136,7 +136,7 @@ use crate::{
         select::ImapMailboxSelectData,
     },
     rfc5161::enable::{ImapExtensionEnable, ImapExtensionEnableError},
-    send::ImapOutput,
+    send::{ImapFetchPartial, ImapOutput},
 };
 
 /// UID-keyed mailbox change emitted by the watcher.
@@ -459,8 +459,9 @@ impl ImapMailboxWatch {
     /// counterpart of [`Self::compute_deltas`]: absence is what reports
     /// a vanished message, since no untagged VANISHED arrives.
     ///
-    /// A snapshot that is not `complete` skipped lines, so absence
-    /// reports nothing and the shadow keeps the messages it misses.
+    /// A snapshot that is not `complete` skipped lines or items it reads,
+    /// so absence reports nothing and the shadow keeps the messages it
+    /// misses.
     fn compute_snapshot_deltas(
         &mut self,
         snapshot: BTreeMap<NonZeroU32, Vec<MessageDataItem<'static>>>,
@@ -668,8 +669,14 @@ impl ImapCoroutine for ImapMailboxWatch {
                             bytes,
                         ));
                     }
-                    ImapCoroutineState::Complete(Ok(ImapOutput { data, .. })) => {
-                        for (_seq, items) in data {
+                    ImapCoroutineState::Complete(Ok(ImapOutput { data, partial, .. })) => {
+                        let unreadable = unreadable(&partial);
+
+                        for (seq, items) in data {
+                            if unreadable.contains(&seq) {
+                                continue;
+                            }
+
                             let items_vec = items.into_inner();
                             if let (Some(uid), flags) = extract_uid_flags(&items_vec) {
                                 self.shadow.insert(uid, flags);
@@ -785,15 +792,24 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 bytes,
                             ));
                         }
-                        ImapCoroutineState::Complete(Ok(ImapOutput { data, skipped, .. })) => {
+                        ImapCoroutineState::Complete(Ok(ImapOutput {
+                            mut data,
+                            skipped,
+                            partial,
+                            ..
+                        })) => {
                             if let Err(err) = self.check_uid_validity(&data) {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
 
+                            let unreadable = unreadable(&partial);
+                            data.changed
+                                .retain(|fetch| !unreadable.contains(&fetch.seq));
+
                             // NOTE: a reply that skipped a line is asked
                             // again from the same resync point.
                             match data.highest_mod_seq {
-                                Some(modseq) if skipped.is_empty() => {
+                                Some(modseq) if skipped.is_empty() && unreadable.is_empty() => {
                                     self.highest_mod_seq = modseq;
                                 }
                                 Some(_) => debug!("incomplete resync, keeping the resync point"),
@@ -857,10 +873,20 @@ impl ImapCoroutine for ImapMailboxWatch {
                             bytes,
                         ));
                     }
-                    ImapCoroutineState::Complete(Ok(ImapOutput { data, skipped, .. })) => {
+                    ImapCoroutineState::Complete(Ok(ImapOutput {
+                        data,
+                        skipped,
+                        partial,
+                        ..
+                    })) => {
+                        let unreadable = unreadable(&partial);
                         let mut snapshot = BTreeMap::new();
 
-                        for (_seq, items) in data {
+                        for (seq, items) in data {
+                            if unreadable.contains(&seq) {
+                                continue;
+                            }
+
                             let items_vec = items.into_inner();
                             if let (Some(uid), _flags) = extract_uid_flags(&items_vec) {
                                 snapshot.insert(uid, items_vec);
@@ -869,7 +895,8 @@ impl ImapCoroutine for ImapMailboxWatch {
 
                         debug!("re-read the whole mailbox");
                         trace!("uids: {}", snapshot.len());
-                        self.compute_snapshot_deltas(snapshot, skipped.is_empty());
+                        let complete = skipped.is_empty() && unreadable.is_empty();
+                        self.compute_snapshot_deltas(snapshot, complete);
                         self.state = State::EmitDeltas;
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
@@ -892,6 +919,22 @@ impl ImapCoroutine for ImapMailboxWatch {
             }
         }
     }
+}
+
+/// The sequence numbers of the messages whose `UID`, `FLAGS` or `MODSEQ`
+/// did not decode, which the shadow does not take.
+fn unreadable(partial: &[ImapFetchPartial]) -> BTreeSet<NonZeroU32> {
+    let watched = |name: &str| {
+        ["UID", "FLAGS", "MODSEQ"]
+            .iter()
+            .any(|watched| name.eq_ignore_ascii_case(watched))
+    };
+
+    partial
+        .iter()
+        .filter(|partial| partial.failed.iter().any(|item| watched(&item.name)))
+        .map(|partial| partial.seq)
+        .collect()
 }
 
 /// Extract the UID and flag list from a single FETCH; preserves wire
@@ -1248,7 +1291,7 @@ mod tests {
             ..Default::default()
         };
         let (mut watch, mut frag) = watcher_with(&[], opts);
-        let resynced = "* 1 FETCH (UID 1 FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+        let resynced = "* 1 FETCH (UID 1 FLAGS (\\Seen)\r\n\
             * 2 FETCH (UID 2 FLAGS (\\Seen))\r\n\
             {tag} OK FETCH completed\r\n";
         let steps: &[Step] = &[
@@ -1278,7 +1321,7 @@ mod tests {
             "* 1 EXISTS\r\n\
              * OK [UIDVALIDITY {UID_VALIDITY}] uid validity\r\n\
              * OK [HIGHESTMODSEQ 50] modseq\r\n\
-             * 1 FETCH (UID 1 FLAGS (OIB-Seen-[Gmail]/All Mail) MODSEQ (50))\r\n\
+             * 1 FETCH (UID 1 FLAGS (\\Seen) MODSEQ (50)\r\n\
              {{tag}} OK [READ-ONLY] EXAMINE completed\r\n",
         );
         let steps: &[Step] = &[
@@ -1291,6 +1334,59 @@ mod tests {
 
         let state = watch.state().expect("state kept");
         assert_eq!(known(42, &[(1, Vec::new())]), state);
+    }
+
+    #[test]
+    fn a_listing_missing_flags_keeps_the_known_ones() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(0, &[(1, Vec::new()), (2, vec![Flag::Seen])])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[], opts);
+        let resynced = "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n\
+            * 2 FETCH (UID 2 FLAGS (OIB-Seen-[Gmail]/All Mail))\r\n\
+            {tag} OK FETCH completed\r\n";
+        let steps: &[Step] = &[
+            ("EXAMINE INBOX", &[&examined(UID_VALIDITY)]),
+            ("UID FETCH 1:* (UID FLAGS)", &[resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert_eq!(1, events.len(), "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            ImapMailboxWatchEvent::FlagsAdded { uid, .. } if uid.get() == 1
+        ));
+
+        let state = watch.state().expect("state kept");
+        let flags = [(1, vec![Flag::Seen]), (2, vec![Flag::Seen])];
+        assert_eq!(known(0, &flags), state);
+    }
+
+    #[test]
+    fn a_qresync_reply_missing_flags_keeps_the_resync_point() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(42, &[(1, vec![Flag::Seen])])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[Capability::QResync], opts);
+        let resynced = format!(
+            "* 1 EXISTS\r\n\
+             * OK [UIDVALIDITY {UID_VALIDITY}] uid validity\r\n\
+             * OK [HIGHESTMODSEQ 50] modseq\r\n\
+             * 1 FETCH (UID 1 FLAGS (OIB-Seen-[Gmail]/All Mail) MODSEQ (50))\r\n\
+             {{tag}} OK [READ-ONLY] EXAMINE completed\r\n",
+        );
+        let steps: &[Step] = &[
+            ("ENABLE", &["* ENABLED QRESYNC\r\n{tag} OK enabled\r\n"]),
+            ("EXAMINE INBOX (QRESYNC (1700 42))", &[&resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(events.is_empty(), "got {events:?}");
+
+        let state = watch.state().expect("state kept");
+        assert_eq!(known(42, &[(1, vec![Flag::Seen])]), state);
     }
 
     #[test]

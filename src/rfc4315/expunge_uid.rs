@@ -146,6 +146,7 @@ impl ImapCoroutine for ImapMessageExpungeUid {
                         data: expunged,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMessageExpungeUidError::No(body.into());

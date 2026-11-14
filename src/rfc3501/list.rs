@@ -171,6 +171,7 @@ impl ImapCoroutine for ImapMailboxList {
                         data: mailboxes,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMailboxListError::No(body.into());

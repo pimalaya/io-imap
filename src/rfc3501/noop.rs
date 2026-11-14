@@ -135,6 +135,7 @@ impl ImapCoroutine for ImapNoop {
                         data: ImapMailboxUpdates::from_data(out.data),
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapNoopError::No(body.into());
@@ -205,7 +206,8 @@ mod tests {
             * OK [ALERT] maintenance at midnight\r\n\
             A1 OK NOOP completed\r\n";
         let out = expect_complete_ok(&mut noop, &mut frag, reply);
-        assert_eq!(1, out.skipped.len());
+        assert!(out.skipped.is_empty());
+        assert_eq!(4, out.partial[0].seq.get());
         assert_eq!(["maintenance at midnight"], *out.alerts);
 
         let updates = out.data;

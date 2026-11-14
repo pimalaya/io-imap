@@ -249,6 +249,7 @@ impl ImapCoroutine for ImapMailboxSelect {
                         data: output,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMailboxSelectError::No(body.into());

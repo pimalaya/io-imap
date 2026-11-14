@@ -178,6 +178,7 @@ impl ImapCoroutine for ImapMessageSearch {
                         data: ids,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMessageSearchError::No(body.into());

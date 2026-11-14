@@ -169,6 +169,7 @@ impl ImapCoroutine for ImapMessageThread {
                             data: threads,
                             alerts,
                             skipped: out.skipped,
+                            partial: out.partial,
                         })),
                         None => {
                             ImapCoroutineState::Complete(Err(ImapMessageThreadError::MissingData))

@@ -165,6 +165,7 @@ impl ImapCoroutine for ImapMailboxLsub {
                         data: mailboxes,
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMailboxLsubError::No(body.into());

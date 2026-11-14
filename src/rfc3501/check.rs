@@ -135,6 +135,7 @@ impl ImapCoroutine for ImapMailboxCheck {
                         data: ImapMailboxUpdates::from_data(out.data),
                         alerts,
                         skipped: out.skipped,
+                        partial: out.partial,
                     })),
                     StatusKind::No => {
                         let err = ImapMailboxCheckError::No(body.into());

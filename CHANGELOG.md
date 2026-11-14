@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `send::ImapFetchPartial`, a FETCH response whose items decoded only in part.
+
+- Added `send::ImapFetchFailedItem`, an item of a FETCH response that did not decode, its name and its raw bytes.
+
+### Changed
+
+- **BREAKING**: Added `partial` to `send::ImapOutput` and `send::ImapSendOutput`, the FETCH responses recovered in part.
+
+  A caller building or matching these structs exhaustively must name the new field.
+
+### Fixed
+
+- Fixed an untagged FETCH response that does not decode losing every item of its message.
+
+  Its items are decoded one by one: those that decode join the data under its sequence number, the others are named in `partial`. A line whose top level does not scan stays in `skipped`.
+
 ## [0.10.0] - 2026-11-13
 
 ### Changed

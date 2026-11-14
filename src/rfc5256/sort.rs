@@ -331,6 +331,7 @@ impl ImapCoroutine for ImapMessageSort {
                                 data: ids,
                                 alerts,
                                 skipped: out.skipped,
+                                partial: out.partial,
                             })),
                             None => {
                                 ImapCoroutineState::Complete(Err(ImapMessageSortError::MissingData))
@@ -352,6 +353,7 @@ impl ImapCoroutine for ImapMessageSort {
                     self.searched = self.remaining.iter().copied().collect();
                     self.output.alerts.extend(out.alerts);
                     self.output.skipped.extend(out.skipped);
+                    self.output.partial.extend(out.partial);
 
                     match self.next_fetch() {
                         Ok(Some(fetch)) => {
@@ -370,6 +372,7 @@ impl ImapCoroutine for ImapMessageSort {
                     self.fetched.extend(out.data);
                     self.output.alerts.extend(out.alerts);
                     self.output.skipped.extend(out.skipped);
+                    self.output.partial.extend(out.partial);
 
                     match self.next_fetch() {
                         Ok(Some(fetch)) => {
@@ -831,6 +834,39 @@ mod tests {
 
         assert_eq!(vec![nz(1)], out.data);
         assert_eq!(2, out.skipped.len());
+    }
+
+    #[test]
+    fn fallback_returns_fetch_lines_recovered_in_part() {
+        let opts = ImapMessageSortOptions {
+            uid: true,
+            fallback: true,
+        };
+        let mut sort = ImapMessageSort::new(arrival(), search_criteria(), opts);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        wants_tag(&mut sort, &mut frag, None);
+        wants_write(&mut sort, &mut frag, Some(b"A1"));
+        wants_read(&mut sort, &mut frag, None);
+
+        let search_reply = b"* SEARCH 1 2\r\nA1 OK SEARCH completed\r\n";
+        wants_tag(&mut sort, &mut frag, Some(search_reply));
+        wants_write(&mut sort, &mut frag, Some(b"A2"));
+        wants_read(&mut sort, &mut frag, None);
+
+        let fetch_reply = b"* 1 FETCH (UID 1 INTERNALDATE \"02-Feb-2021 00:00:00 +0000\")\r\n\
+            * 2 FETCH (UID 2 INTERNALDATE \"oops\")\r\n\
+            A2 OK FETCH completed\r\n";
+        let out = match sort.resume(&mut frag, Some(fetch_reply)) {
+            ImapCoroutineState::Complete(Ok(out)) => out,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        };
+
+        assert_eq!(2, out.data.len());
+        assert!(out.skipped.is_empty());
+        assert_eq!(1, out.partial.len());
+        assert_eq!(Some(nz(2)), out.partial[0].uid);
+        assert_eq!("INTERNALDATE", out.partial[0].failed[0].name);
     }
 
     #[test]

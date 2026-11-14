@@ -51,6 +51,25 @@ change: a-fetch-line-keeps-what-decodes
 - **WHEN** the SEARCH of a client-side SORT skips one line and its FETCH another
 - **THEN** the output of the SORT holds both lines as skipped
 
+### Requirement: An incomplete listing removes nothing
+
+(mailbox-watch) A whole-mailbox re-read whose FETCH skipped a line for not decoding, or recovered a line in part without its `UID`, `FLAGS` or `MODSEQ`, SHALL report no removal and keep in the shadow the messages its snapshot misses, while still reporting the additions and flag changes it read. A QRESYNC reply that did either SHALL apply what it read and keep its resync point, so the next resync asks again from it. A message whose `UID`, `FLAGS` or `MODSEQ` did not decode SHALL be left out of the baseline, the re-read and the reply, as if its line were skipped.
+
+#### Scenario: One line of the re-read does not decode
+
+- **WHEN** a watch knowing UIDs 1 and 2 re-reads a mailbox whose line for UID 1 is skipped and whose UID 2 is now `\Seen`
+- **THEN** it emits the `\Seen` of 2 alone, and its state still holds UID 1
+
+#### Scenario: One line of a QRESYNC reply does not decode
+
+- **WHEN** a watch at resync point 42 reads a reply announcing `HIGHESTMODSEQ 50` and skips one of its FETCH lines
+- **THEN** its state keeps the resync point 42
+
+#### Scenario: The flags of one message do not decode
+
+- **WHEN** a watch knowing UID 2 as `\Seen` re-reads a mailbox whose line for UID 2 decodes its `UID` but not its `FLAGS`
+- **THEN** it emits no flag change for 2, and its state still holds 2 as `\Seen`
+
 ## REMOVED Requirements
 
 None.
