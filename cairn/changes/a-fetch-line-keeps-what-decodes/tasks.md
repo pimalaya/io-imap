@@ -12,4 +12,4 @@ change: a-fetch-line-keeps-what-decodes
 - [x] Fuzz the scanner (no panic, no recursion, bounded by the message): fuzz/fuzz_targets/fetch_line.rs, plus the scanner unit tests in src/send.rs
 - [x] Upstream: duesee/imap-codec#748 (the offset of a failed decode) and duesee/imap-codec#749 (a configurable body recursion limit), opened 2026-11-14
 - [x] cairn/spec/coroutines.md and message-fetch.md: fold the delta; CHANGELOG; log; status landed
-- [ ] The release, left to the owner
+- [x] The release: io-imap 0.11.0 on crates.io, 2026-11-15
