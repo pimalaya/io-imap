@@ -609,6 +609,7 @@ macro_rules! imap_client_commands {
             ///
             /// Errors with `QresyncNotSupported` when `capability` lacks
             /// QRESYNC, with `InvalidModSeq` when `highest_mod_seq` is 0.
+            /// Needs QRESYNC enabled first, listed in what `enable` returned.
             fn select_qresync(
                 &mut self,
                 mailbox: Mailbox<'static>,
@@ -721,6 +722,7 @@ macro_rules! imap_client_commands {
             ///
             /// Errors with `QresyncNotSupported` when `capability` lacks
             /// QRESYNC, with `InvalidModSeq` when `highest_mod_seq` is 0.
+            /// Needs QRESYNC enabled first, listed in what `enable` returned.
             fn select_qresync(
                 &mut self,
                 mailbox: Mailbox<'static>,

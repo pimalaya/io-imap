@@ -120,12 +120,12 @@
 //! chaining ENABLE QRESYNC, SELECT (CONDSTORE), a FETCH baseline seed,
 //! then an IDLE wake-loop with SELECT (QRESYNC) delta pulls, emitting
 //! UID-keyed added/changed/removed events. Against a server without
-//! QRESYNC it re-reads the whole mailbox on each wake and diffs the
-//! same baseline locally, so the events are the same and only the cost
-//! differs. The connection is dedicated; a shared `AtomicBool` winds it
-//! down cleanly. A watch that lost its connection hands out what it
-//! knew of the mailbox, and a new one resumed from it emits what
-//! changed during the outage.
+//! QRESYNC, or whose ENABLED does not list it, it re-reads the whole
+//! mailbox on each wake and diffs the same baseline locally, so the
+//! events are the same and only the cost differs. The connection is
+//! dedicated; a shared `AtomicBool` winds it down cleanly. A watch that
+//! lost its connection hands out what it knew of the mailbox, and a new
+//! one resumed from it emits what changed during the outage.
 //!
 //! ## The clients
 //!

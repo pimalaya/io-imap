@@ -1,6 +1,6 @@
 //! IMAP single-mailbox watcher: IDLE (RFC 2177) for the wake signal,
 //! EXAMINE (QRESYNC) (RFC 7162) for UID-keyed deltas, with a client-side
-//! fallback for servers that do not advertise QRESYNC.
+//! fallback for servers that do not advertise or enable QRESYNC.
 //!
 //! The mailbox is opened with EXAMINE, not SELECT, so the session is
 //! **read-only**: the watcher never writes (no flag changes, no expunge),
@@ -109,7 +109,7 @@ use core::{
 
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    string::String,
+    string::{String, ToString},
     sync::Arc,
     vec,
     vec::Vec,
@@ -304,8 +304,8 @@ pub struct ImapMailboxWatch {
 
 impl ImapMailboxWatch {
     /// Builds a watcher for `mailbox`, picking its path from
-    /// `capability`: QRESYNC when the server advertises it, the
-    /// whole-mailbox fallback otherwise.
+    /// `capability`: QRESYNC when the server advertises it and its
+    /// ENABLED lists it, the whole-mailbox fallback otherwise.
     pub fn new(
         capability: &[Capability<'static>],
         mailbox: Mailbox<'static>,
@@ -340,8 +340,7 @@ impl ImapMailboxWatch {
         }
 
         watch.state = if qresync {
-            // NOTE: RFC 7162 §3.1: QRESYNC implies CONDSTORE, but pass
-            // both since some servers only echo CONDSTORE in ENABLED.
+            // NOTE: RFC 7162 §3.2.3 has servers take both in one ENABLE.
             let condstore = CapabilityEnable::CondStore;
             // NOTE: QRESYNC is not in the typed enum, route via Atom.
             let qresync = CapabilityEnable::from(
@@ -593,7 +592,17 @@ impl ImapCoroutine for ImapMailboxWatch {
                         ));
                     }
                     ImapCoroutineState::Complete(Ok(enabled)) => {
-                        debug!("enabled qresync");
+                        // NOTE: RFC 5161 §3.2: what ENABLED does not list,
+                        // a bare OK included, is not enabled.
+                        self.qresync = enabled.iter().flatten().any(|capability| {
+                            capability.to_string().eq_ignore_ascii_case("QRESYNC")
+                        });
+
+                        if self.qresync {
+                            debug!("enabled qresync");
+                        } else {
+                            debug!("qresync not enabled, watching the whole mailbox");
+                        }
                         trace!("{enabled:?}");
 
                         if self.seeded {
@@ -601,7 +610,11 @@ impl ImapCoroutine for ImapMailboxWatch {
                             continue;
                         }
 
-                        let parameters = vec![SelectParameter::CondStore];
+                        let parameters = if self.qresync {
+                            vec![SelectParameter::CondStore]
+                        } else {
+                            Vec::new()
+                        };
                         let examine = ImapMailboxExamine::new(
                             self.mailbox.clone(),
                             ImapMailboxExamineOptions { parameters },
@@ -1640,5 +1653,56 @@ mod tests {
             "{err:?}"
         );
         assert!(!watch.opened());
+    }
+
+    #[test]
+    fn an_enable_not_listing_qresync_falls_back_to_the_whole_mailbox() {
+        let baseline = fetched(&[(1, "")]);
+        let resynced = fetched(&[(1, ""), (2, "")]);
+
+        for enabled in [
+            "{tag} OK ENABLE completed\r\n",
+            "* ENABLED CONDSTORE\r\n{tag} OK ENABLE completed\r\n",
+        ] {
+            let (mut watch, mut frag) = watcher(&[Capability::QResync]);
+            let steps: &[Step] = &[
+                ("ENABLE", &[enabled]),
+                ("EXAMINE INBOX\r\n", &[&examined_qresync()]),
+                ("UID FETCH 1:* (UID FLAGS)", &[&baseline]),
+                ("IDLE", &["+ idling\r\n", "* 2 EXISTS\r\n"]),
+                ("DONE", &["{tag} OK IDLE terminated\r\n"]),
+                ("EXAMINE INBOX\r\n", &[&examined_qresync()]),
+                ("UID FETCH 1:* (UID FLAGS)", &[&resynced]),
+            ];
+
+            let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+            assert_eq!(1, events.len(), "got {events:?}");
+            assert!(matches!(
+                &events[0],
+                ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } if uid.get() == 2
+            ));
+        }
+    }
+
+    #[test]
+    fn a_resumed_watch_whose_enable_omits_qresync_re_reads_the_whole_mailbox() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(225, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[Capability::QResync], opts);
+        let resynced = fetched(&[(1, ""), (12, "")]);
+        let steps: &[Step] = &[
+            ("ENABLE", &["{tag} OK ENABLE completed\r\n"]),
+            ("EXAMINE INBOX\r\n", &[&examined_qresync()]),
+            ("UID FETCH 1:* (UID FLAGS)", &[&resynced]),
+        ];
+
+        let events = drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert_eq!(1, events.len(), "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } if uid.get() == 12
+        ));
     }
 }

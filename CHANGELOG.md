@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `watch::ImapMailboxWatch` taking the QRESYNC path on any `OK` to its ENABLE: it takes it only when the server's ENABLED lists QRESYNC, and watches the whole mailbox otherwise.
+
+  Against a server answering a bare `OK`, every resync read nothing and moved past the change, so arrivals, flag changes and expunges were lost.
+
 ## [0.11.1] - 2026-11-15
 
 ### Added
