@@ -32,13 +32,14 @@ use imap_codec::{
         core::{IString, NString, TagGenerator, Vec1},
         extensions::{
             enable::CapabilityEnable,
+            notify::Notify,
             sort::SortCriterion,
             thread::{Thread, ThreadingAlgorithm},
         },
         fetch::{MacroOrMessageDataItemNames, MessageDataItem},
         flag::{Flag, StoreType},
         mailbox::{ListMailbox, Mailbox},
-        response::Capability,
+        response::{Capability, Data},
         search::SearchKey,
         sequence::SequenceSet,
         status::{StatusDataItem, StatusDataItemName},
@@ -52,7 +53,7 @@ use thiserror::Error;
 use crate::rfc7677::auth_scram_sha_256::*;
 use crate::{
     coroutine::*,
-    rfc2177::idle::ImapIdleError,
+    rfc2177::idle::{ImapIdleError, ImapIdleEvent},
     rfc2971::id::*,
     rfc3501::{
         append::*, append_stream::*, capability::*, check::*, close::*, copy::*, create::*,
@@ -64,6 +65,7 @@ use crate::{
     rfc4315::expunge_uid::*,
     rfc5161::enable::*,
     rfc5256::{sort::*, thread::*},
+    rfc5465::{notify::*, watch::*},
     rfc6851::r#move::*,
     rfc7628::auth_oauthbearer::*,
     sasl::{auth_anonymous::*, auth_login::*, auth_plain::*, auth_xoauth2::*},
@@ -169,6 +171,12 @@ pub enum ImapClientError {
     /// The mailbox watcher failed.
     #[error(transparent)]
     MailboxWatch(#[from] ImapMailboxWatchError),
+    /// The NOTIFY coroutine failed.
+    #[error(transparent)]
+    NotifySet(#[from] ImapNotifySetError),
+    /// The NOTIFY watch failed.
+    #[error(transparent)]
+    NotifyWatch(#[from] ImapNotifyWatchError),
     /// The CLOSE coroutine failed.
     #[error(transparent)]
     MailboxClose(#[from] ImapMailboxCloseError),
@@ -405,6 +413,22 @@ impl ImapClientError {
                 | Watch::Enable(
                     ImapExtensionEnableError::No(status) | ImapExtensionEnableError::Bad(status),
                 ),
+            )
+            | Self::NotifySet(
+                ImapNotifySetError::No(status)
+                | ImapNotifySetError::Bad(status)
+                | ImapNotifySetError::BadEvent { status, .. },
+            )
+            | Self::NotifyWatch(
+                ImapNotifyWatchError::Notify(
+                    ImapNotifySetError::No(status)
+                    | ImapNotifySetError::Bad(status)
+                    | ImapNotifySetError::BadEvent { status, .. },
+                )
+                | ImapNotifyWatchError::Enable(
+                    ImapExtensionEnableError::No(status) | ImapExtensionEnableError::Bad(status),
+                )
+                | ImapNotifyWatchError::Idle(ImapIdleError::No(status) | ImapIdleError::Bad(status)),
             ) => Some(status),
             #[cfg(feature = "scram")]
             Self::AuthScramSha256(
@@ -504,6 +528,12 @@ impl ImapClientError {
                 | Watch::Fetch(ImapMessageFetchError::Bye(_))
                 | Watch::Idle(ImapIdleError::Bye(_) | ImapIdleError::Eof)
                 | Watch::Enable(ImapExtensionEnableError::Bye(_)),
+            )
+            | Self::NotifySet(ImapNotifySetError::Bye(_))
+            | Self::NotifyWatch(
+                ImapNotifyWatchError::Enable(ImapExtensionEnableError::Bye(_))
+                | ImapNotifyWatchError::Notify(ImapNotifySetError::Bye(_))
+                | ImapNotifyWatchError::Idle(ImapIdleError::Bye(_) | ImapIdleError::Eof),
             ) => true,
             #[cfg(feature = "scram")]
             Self::AuthScramSha256(ImapAuthScramSha256Error::Bye(_))
@@ -838,6 +868,12 @@ imap_client_commands! {
         capabilities: Vec1<CapabilityEnable<'static>>,
     ) -> Option<Vec<CapabilityEnable<'static>>> {
         ImapExtensionEnable::new(capabilities)
+    }
+
+    /// `NOTIFY SET` or `NOTIFY NONE`; returns the STATUS responses a
+    /// `NOTIFY SET STATUS` asks for.
+    fn notify(notify: Notify<'static>) -> ImapOutput<Vec<Data<'static>>> {
+        ImapNotifySet::new(notify)
     }
 
     /// `LIST`; returns the mailboxes matching `reference` and `pattern`.
@@ -1295,6 +1331,114 @@ impl ImapClientStd {
         })
     }
 
+    /// Consumes the client into a background NOTIFY watch: `notify`
+    /// once, then IDLE, sending every notification to the stream.
+    /// `capability` decides whether CONDSTORE is enabled first.
+    ///
+    /// Drop the returned stream (or call its `close`) to wind down;
+    /// `opts.shutdown_poll` bounds how long that takes.
+    /// [`ImapNotifyWatchStream::wait_opened`] tells when the server
+    /// accepted the NOTIFY.
+    pub fn watch_notify(
+        self,
+        notify: Notify<'static>,
+        capability: &[Capability<'static>],
+        opts: ImapNotifyWatchStreamOptions,
+    ) -> Result<ImapNotifyWatchStream, ImapClientError> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let watch_opts = ImapNotifyWatchOptions {
+            idle_timeout: opts.idle_timeout,
+            condstore: opts.condstore,
+        };
+        let mut watcher = ImapNotifyWatch::new(capability, notify, shutdown.clone(), watch_opts);
+        let mut fragmentizer = self.fragmentizer;
+        let mut tags = self.tags;
+        let mut stream = self.stream;
+
+        stream.set_read_timeout(Some(opts.shutdown_poll))?;
+        stream.stop_retrying();
+
+        let (tx, rx) = mpsc::sync_channel::<Result<ImapIdleEvent, ImapClientError>>(256);
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+        let shutdown_handle = shutdown.clone();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; READ_BUFFER_SIZE];
+            let mut arg: Option<Vec<u8>> = None;
+            let mut opened_tx = Some(opened_tx);
+
+            loop {
+                let state = watcher.resume(&mut fragmentizer, arg.as_deref());
+
+                if watcher.opened()
+                    && let Some(opened_tx) = opened_tx.take()
+                {
+                    opened_tx.send(()).ok();
+                }
+
+                match state {
+                    ImapCoroutineState::Yielded(ImapNotifyWatchYield::Event(e)) => {
+                        arg = None;
+                        if tx.send(Ok(e)).is_err() {
+                            return;
+                        }
+                    }
+                    ImapCoroutineState::Complete(Ok(())) => return,
+                    ImapCoroutineState::Yielded(ImapNotifyWatchYield::WantsTag) => {
+                        let tag = tags.generate();
+                        arg = Some(tag.as_ref().as_bytes().to_vec());
+                    }
+                    ImapCoroutineState::Yielded(ImapNotifyWatchYield::WantsRead) => {
+                        match stream.read(&mut buf) {
+                            Ok(0) => {
+                                let eof = io::ErrorKind::UnexpectedEof;
+                                let err = "IMAP server closed the connection during watch";
+                                tx.send(Err(io::Error::new(eof, err).into())).ok();
+                                return;
+                            }
+                            Ok(n) => arg = Some(buf[..n].to_vec()),
+                            // NOTE: the read deadline armed above, the
+                            // chance to see the shutdown flag.
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                arg = None;
+                            }
+                            Err(err) => {
+                                tx.send(Err(err.into())).ok();
+                                return;
+                            }
+                        }
+                    }
+                    ImapCoroutineState::Yielded(ImapNotifyWatchYield::WantsWrite(bytes)) => {
+                        if let Err(err) = stream.write_all(&bytes).and_then(|()| stream.flush()) {
+                            tx.send(Err(err.into())).ok();
+                            return;
+                        }
+                        arg = None;
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        tx.send(Err(err.into())).ok();
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ImapNotifyWatchStream {
+            rx: Some(rx),
+            handle: Some(handle),
+            shutdown: shutdown_handle,
+            opened_rx,
+            opened: AtomicBool::new(false),
+        })
+    }
+
     /// `FETCH <id> (BODY.PEEK[])` streaming the message body straight
     /// into `sink`; the body never lands in memory whole.
     ///
@@ -1635,6 +1779,113 @@ impl Drop for ImapMailboxWatchStream {
     }
 }
 
+/// Options of [`ImapClientStd::watch_notify`].
+#[derive(Clone, Debug)]
+pub struct ImapNotifyWatchStreamOptions {
+    /// How long the worker may sit in a read before it looks at the
+    /// shutdown flag again, as for
+    /// [`ImapMailboxWatchStreamOptions::shutdown_poll`].
+    pub shutdown_poll: Duration,
+    /// How long an IDLE is held before it is re-issued, `None` taking
+    /// io-imap's own default.
+    pub idle_timeout: Option<Duration>,
+    /// Whether to ENABLE CONDSTORE before the NOTIFY, as for
+    /// [`ImapNotifyWatchOptions::condstore`].
+    pub condstore: ImapNotifyCondstore,
+}
+
+impl Default for ImapNotifyWatchStreamOptions {
+    fn default() -> Self {
+        Self {
+            shutdown_poll: Duration::from_secs(5),
+            idle_timeout: None,
+            condstore: ImapNotifyCondstore::default(),
+        }
+    }
+}
+
+/// Background-worker NOTIFY watch; drop or [`Self::close`] to wind down.
+pub struct ImapNotifyWatchStream {
+    rx: Option<Receiver<Result<ImapIdleEvent, ImapClientError>>>,
+    handle: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    opened_rx: Receiver<()>,
+    opened: AtomicBool,
+}
+
+impl ImapNotifyWatchStream {
+    /// Whether the server accepted the NOTIFY.
+    pub fn opened(&self) -> bool {
+        self.wait_opened(Duration::ZERO).is_ok()
+    }
+
+    /// Waits up to `timeout` for the server to accept the NOTIFY.
+    ///
+    /// `Disconnected` tells a worker that ended unopened, its error
+    /// waiting on the stream.
+    pub fn wait_opened(&self, timeout: Duration) -> Result<(), RecvTimeoutError> {
+        if self.opened.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.opened_rx.recv_timeout(timeout)?;
+        self.opened.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Non-blocking probe for the next notifications.
+    pub fn try_recv(&self) -> Result<Result<ImapIdleEvent, ImapClientError>, TryRecvError> {
+        match &self.rx {
+            Some(rx) => rx.try_recv(),
+            None => Err(TryRecvError::Disconnected),
+        }
+    }
+
+    /// Waits up to `timeout` for the next notifications.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Result<ImapIdleEvent, ImapClientError>, RecvTimeoutError> {
+        match &self.rx {
+            Some(rx) => rx.recv_timeout(timeout),
+            None => Err(RecvTimeoutError::Disconnected),
+        }
+    }
+
+    /// Signals shutdown and joins the worker.
+    pub fn close(mut self) -> Result<(), ImapClientError> {
+        match self.stop() {
+            Some(Err(_)) => Err(io::Error::other("IMAP NOTIFY worker panicked").into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Winds the worker down and joins it, once.
+    fn stop(&mut self) -> Option<thread::Result<()>> {
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        // NOTE: dropped before the join, so a worker blocked on a full
+        // channel fails its send and returns.
+        self.rx.take();
+
+        self.handle.take().map(JoinHandle::join)
+    }
+}
+
+impl Iterator for ImapNotifyWatchStream {
+    type Item = Result<ImapIdleEvent, ImapClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx.as_ref()?.recv().ok()
+    }
+}
+
+impl Drop for ImapNotifyWatchStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Blocking stream the client runs over.
 ///
 /// Implemented for the standard pimalaya-stream transport; a custom one (such
@@ -1865,6 +2116,76 @@ mod tests {
 
         ImapClientStd::new(stream)
             .watch_mailbox("INBOX".try_into().expect("valid mailbox"), &[], opts)
+            .expect("watch started")
+    }
+
+    #[test]
+    fn a_notify_stream_yields_the_status_and_the_notifications() {
+        let stream = notify_stream(|command| {
+            if command.contains("NOTIFY") {
+                "* STATUS INBOX (MESSAGES 1)\r\n{tag} OK done\r\n"
+            } else if command.contains("IDLE") {
+                "+ idling\r\n* STATUS Lists (MESSAGES 4)\r\n"
+            } else {
+                "{tag} OK done\r\n"
+            }
+        });
+
+        assert_eq!(Ok(()), stream.wait_opened(Duration::from_secs(5)));
+        for _ in 0..2 {
+            let event = stream
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an event")
+                .expect("no error");
+            assert!(matches!(event.data[..], [Data::Status { .. }]));
+        }
+        stream.close().expect("worker wound down");
+    }
+
+    #[test]
+    fn a_notify_stream_refused_never_opens() {
+        let mut stream = notify_stream(
+            |_| "{tag} NO [BADEVENT MailboxMetadataChange] Unsupported NOTIFY events.\r\n",
+        );
+
+        let opened = stream.wait_opened(Duration::from_secs(5));
+        assert_eq!(Err(RecvTimeoutError::Disconnected), opened);
+
+        let err = stream.next().expect("an error").expect_err("refused");
+        let status = err.status().expect("a refusal");
+        assert_eq!(StatusKind::No, status.kind);
+    }
+
+    /// A NOTIFY watch of every personal mailbox over a [`ScriptStream`]
+    /// answering with `answer`.
+    fn notify_stream(answer: fn(&str) -> &'static str) -> ImapNotifyWatchStream {
+        use imap_codec::imap_types::extensions::notify::{
+            EventGroups, FilterMailboxes, MailboxEvents, MailboxGroup, MessageEvents,
+        };
+
+        let stream = ScriptStream {
+            answer,
+            unflushed: Vec::new(),
+            replies: Vec::new(),
+        };
+        let group = MailboxGroup {
+            filter: FilterMailboxes::Personal,
+            events: Some(MailboxEvents::WithMessage {
+                message: MessageEvents::default(),
+                others: Vec::new(),
+            }),
+        };
+        let notify = Notify::Set {
+            status: true,
+            groups: EventGroups::Others(Vec1::from(group)),
+        };
+        let opts = ImapNotifyWatchStreamOptions {
+            shutdown_poll: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        ImapClientStd::new(stream)
+            .watch_notify(notify, &[], opts)
             .expect("watch started")
     }
 

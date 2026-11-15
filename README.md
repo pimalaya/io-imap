@@ -45,6 +45,7 @@ This library is composed of 3 feature-gated layers:
 | [4959] | SASL-IR: initial client response inline with the authentication command, saving a round-trip                                               |
 | [5161] | ENABLE: explicit activation of server capabilities                                                                                         |
 | [5256] | SORT and THREAD: server-side message sorting and threading, with a client-side sorting fallback for servers lacking the extension          |
+| [5465] | NOTIFY: change notifications for several mailboxes on one connection, held open with IDLE                                                  |
 | [6851] | MOVE: atomic message move between mailboxes                                                                                                |
 | [7162] | CONDSTORE and QRESYNC: incremental resync through mod-sequences and vanished message reporting on select and examine                       |
 | [7628] | OAUTHBEARER: OAuth 2.0 bearer token authentication, next to the pre-standard XOAUTH2                                                       |
@@ -58,6 +59,7 @@ This library is composed of 3 feature-gated layers:
 [4959]: https://www.rfc-editor.org/rfc/rfc4959
 [5161]: https://www.rfc-editor.org/rfc/rfc5161
 [5256]: https://www.rfc-editor.org/rfc/rfc5256
+[5465]: https://www.rfc-editor.org/rfc/rfc5465
 [6851]: https://www.rfc-editor.org/rfc/rfc6851
 [7162]: https://www.rfc-editor.org/rfc/rfc7162
 [7628]: https://www.rfc-editor.org/rfc/rfc7628

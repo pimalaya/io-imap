@@ -24,10 +24,11 @@
 //! Like io-http and io-oauth, the source tree mirrors the specs:
 //! [`rfc3501`] (IMAP4rev1 commands), [`rfc2177`] (IDLE), [`rfc2971`]
 //! (ID), [`rfc3691`] (UNSELECT), [`rfc4315`] (UIDPLUS), [`rfc5161`]
-//! (ENABLE), [`rfc5256`] (SORT and THREAD), [`rfc6851`] (MOVE),
-//! [`rfc7628`] (OAUTHBEARER) and `rfc7677` (SCRAM-SHA-256, behind the
-//! `scram` feature); the [`sasl`] module holds the RFC-agnostic
-//! mechanisms (ANONYMOUS, LOGIN, PLAIN, XOAUTH2). The CONDSTORE and
+//! (ENABLE), [`rfc5256`] (SORT and THREAD), [`rfc5465`] (NOTIFY),
+//! [`rfc6851`] (MOVE), [`rfc7628`] (OAUTHBEARER) and `rfc7677`
+//! (SCRAM-SHA-256, behind the `scram` feature); the [`sasl`] module
+//! holds the RFC-agnostic mechanisms (ANONYMOUS, LOGIN, PLAIN,
+//! XOAUTH2). The CONDSTORE and
 //! QRESYNC extensions (RFC 7162) have no module of their own: they
 //! surface as parameters and response fields of the [`rfc3501`]
 //! select, examine and fetch coroutines, and power [`watch`]. Code
@@ -174,6 +175,7 @@ pub mod rfc3691;
 pub mod rfc4315;
 pub mod rfc5161;
 pub mod rfc5256;
+pub mod rfc5465;
 pub mod rfc6851;
 pub mod rfc7628;
 #[cfg(feature = "scram")]

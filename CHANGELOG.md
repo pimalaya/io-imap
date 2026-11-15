@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `rfc5465::notify::ImapNotifySet`, the NOTIFY command, and `notify` on `client::ImapClient` and `client::ImapClientAsync`.
+
+  A `BADEVENT` refusal is `ImapNotifySetError::BadEvent`, read in the RFC's form and in Dovecot's.
+
+- Added `rfc5465::watch::ImapNotifyWatch`, a NOTIFY followed by IDLE, yielding the notifications of every mailbox it names, and `client::ImapClientStd::watch_notify`, the same on a worker thread.
+
+  A `NOTIFICATIONOVERFLOW` ends it with `ImapNotifyWatchError::Overflow`.
+
+  It ENABLEs CONDSTORE first, so that a flag change in a mailbox that isn't selected is reported (as HIGHESTMODSEQ), as `rfc5465::watch::ImapNotifyCondstore` chooses: `Prefer` (the default) when the capabilities it's given include ENABLE and CONDSTORE, `Require` failing with `ImapNotifyWatchError::CondstoreNotSupported` otherwise, or `Disable`. As for the mailbox watch, CONDSTORE counts only when the server's ENABLED lists it; `ImapNotifyWatch::condstore` tells whether it did.
+
 ### Fixed
 
 - Fixed `watch::ImapMailboxWatch` taking the QRESYNC path on any `OK` to its ENABLE: it takes it only when the server's ENABLED lists QRESYNC, and watches the whole mailbox otherwise.
