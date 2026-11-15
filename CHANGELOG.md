@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- **BREAKING**: Changed the mime-rs dependency to 0.2.
 - **BREAKING**: Added `partial` to `send::ImapOutput` and `send::ImapSendOutput`, the FETCH responses recovered in part.
 
   A caller building or matching these structs exhaustively must name the new field.
