@@ -34,6 +34,10 @@
 //! [`ImapMailboxWatchOptions::resume_from`] starts at the resync, so
 //! what changed during the outage is emitted.
 //!
+//! [`ImapMailboxWatch::opened`] turns true once the mailbox is
+//! examined, before the first wait, which tells an established watch
+//! from one its EXAMINE is about to end.
+//!
 //! Connection is dedicated. Flip the shared [`AtomicBool`] to wind
 //! down cleanly.
 //!
@@ -294,6 +298,7 @@ pub struct ImapMailboxWatch {
     highest_mod_seq: u64,
     shadow: BTreeMap<NonZeroU32, Vec<Flag<'static>>>,
     seeded: bool,
+    opened: bool,
     pending: VecDeque<ImapMailboxWatchEvent>,
 }
 
@@ -322,6 +327,7 @@ impl ImapMailboxWatch {
             highest_mod_seq: 0,
             shadow: BTreeMap::new(),
             seeded: false,
+            opened: false,
             pending: VecDeque::new(),
         };
 
@@ -376,6 +382,11 @@ impl ImapMailboxWatch {
             highest_mod_seq: self.highest_mod_seq,
             flags: self.shadow.clone(),
         })
+    }
+
+    /// Whether the mailbox was opened, its first EXAMINE having succeeded.
+    pub fn opened(&self) -> bool {
+        self.opened
     }
 
     /// The re-read that follows a wake, whichever way the watch was
@@ -642,6 +653,8 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 debug!("examined mailbox");
                             }
 
+                            self.opened = true;
+
                             let fetch = match fetch_uid_flags() {
                                 Ok(fetch) => fetch,
                                 Err(err) => return ImapCoroutineState::Complete(Err(err)),
@@ -802,6 +815,8 @@ impl ImapCoroutine for ImapMailboxWatch {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
 
+                            self.opened = true;
+
                             let unreadable = unreadable(&partial);
                             data.changed
                                 .retain(|fetch| !unreadable.contains(&fetch.seq));
@@ -845,6 +860,8 @@ impl ImapCoroutine for ImapMailboxWatch {
                             if let Err(err) = self.check_uid_validity(&data) {
                                 return ImapCoroutineState::Complete(Err(err));
                             }
+
+                            self.opened = true;
 
                             let fetch = match fetch_uid_flags() {
                                 Ok(fetch) => fetch,
@@ -1515,5 +1532,113 @@ mod tests {
         };
         assert_eq!(UID_VALIDITY, known.get());
         assert_eq!(UID_VALIDITY + 1, seen.get());
+    }
+
+    const ENABLED: &str = "* ENABLED QRESYNC\r\n{tag} OK enabled\r\n";
+
+    const REFUSED: &str = "{tag} NO no such mailbox\r\n";
+
+    /// The EXAMINE (CONDSTORE) or (QRESYNC) reply of a mailbox that has
+    /// never been recreated.
+    fn examined_qresync() -> String {
+        format!(
+            "* 2 EXISTS\r\n\
+             * OK [UIDVALIDITY {UID_VALIDITY}] uid validity\r\n\
+             * OK [HIGHESTMODSEQ 50] modseq\r\n\
+             {{tag}} OK [READ-ONLY] EXAMINE completed\r\n",
+        )
+    }
+
+    #[test]
+    fn the_watch_opens_once_its_examine_succeeds() {
+        let (mut watch, mut frag) = watcher(&[]);
+        assert!(!watch.opened());
+
+        let steps: &[Step] = &[("EXAMINE INBOX", &[&examined(UID_VALIDITY)])];
+        drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(watch.opened());
+    }
+
+    #[test]
+    fn a_qresync_watch_opens_on_its_examine_not_its_enable() {
+        let (mut watch, mut frag) = watcher(&[Capability::QResync]);
+        let steps: &[Step] = &[("ENABLE", &[ENABLED])];
+        drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(!watch.opened());
+
+        let (mut watch, mut frag) = watcher(&[Capability::QResync]);
+        let steps: &[Step] = &[
+            ("ENABLE", &[ENABLED]),
+            ("EXAMINE INBOX (CONDSTORE)", &[&examined_qresync()]),
+        ];
+        drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(watch.opened());
+    }
+
+    #[test]
+    fn a_resumed_watch_opens_once_its_resync_examine_succeeds() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(0, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[], opts);
+        let steps: &[Step] = &[("EXAMINE INBOX", &[&examined(UID_VALIDITY)])];
+        drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(watch.opened());
+
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(42, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[Capability::QResync], opts);
+        let steps: &[Step] = &[
+            ("ENABLE", &[ENABLED]),
+            ("EXAMINE INBOX (QRESYNC (1700 42))", &[&examined_qresync()]),
+        ];
+        drive(&mut watch, &mut frag, steps).expect("watch running");
+        assert!(watch.opened());
+    }
+
+    #[test]
+    fn a_refused_examine_never_opens_the_watch() {
+        let resumed = || ImapMailboxWatchOptions {
+            resume_from: Some(known(42, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let enable: Step = ("ENABLE", &[ENABLED]);
+        let refuse: Step = ("EXAMINE INBOX", &[REFUSED]);
+
+        for (capability, opts, steps) in [
+            (&[][..], ImapMailboxWatchOptions::default(), &[refuse][..]),
+            (&[][..], resumed(), &[refuse][..]),
+            (
+                &[Capability::QResync][..],
+                Default::default(),
+                &[enable, refuse],
+            ),
+            (&[Capability::QResync][..], resumed(), &[enable, refuse]),
+        ] {
+            let (mut watch, mut frag) = watcher_with(capability, opts);
+            let err = drive(&mut watch, &mut frag, steps).expect_err("examine refused");
+            assert!(matches!(err, ImapMailboxWatchError::Examine(_)), "{err:?}");
+            assert!(!watch.opened());
+        }
+    }
+
+    #[test]
+    fn a_recreated_mailbox_never_opens_a_resumed_watch() {
+        let opts = ImapMailboxWatchOptions {
+            resume_from: Some(known(0, &[(1, Vec::new())])),
+            ..Default::default()
+        };
+        let (mut watch, mut frag) = watcher_with(&[], opts);
+        let steps: &[Step] = &[("EXAMINE INBOX", &[&examined(UID_VALIDITY + 1)])];
+
+        let err = drive(&mut watch, &mut frag, steps).expect_err("uid validity changed");
+        assert!(
+            matches!(err, ImapMailboxWatchError::UidValidityChanged { .. }),
+            "{err:?}"
+        );
+        assert!(!watch.opened());
     }
 }

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `watch::ImapMailboxWatch::opened`, true once the watch's EXAMINE succeeded.
+
+- Added `client::ImapMailboxWatchStream::opened` and `client::ImapMailboxWatchStream::wait_opened`, the same for the blocking watch.
+
+  `wait_opened` returns `Disconnected` when the worker ended without opening the mailbox, its error waiting on the stream.
+
+### Fixed
+
+- Fixed `rfc3501::fetch::ImapMessageFetchFirst` returning the other items of the requested message when one of them did not decode.
+
+  It fails with `MissingData` again, as before 0.11.0.
+
 ## [0.11.0] - 2026-11-15
 
 ### Added

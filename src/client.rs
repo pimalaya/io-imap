@@ -1160,7 +1160,8 @@ impl ImapClientStd {
     /// Drop the returned stream (or call its `close`) to wind down.
     /// `capability` selects the QRESYNC path or the whole-mailbox
     /// fallback, and `opts.shutdown_poll` how long winding down may
-    /// take.
+    /// take. [`ImapMailboxWatchStream::wait_opened`] tells when the
+    /// mailbox is open.
     pub fn watch_mailbox(
         self,
         mailbox: Mailbox<'static>,
@@ -1182,13 +1183,26 @@ impl ImapClientStd {
         stream.stop_retrying();
 
         let (tx, rx) = mpsc::sync_channel::<Result<ImapMailboxWatchEvent, ImapClientError>>(256);
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
         let shutdown_handle = shutdown.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; READ_BUFFER_SIZE];
             let mut arg: Option<Vec<u8>> = None;
+            let mut opened_tx = Some(opened_tx);
 
             let mut pump = || loop {
-                match watcher.resume(&mut fragmentizer, arg.as_deref()) {
+                let state = watcher.resume(&mut fragmentizer, arg.as_deref());
+
+                // NOTE: told before what the resume yielded, so the
+                // opening comes before the first event; a worker that
+                // ends unopened drops the sender instead.
+                if watcher.opened()
+                    && let Some(opened_tx) = opened_tx.take()
+                {
+                    opened_tx.send(()).ok();
+                }
+
+                match state {
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(e)) => {
                         arg = None;
                         if tx.send(Ok(e)).is_err() {
@@ -1274,6 +1288,8 @@ impl ImapClientStd {
             rx: Some(rx),
             handle: Some(handle),
             shutdown: shutdown_handle,
+            opened_rx,
+            opened: AtomicBool::new(false),
         })
     }
 
@@ -1341,7 +1357,7 @@ impl ImapClientStd {
     }
 
     /// `UID FETCH <set> (UID BODY.PEEK[])` streaming every message body in one
-    /// command — N bodies for one round trip. Each message is routed to its own
+    /// command: N bodies for one round trip. Each message is routed to its own
     /// sink: `open(uid)` returns a fresh sink when a message begins, its body is
     /// streamed into it, and `done(uid, sink)` commits it when the message ends.
     /// No body is held in memory whole. A requested UID absent on the server
@@ -1528,9 +1544,30 @@ pub struct ImapMailboxWatchStream {
     rx: Option<Receiver<Result<ImapMailboxWatchEvent, ImapClientError>>>,
     handle: Option<JoinHandle<Option<ImapMailboxWatchState>>>,
     shutdown: Arc<AtomicBool>,
+    opened_rx: Receiver<()>,
+    opened: AtomicBool,
 }
 
 impl ImapMailboxWatchStream {
+    /// Whether the worker opened the mailbox, its EXAMINE having succeeded.
+    pub fn opened(&self) -> bool {
+        self.wait_opened(Duration::ZERO).is_ok()
+    }
+
+    /// Waits up to `timeout` for the worker to open the mailbox.
+    ///
+    /// `Disconnected` tells a worker that ended unopened, its error
+    /// waiting on the stream.
+    pub fn wait_opened(&self, timeout: Duration) -> Result<(), RecvTimeoutError> {
+        if self.opened.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.opened_rx.recv_timeout(timeout)?;
+        self.opened.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Non-blocking probe for the next event.
     pub fn try_recv(&self) -> Result<Result<ImapMailboxWatchEvent, ImapClientError>, TryRecvError> {
         match &self.rx {
@@ -1758,6 +1795,8 @@ mod tests {
             rx: Some(rx),
             handle: Some(handle),
             shutdown: Arc::new(AtomicBool::new(false)),
+            opened_rx: mpsc::sync_channel(1).1,
+            opened: AtomicBool::new(false),
         };
 
         let (closed_tx, closed_rx) = mpsc::channel();
@@ -1768,6 +1807,63 @@ mod tests {
 
         let closed = closed_rx.recv_timeout(Duration::from_secs(2));
         assert!(closed.is_ok(), "close is still waiting for the worker");
+    }
+
+    #[test]
+    fn a_watch_stream_opens_once_its_examine_succeeds() {
+        let stream = watch_stream(|command| {
+            if command.contains("EXAMINE") {
+                "* OK [UIDVALIDITY 1] uid validity\r\n{tag} OK [READ-ONLY] done\r\n"
+            } else if command.contains("IDLE") {
+                "+ idling\r\n"
+            } else {
+                "{tag} OK done\r\n"
+            }
+        });
+
+        assert_eq!(Ok(()), stream.wait_opened(Duration::from_secs(5)));
+        assert!(stream.opened());
+        stream.close().expect("worker wound down");
+    }
+
+    #[test]
+    fn a_watch_stream_refused_its_examine_never_opens() {
+        let mut stream = watch_stream(|command| {
+            if command.contains("EXAMINE") {
+                "{tag} NO no such mailbox\r\n"
+            } else {
+                "{tag} OK done\r\n"
+            }
+        });
+
+        let opened = stream.wait_opened(Duration::from_secs(5));
+        assert_eq!(Err(RecvTimeoutError::Disconnected), opened);
+        assert!(!stream.opened());
+
+        let err = stream
+            .next()
+            .expect("an error")
+            .expect_err("examine refused");
+        let status = err.status().expect("a refusal");
+        assert_eq!(StatusKind::No, status.kind);
+    }
+
+    /// The fallback watch of INBOX over a [`ScriptStream`] answering
+    /// with `answer`.
+    fn watch_stream(answer: fn(&str) -> &'static str) -> ImapMailboxWatchStream {
+        let stream = ScriptStream {
+            answer,
+            unflushed: Vec::new(),
+            replies: Vec::new(),
+        };
+        let opts = ImapMailboxWatchStreamOptions {
+            shutdown_poll: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        ImapClientStd::new(stream)
+            .watch_mailbox("INBOX".try_into().expect("valid mailbox"), &[], opts)
+            .expect("watch started")
     }
 
     #[test]
@@ -1825,6 +1921,58 @@ mod tests {
     }
 
     impl ImapStream for OkStream {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A stream answering each flushed command with `answer`, `{tag}`
+    /// standing for its tag, and timing out once the answers are read.
+    struct ScriptStream {
+        answer: fn(&str) -> &'static str,
+        unflushed: Vec<u8>,
+        replies: Vec<u8>,
+    }
+
+    impl Read for ScriptStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.replies.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+
+            let n = buf.len().min(self.replies.len());
+            buf[..n].copy_from_slice(&self.replies[..n]);
+            self.replies.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl Write for ScriptStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.unflushed.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let command = String::from_utf8(mem::take(&mut self.unflushed));
+            let command = command.expect("utf8 command");
+            if command.is_empty() {
+                return Ok(());
+            }
+
+            let tag = command.split(' ').next().unwrap_or_default();
+            let reply = (self.answer)(&command).replace("{tag}", tag);
+            self.replies.extend_from_slice(reply.as_bytes());
+            Ok(())
+        }
+    }
+
+    impl ImapStream for ScriptStream {
         fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }

@@ -145,7 +145,8 @@ pub enum ImapMessageFetchError {
     #[error("IMAP FETCH failed: server did not return a tagged response")]
     MissingTagged,
     /// The server answered OK but returned no FETCH data for the
-    /// requested message.
+    /// requested message, or a line of it whose items decoded only in
+    /// part.
     #[error("IMAP FETCH failed: server did not return any data")]
     MissingData,
     /// The underlying send/receive exchange failed (EOF, decode, framing).
@@ -339,6 +340,20 @@ impl ImapCoroutine for ImapMessageFetchFirst {
                     }
                 }
 
+                // NOTE: a line of the requested message recovered in part
+                // misses items asked for, as a line skipped whole does.
+                let incomplete = out.partial.iter().any(|partial| {
+                    if self.uid {
+                        partial.uid == Some(self.id)
+                    } else {
+                        partial.seq == self.id
+                    }
+                });
+
+                if incomplete {
+                    output.clear();
+                }
+
                 match body.kind {
                     StatusKind::Ok => match Vec1::try_from(output) {
                         Ok(items) => ImapCoroutineState::Complete(Ok(items)),
@@ -377,6 +392,8 @@ mod tests {
     use core::str;
 
     use alloc::{borrow::ToOwned, format};
+
+    use imap_codec::imap_types::fetch::MessageDataItemName;
 
     use crate::rfc3501::fetch::*;
 
@@ -670,6 +687,75 @@ mod tests {
         let reply = b"* 9 FETCH (FLAGS (\\Seen))\r\nA1 OK FETCH completed\r\n";
         let err = expect_complete_err_first(&mut fetch, &mut frag, reply);
         assert!(matches!(err, ImapMessageFetchError::MissingData));
+    }
+
+    #[test]
+    fn first_with_an_item_that_does_not_decode_returns_missing_data_error() {
+        for (uid, line) in [
+            (
+                false,
+                "* 42 FETCH (UID 100 FLAGS (\\Seen) ENVELOPE (NIL))\r\n",
+            ),
+            (true, "* 7 FETCH (UID 42 FLAGS (\\Seen) ENVELOPE (NIL))\r\n"),
+        ] {
+            let reply = format!("{line}A1 OK FETCH completed\r\n");
+            let err = first_reply_err(uid, reply.as_bytes());
+            assert!(matches!(err, ImapMessageFetchError::MissingData), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn first_ignores_another_message_recovered_in_part() {
+        let unsolicited = "* 9 FETCH (FLAGS (\\Seen) ENVELOPE (NIL))\r\n";
+
+        for (uid, requested) in [
+            (false, "* 42 FETCH (UID 100)\r\n"),
+            (true, "* 7 FETCH (UID 42)\r\n"),
+        ] {
+            let mut fetch = first_fetch(uid);
+            let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+            expect_wants_tag_first(&mut fetch, &mut frag);
+            let _ = expect_wants_write_first(&mut fetch, &mut frag, Some(b"A1"));
+            expect_wants_read_first(&mut fetch, &mut frag);
+
+            let reply = format!("{requested}{unsolicited}A1 OK FETCH completed\r\n");
+            let items = expect_complete_ok_first(&mut fetch, &mut frag, reply.as_bytes());
+            assert!(
+                matches!(items.as_ref(), [MessageDataItem::Uid(_)]),
+                "{items:?}"
+            );
+        }
+    }
+
+    /// The FETCH of message 42, by UID when `uid` holds, asking for its
+    /// UID, flags and envelope.
+    fn first_fetch(uid: bool) -> ImapMessageFetchFirst {
+        let names = Vec::from([
+            MessageDataItemName::Uid,
+            MessageDataItemName::Flags,
+            MessageDataItemName::Envelope,
+        ]);
+
+        ImapMessageFetchFirst::new(
+            NonZeroU32::new(42).expect("non-zero"),
+            MacroOrMessageDataItemNames::MessageDataItemNames(names),
+            ImapMessageFetchOptions {
+                uid,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Runs [`first_fetch`] tagged `A1` over `reply`, which fails.
+    fn first_reply_err(uid: bool, reply: &[u8]) -> ImapMessageFetchError {
+        let mut fetch = first_fetch(uid);
+        let mut frag = Fragmentizer::new(50 * 1024 * 1024);
+
+        expect_wants_tag_first(&mut fetch, &mut frag);
+        let _ = expect_wants_write_first(&mut fetch, &mut frag, Some(b"A1"));
+        expect_wants_read_first(&mut fetch, &mut frag);
+        expect_complete_err_first(&mut fetch, &mut frag, reply)
     }
 
     #[test]

@@ -52,3 +52,17 @@ The blocking client SHALL flush its stream after each write a coroutine asks for
 
 - **WHEN** a COPY completes with `NO mailbox does not exist`
 - **THEN** the client error says the connection is not lost
+
+### Requirement: The watch stream tells when its mailbox is open
+
+The worker of `ImapClientStd::watch_mailbox` SHALL signal the opening of its watch once, before handing over what the resume that opened it yielded. `ImapMailboxWatchStream::wait_opened` SHALL return `Ok(())` once the watch is open, `Timeout` while it is not yet, and `Disconnected` when the worker ended without opening it, its error then waiting on the stream. `ImapMailboxWatchStream::opened` SHALL tell the same without waiting.
+
+#### Scenario: Examined
+
+- **WHEN** the server answers the EXAMINE of the watch with `OK` and a UIDVALIDITY
+- **THEN** `wait_opened` returns `Ok(())`
+
+#### Scenario: Refused
+
+- **WHEN** the server answers the EXAMINE of the watch with `NO`
+- **THEN** `wait_opened` returns `Disconnected`, and the stream yields the refusal

@@ -99,3 +99,22 @@ A whole-mailbox re-read whose FETCH skipped a line for not decoding, or recovere
 
 - **WHEN** a watch knowing UID 2 as `\Seen` re-reads a mailbox whose line for UID 2 decodes its `UID` but not its `FLAGS`
 - **THEN** it emits no flag change for 2, and its state still holds 2 as `\Seen`
+
+### Requirement: A watch tells when its mailbox is open
+
+`ImapMailboxWatch::opened` SHALL be false until an EXAMINE of the watch succeeds and passes the watch's checks (UIDVALIDITY present, HIGHESTMODSEQ present on the QRESYNC path, UIDVALIDITY unchanged on a resume), and true from then on. An ENABLE alone SHALL NOT open the watch.
+
+#### Scenario: Examined
+
+- **WHEN** a watch reads the `OK` of its EXAMINE, with a UIDVALIDITY
+- **THEN** `opened` is true when it writes its baseline FETCH
+
+#### Scenario: Refused
+
+- **WHEN** a watch, new or resumed, with or without QRESYNC, reads `NO` to its EXAMINE
+- **THEN** it fails with `Examine` and `opened` stays false
+
+#### Scenario: Recreated mailbox
+
+- **WHEN** a resumed watch reads an EXAMINE announcing another UIDVALIDITY
+- **THEN** it fails with `UidValidityChanged` and `opened` stays false
