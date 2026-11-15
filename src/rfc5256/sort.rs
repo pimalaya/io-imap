@@ -525,9 +525,18 @@ fn addr_mailbox(addresses: Option<&Vec<Address<'static>>>) -> Vec<u8> {
 /// instant, so `SortKey::Date` orders chronologically rather than by the
 /// header's leading weekday. The ENVELOPE date arrives as bytes; a
 /// non-UTF-8, unparsable, or absent header yields `None`.
+///
+/// The day-of-week is informational (RFC 5322 section 3.3) and skipped,
+/// chrono rejecting a wrong one.
 fn date_sort_key(raw: Option<&[u8]>) -> Option<DateTime<FixedOffset>> {
-    let raw = from_utf8(raw?).ok()?;
-    DateTime::parse_from_rfc2822(raw).ok()
+    let raw = from_utf8(raw?).ok()?.trim_start();
+
+    let date = match raw.as_bytes() {
+        &[d, a, y, b',', ..] if [d, a, y].iter().all(u8::is_ascii_alphabetic) => &raw[4..],
+        _ => raw,
+    };
+
+    DateTime::parse_from_rfc2822(date).ok()
 }
 
 /// Extracts the base subject of a raw subject (RFC 5256 section 2.1).
@@ -979,6 +988,23 @@ mod tests {
         assert_eq!(ids, [3, 2, 1, 4].map(nz));
     }
 
+    #[test]
+    fn fallback_date_ignores_a_wrong_weekday() {
+        let date = |date: &str| format!("(\"{date}\" NIL NIL NIL NIL NIL NIL NIL NIL NIL)");
+        let ids = sort_fetched(
+            SortKey::Date,
+            false,
+            &[
+                date("Thu, 01 Jan 2026 08:00:00 +0000"),
+                date("Thu, 01 Jan 2026 12:00:00 +0000"),
+                date("Mon, 01 Jan 2026 06:00:00 +0000"),
+            ],
+        );
+
+        // 3 sorts by its date, not by its internal date, 3 Jan.
+        assert_eq!(ids, [3, 1, 2].map(nz));
+    }
+
     /// Runs the UID fallback over messages whose envelopes are given in
     /// sequence order, UID `n` and internal date `n` Jan 2026 for the
     /// `n`th one.
@@ -1126,6 +1152,18 @@ mod tests {
         assert_eq!(date_sort_key(None), None);
         assert_eq!(date_sort_key(Some(b"not a date")), None);
         assert!(date_sort_key(None) < mon);
+    }
+
+    #[test]
+    fn date_sort_key_ignores_a_wrong_weekday() {
+        let expected = DateTime::parse_from_rfc3339("2026-11-11T06:00:00Z").expect("rfc3339");
+
+        // 11 Nov 2026 is a Wednesday.
+        let date = date_sort_key(Some(b"Mon, 11 Nov 2026 06:00:00 +0000"));
+        assert_eq!(date, Some(expected));
+
+        assert_eq!(date_sort_key(Some(b"Mon, not a date")), None);
+        assert_eq!(date_sort_key(Some(b"Mon,")), None);
     }
 
     fn nz(n: u32) -> NonZeroU32 {

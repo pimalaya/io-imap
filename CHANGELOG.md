@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Against a server answering a bare `OK`, every resync read nothing and moved past the change, so arrivals, flag changes and expunges were lost.
 
+- Fixed `rfc5256::sort::ImapMessageSort` sorting by `DATE` a message whose `Date:` names a wrong day-of-week at its internal date: the day-of-week is ignored, so it sorts at the date it shows.
+
 ## [0.11.1] - 2026-11-15
 
 ### Added
