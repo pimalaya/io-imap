@@ -4,20 +4,24 @@
 
 //! # io-imap
 //!
-//! I/O-free IMAP client coroutines built on
+//! I/O-free IMAP client coroutines and server session built on
 //! [imap-codec](https://docs.rs/imap-codec): every command exchange is
 //! a resumable state machine emitting tag, read and write requests
 //! instead of performing I/O itself, so the caller owns the socket and pumps
-//! the coroutine (see the `client` feature for a ready-made
+//! the coroutine (see the `std` feature for a ready-made
 //! std-blocking pump). imap-codec is re-exported as [`codec`], with
 //! imap-types as [`types`], so consumers encode and decode with the
 //! exact same codec version.
 //!
 //! The crate ships the three standard Pimalaya layers: the I/O-free
-//! coroutines (no_std core, always present), a light std client
-//! (`client` feature) wrapping a caller-provided stream, and a full
-//! std client (`rustls-ring` default, `rustls-aws`, `native-tls`) that
-//! also opens TCP, negotiates TLS and authenticates.
+//! client coroutines (no_std, `client` feature, on by default), a light
+//! std client (`std` feature) wrapping a caller-provided stream, and a
+//! full std client (`rustls-ring` default, `rustls-aws`, `native-tls`)
+//! that also opens TCP, negotiates TLS and authenticates. The `server`
+//! feature adds the I/O-free server side: the `server` module holds a
+//! session framing, checking and answering what a client sends, the
+//! mailbox store left to the caller. The types and the codec
+//! re-exports are always compiled.
 //!
 //! ## Layout: one module per RFC
 //!
@@ -137,7 +141,7 @@
 //! yield vocabulary of their own cannot be defaulted, which is exactly
 //! where implementations are expected to differ.
 //!
-//! [`client::ImapClientStd`] (`client` feature) is the in-tree
+//! [`client::ImapClientStd`] (`std` feature) is the in-tree
 //! implementation, wrapping any blocking `Read + Write` stream plus a
 //! per-connection `Fragmentizer` and the imap-types `TagGenerator`
 //! answering every tag request. Its connect constructor (TLS features)
@@ -161,26 +165,59 @@
 //! live in the examples folder, one per layer.
 
 extern crate alloc;
-#[cfg(feature = "client")]
+#[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(feature = "client")]
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod client;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod coroutine;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc2177;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc2971;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc3501;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc3691;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc4315;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc5161;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc5256;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc6851;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod rfc7628;
 #[cfg(feature = "scram")]
+#[cfg_attr(docsrs, doc(cfg(feature = "scram")))]
 pub mod rfc7677;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod sasl;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod send;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub mod server;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod session;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub mod watch;
 
 /// The imap-codec crate this version of io-imap builds on, re-exported

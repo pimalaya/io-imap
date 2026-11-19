@@ -3,6 +3,8 @@
 //! Alone in its test binary: the counting allocator is global, and a
 //! second test running beside this one would be counted with it.
 
+#![cfg(feature = "client")]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::VecDeque,

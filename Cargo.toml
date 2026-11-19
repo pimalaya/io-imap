@@ -17,44 +17,46 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["rustls-ring", "scram"]
-scram = ["io-sasl/scram"]
+default = ["client", "rustls-ring", "scram"]
+client = ["dep:base64-codec", "dep:chrono", "dep:mime-rs", "io-sasl/client"]
+server = ["io-sasl/server"]
+std = ["client", "imap-codec/tag_generator"]
+scram = ["client", "io-sasl/scram"]
 url = ["dep:url"]
-client = ["imap-codec/tag_generator"]
-rustls-ring = ["client", "url", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:rand"]
-rustls-aws = ["client", "url", "pimalaya-stream/rustls-aws", "dep:anyhow", "dep:rand"]
-native-tls = ["client", "url", "pimalaya-stream/native-tls", "dep:anyhow", "dep:rand"]
+rustls-ring = ["std", "client", "url", "pimalaya-stream/rustls-ring", "dep:anyhow", "dep:rand"]
+rustls-aws = ["std", "client", "url", "pimalaya-stream/rustls-aws", "dep:anyhow", "dep:rand"]
+native-tls = ["std", "client", "url", "pimalaya-stream/native-tls", "dep:anyhow", "dep:rand"]
 vendored = ["pimalaya-stream/vendored"]
 
 [[example]]
 name = "std_coroutine"
 path = "examples/std_coroutine.rs"
-required-features = ["client"]
+required-features = ["std"]
 
 [[example]]
 name = "tokio_coroutine"
 path = "examples/tokio_coroutine.rs"
-required-features = ["client"]
+required-features = ["std"]
 
 [[example]]
 name = "tokio_session"
 path = "examples/tokio_session.rs"
-required-features = ["client", "url"]
+required-features = ["std", "url"]
 
 [[example]]
 name = "tokio_watch"
 path = "examples/tokio_watch.rs"
-required-features = ["client"]
+required-features = ["std"]
 
 [[example]]
 name = "tokio_fetch_stream"
 path = "examples/tokio_fetch_stream.rs"
-required-features = ["client"]
+required-features = ["std"]
 
 [[example]]
 name = "std_client_light"
 path = "examples/std_client_light.rs"
-required-features = ["client"]
+required-features = ["std"]
 
 [[example]]
 name = "std_client_full"
@@ -78,14 +80,17 @@ url = "2"
 
 [dependencies]
 anyhow = { version = "1", optional = true }
-base64-codec = { version = "0.1", default-features = false, features = ["alloc"] }
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+base64-codec = { version = "0.1", default-features = false, features = ["alloc"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 imap-codec = { version = "2.0.0-alpha.10", features = ["ext_condstore_qresync", "ext_id", "ext_login_referrals", "ext_mailbox_referrals", "ext_metadata", "ext_namespace", "ext_utf8", "quirk", "quirk_crlf_relaxed", "quirk_id_empty_to_nil", "starttls"] }
 io-sasl = { version = "0.2", default-features = false }
 log = { version = "0.4", default-features = false }
-mime-rs = { version = "0.2", default-features = false, features = ["base64", "encoding"] }
+mime-rs = { version = "0.2", default-features = false, features = ["base64", "encoding"], optional = true }
 pimalaya-stream = { version = "0.4", default-features = false, optional = true }
 rand = { version = "0.10", default-features = false, features = ["thread_rng"], optional = true }
 secrecy = { version = "0.10", default-features = false }
 thiserror = { version = "2", default-features = false }
 url = { version = "2.2", default-features = false, optional = true }
+
+[patch.crates-io]
+io-sasl = { path = "../io-sasl" }

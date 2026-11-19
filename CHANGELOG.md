@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the `client` cargo feature to `std` (BREAKING): it gates the std runtime, `client::ImapClientStd` and the imap-types tag generator, as `client` did. Consumers enabling it change their dependency line:
+
+  ```toml
+  # before
+  io-imap = { version = "0.11", default-features = false, features = ["client"] }
+  # after
+  io-imap = { version = "0.12", default-features = false, features = ["std"] }
+  ```
+
+- Gated the I/O-free client coroutines (`coroutine`, `send`, `session`, `watch`, `sasl` and every `rfc*` module) behind a new `client` feature, on by default (BREAKING). The types and the `codec`/`types` re-exports stay always compiled. Consumers using the coroutines with `default-features = false` add the feature:
+
+  ```toml
+  # before
+  io-imap = { version = "0.11", default-features = false }
+  # after
+  io-imap = { version = "0.12", default-features = false, features = ["client"] }
+  ```
+
+  The default set is now `["client", "rustls-ring", "scram"]`; `rustls-ring`, `rustls-aws` and `native-tls` pull `std` and `client`, and `scram` pulls `client`.
+
+- Took io-sasl without its default features: `client` enables `io-sasl/client` and `server` enables `io-sasl/server`. chrono, mime-rs and base64-codec are optional, pulled by `client`.
+
+- Changed `rfc3501::raw::ImapRaw`, `ImapClient::raw` and `ImapClientAsync::raw` to return `Vec<Vec<u8>>`, one entry per response with its exact octets, instead of a `String` decoded lossily (BREAKING). An 8-bit literal was altered and no longer held its announced octet count. `concat()` on the result gives the reply as read; `String::from_utf8_lossy` gives the old text.
+
+### Added
+
+- Added the `server` feature and the `server` module: `server::ImapServerSession`, an I/O-free IMAP server session over one client connection. It frames lines and literals (synchronising, LITERAL+ and LITERAL-) under line, literal and command limits, tracks the connection state, answers CAPABILITY, LOGOUT, STARTTLS, ENABLE and IDLE itself, runs LOGIN and AUTHENTICATE (PLAIN and LOGIN, with SASL-IR) up to the caller's verdict, and hands every other command to the caller:
+
+  ```toml
+  io-imap = { version = "0.12", default-features = false, features = ["server"] }
+  ```
+
+- Added `send::ImapStatusError::code_bytes`, the response code of a refusal as spelled on the wire, without its brackets.
+
+- Added `rfc3501::raw::ImapRawError::MessageTooLong`: a raw response past the `Fragmentizer` size limit fails instead of coming back truncated.
+
+- Added the `server` fuzz target, feeding arbitrary client bytes to the session.
+
 ## [0.11.2] - 2026-11-15
 
 ### Fixed

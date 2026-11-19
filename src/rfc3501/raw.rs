@@ -1,5 +1,6 @@
 //! IMAP raw passthrough coroutine; writes one or more caller-tagged
-//! command lines byte-for-byte and returns the verbatim server response.
+//! command lines byte-for-byte and returns the server's responses as the
+//! exact octets received, one entry per response.
 //!
 //! The input is sent to the server exactly as given: no tag is injected,
 //! no CRLF is trimmed or appended. Callers are therefore responsible for
@@ -15,6 +16,10 @@
 //! tags have been acknowledged by a matching tagged completion line. This
 //! tolerates the server answering pipelined commands out of order (RFC
 //! 3501 §5.5), which a "wait for the last tag" strategy would not.
+//!
+//! Each response is framed by the `Fragmentizer`, literals included, so a
+//! literal's content never starts a response of its own, and its octets
+//! are kept as sent, 8-bit and binary alike.
 //!
 //! # Example
 //!
@@ -41,7 +46,7 @@
 //! let mut tag;
 //! let mut arg = None;
 //!
-//! let response = loop {
+//! let responses = loop {
 //!     match coroutine.resume(&mut fragmentizer, arg.take()) {
 //!         ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
 //!             stream.write_all(&bytes).unwrap();
@@ -54,12 +59,14 @@
 //!             let n = stream.read(&mut buf).unwrap();
 //!             arg = Some(&buf[..n]);
 //!         }
-//!         ImapCoroutineState::Complete(Ok(response)) => break response,
+//!         ImapCoroutineState::Complete(Ok(responses)) => break responses,
 //!         ImapCoroutineState::Complete(Err(err)) => panic!("{err}"),
 //!     }
 //! };
 //!
-//! println!("{response}");
+//! for response in responses {
+//!     println!("{}", String::from_utf8_lossy(&response));
+//! }
 //! ```
 
 use core::{fmt, mem};
@@ -102,6 +109,10 @@ pub enum ImapRawError {
     /// The captured response ran past the given number of octets.
     #[error("IMAP raw command failed: response longer than {0} octets")]
     ResponseTooLong(usize),
+    /// A response ran past the `Fragmentizer` size limit, so its octets
+    /// were not all kept.
+    #[error("IMAP raw command failed: a response is longer than the read limit")]
+    MessageTooLong,
 }
 
 /// Default [`ImapRaw::max_response_len`], in octets.
@@ -109,8 +120,8 @@ pub const DEFAULT_MAX_RESPONSE_LEN: usize = 1024 * 1024 * 1024;
 
 /// I/O-free IMAP raw passthrough coroutine.
 ///
-/// The returned String is a lossy UTF-8 decoding of the raw bytes, so binary
-/// payloads carried in literals are rendered with replacement characters.
+/// Returns every response read, in the order received, each as its exact
+/// octets: its lines with their CRLF and its literals.
 pub struct ImapRaw {
     /// Largest response captured, in octets.
     pub max_response_len: usize,
@@ -119,7 +130,8 @@ pub struct ImapRaw {
     state: State,
     wants_read: bool,
     wants_write: Option<Vec<u8>>,
-    response: Vec<u8>,
+    responses: Vec<Vec<u8>>,
+    len: usize,
 }
 
 impl ImapRaw {
@@ -178,14 +190,15 @@ impl ImapRaw {
             state: State::Write,
             wants_read: false,
             wants_write: None,
-            response: Vec::new(),
+            responses: Vec::new(),
+            len: 0,
         })
     }
 }
 
 impl ImapCoroutine for ImapRaw {
     type Yield = ImapYield;
-    type Return = Result<String, ImapRawError>;
+    type Return = Result<Vec<Vec<u8>>, ImapRawError>;
 
     fn resume(
         &mut self,
@@ -226,17 +239,23 @@ impl ImapCoroutine for ImapRaw {
                             continue;
                         }
 
+                        if fragmentizer.is_max_message_size_exceeded() {
+                            let err = ImapRawError::MessageTooLong;
+                            return ImapCoroutineState::Complete(Err(err));
+                        }
+
                         let bytes = fragmentizer.message_bytes();
                         trace!("captured response message: {}", escape_byte_string(bytes));
 
-                        let room = self.max_response_len.saturating_sub(self.response.len());
+                        let room = self.max_response_len.saturating_sub(self.len);
 
                         if bytes.len() > room {
                             let err = ImapRawError::ResponseTooLong(self.max_response_len);
                             return ImapCoroutineState::Complete(Err(err));
                         }
 
-                        self.response.extend_from_slice(bytes);
+                        self.len += bytes.len();
+                        self.responses.push(bytes.to_vec());
 
                         // NOTE: untagged responses decode to no tag and are
                         // captured then ignored; a tagged completion clears
@@ -251,9 +270,9 @@ impl ImapCoroutine for ImapRaw {
                         // completes.
                     }
                     None if self.pending.is_empty() => {
-                        let response = String::from_utf8_lossy(&self.response).into_owned();
-                        trace!("raw response complete ({} bytes)", self.response.len());
-                        return ImapCoroutineState::Complete(Ok(response));
+                        trace!("raw response complete ({} bytes)", self.len);
+                        let responses = mem::take(&mut self.responses);
+                        return ImapCoroutineState::Complete(Ok(responses));
                     }
                     None => {
                         self.state = State::Read;
@@ -282,8 +301,6 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
-    use alloc::format;
-
     use crate::rfc3501::raw::*;
 
     #[test]
@@ -304,9 +321,15 @@ mod tests {
         let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = "* CAPABILITY IMAP4REV1 IDLE\r\na1 OK CAPABILITY completed\r\n";
-        let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
-        assert_eq!(out, reply);
+        let reply = b"* CAPABILITY IMAP4REV1 IDLE\r\na1 OK CAPABILITY completed\r\n";
+        let out = expect_complete_ok(&mut raw, &mut frag, reply);
+        assert_eq!(
+            out,
+            [
+                b"* CAPABILITY IMAP4REV1 IDLE\r\n".to_vec(),
+                b"a1 OK CAPABILITY completed\r\n".to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -326,7 +349,8 @@ mod tests {
 
         let second = "* 3 EXISTS\r\na1 OK [READ-WRITE] SELECT completed\r\n";
         let out = expect_complete_ok(&mut raw, &mut frag, second.as_bytes());
-        assert_eq!(out, format!("{first}{second}"));
+        assert_eq!(out.concat(), [first, second].concat().as_bytes());
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
@@ -353,10 +377,9 @@ mod tests {
         let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = "a1 NO mailbox does not exist\r\n";
-        let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
-        assert_eq!(out, reply);
-        assert!(out.contains("NO mailbox does not exist"));
+        let reply = b"a1 NO mailbox does not exist\r\n";
+        let out = expect_complete_ok(&mut raw, &mut frag, reply);
+        assert_eq!(out, [reply.to_vec()]);
     }
 
     #[test]
@@ -367,10 +390,58 @@ mod tests {
         let _ = expect_wants_write(&mut raw, &mut frag, None);
         expect_wants_read(&mut raw, &mut frag);
 
-        let reply = "* 1 FETCH (BODY[] {3}\r\nabc)\r\na1 OK FETCH completed\r\n";
-        let out = expect_complete_ok(&mut raw, &mut frag, reply.as_bytes());
-        assert_eq!(out, reply);
-        assert!(out.contains("abc"));
+        let reply = b"* 1 FETCH (BODY[] {3}\r\nabc)\r\na1 OK FETCH completed\r\n";
+        let out = expect_complete_ok(&mut raw, &mut frag, reply);
+        assert_eq!(out.concat(), reply);
+        assert_eq!(out[0], b"* 1 FETCH (BODY[] {3}\r\nabc)\r\n");
+    }
+
+    #[test]
+    fn response_with_8bit_literal_is_returned_exactly() {
+        let mut raw = ImapRaw::new(b"a1 FETCH 1 BODY[]\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
+
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
+        expect_wants_read(&mut raw, &mut frag);
+
+        let reply = b"* 1 FETCH (BODY[] {4}\r\nab\xe9c)\r\na1 OK done\r\n";
+        let out = expect_complete_ok(&mut raw, &mut frag, reply);
+        assert_eq!(out.concat(), reply);
+    }
+
+    #[test]
+    fn literal_line_spelling_a_completion_stays_in_its_response() {
+        let mut raw = ImapRaw::new(b"A1 FETCH 1 BODY[]\r\n").unwrap();
+        let mut frag = Fragmentizer::new(MAX_COMMAND_SIZE);
+
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
+        expect_wants_read(&mut raw, &mut frag);
+
+        let mut literal = [0xe9; 7].to_vec();
+        literal.extend_from_slice(b"\r\nA1 NO forged");
+
+        let mut fetch = b"* 1 FETCH (BODY[] {21}\r\n".to_vec();
+        fetch.extend_from_slice(&literal);
+        fetch.extend_from_slice(b")\r\n");
+
+        let mut reply = fetch.clone();
+        reply.extend_from_slice(b"A1 OK done\r\n");
+
+        let out = expect_complete_ok(&mut raw, &mut frag, &reply);
+        assert_eq!(out, [fetch, b"A1 OK done\r\n".to_vec()]);
+    }
+
+    #[test]
+    fn message_over_fragmentizer_limit_returns_error() {
+        let mut raw = ImapRaw::new(b"a1 FETCH 1 BODY[]\r\n").unwrap();
+        let mut frag = Fragmentizer::new(32);
+
+        let _ = expect_wants_write(&mut raw, &mut frag, None);
+        expect_wants_read(&mut raw, &mut frag);
+
+        let reply = b"* 1 FETCH (BODY[] {40}\r\n0123456789012345678901234567890123456789)\r\na1 OK done\r\n";
+        let err = expect_complete_err(&mut raw, &mut frag, reply);
+        assert!(matches!(err, ImapRawError::MessageTooLong), "{err:?}");
     }
 
     #[test]
@@ -451,7 +522,11 @@ mod tests {
         }
     }
 
-    fn expect_complete_ok(cor: &mut ImapRaw, frag: &mut Fragmentizer, reply: &[u8]) -> String {
+    fn expect_complete_ok(
+        cor: &mut ImapRaw,
+        frag: &mut Fragmentizer,
+        reply: &[u8],
+    ) -> Vec<Vec<u8>> {
         match cor.resume(frag, Some(reply)) {
             ImapCoroutineState::Complete(Ok(value)) => value,
             state => panic!("expected Complete(Ok), got {state:?}"),

@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "io-imap"
-version = "0.10.0"
+version = "0.11.2"
 dependencies = [
  "base64-codec",
  "chrono",
@@ -172,8 +172,6 @@ dependencies = [
 [[package]]
 name = "io-sasl"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41b6725f5378a27ba94468ff1663ead20f612fa16b70839af132dca27dabfe3f"
 dependencies = [
  "log",
  "secrecy",
@@ -221,9 +219,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mime-rs"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44ca77080cce04174d6788fb762d0a5576a1a4902291da9f30862fa4180ec130"
+checksum = "64fab22816df54ec4d6650ed93ac149d33b2844315959c2f4aa773b721482ccc"
 dependencies = [
  "base64-codec",
  "encoding_rs",

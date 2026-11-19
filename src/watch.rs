@@ -1465,7 +1465,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(feature = "std")]
     #[test]
     fn data_read_while_an_idle_is_refreshed_wakes_the_watch() {
         let opts = ImapMailboxWatchOptions {

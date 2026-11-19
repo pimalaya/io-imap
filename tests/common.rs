@@ -522,7 +522,11 @@ pub fn run_client(url: &str, sasl: Sasl) {
     client.noop().expect("NOOP");
 
     let raw = client.raw(b"raw1 NOOP\r\n").expect("RAW");
-    assert!(raw.contains("raw1 OK"), "RAW missed its tagged OK: {raw}");
+    let last = raw.last().map(|response| String::from_utf8_lossy(response));
+    assert!(
+        last.is_some_and(|response| response.starts_with("raw1 OK")),
+        "RAW missed its tagged OK: {raw:?}"
+    );
 
     client.id(ImapServerIdOptions::default()).expect("ID");
 

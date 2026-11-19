@@ -4,6 +4,8 @@
 //! response buffers fed directly as `&[u8]`. No network connection is
 //! made.
 
+#![cfg(feature = "client")]
+
 use io_imap::{
     codec::fragmentizer::Fragmentizer,
     coroutine::*,

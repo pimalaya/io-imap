@@ -16,9 +16,11 @@ Everything below documents only what differs from the Pimalaya standards.
 On top of the standard layers, io-imap gates the SCRAM-SHA-256 mechanism behind the scram feature (it pulls the hmac, pbkdf2, rand and sha2 crates); the default set is scram plus rustls-ring. Check every layer:
 
 ```sh
-cargo build --no-default-features                            # coroutines only, no std leak
-cargo build --no-default-features --features client          # light client, no TLS deps
-cargo build --no-default-features --features client,scram    # light client + SCRAM-SHA-256
+cargo build --no-default-features                            # types and codec only, no std leak
+cargo build --no-default-features --features client          # coroutines, no std leak
+cargo build --no-default-features --features server          # server session, no std leak
+cargo build --no-default-features --features std             # light client, no TLS deps
+cargo build --no-default-features --features std,scram       # light client + SCRAM-SHA-256
 cargo build                                                  # full client (scram + rustls-ring)
 ```
 

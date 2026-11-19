@@ -1,6 +1,6 @@
 # Fuzzing
 
-Coverage-guided fuzzing of the response side with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer). Three targets, each feeding arbitrary server bytes, split into reads whose size the first input byte picks, so segmentation is explored too.
+Coverage-guided fuzzing of both sides with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer). Four targets: three feed arbitrary server bytes to the client coroutines, one arbitrary client bytes to the server session, each input split into reads whose size the first input byte picks, so segmentation is explored too.
 
 The `response` target drives the greeting, STARTTLS, SELECT, EXAMINE, LIST, SEARCH, SORT, FETCH, COPY, MOVE and the single FETCH body stream. Its oracle is that whatever a server sends, a coroutine completes or asks for more, never panics. The greeting and STARTTLS coroutines matter most: they read in plaintext, where anyone on the path speaks. On top of it, a COPYUID returned by COPY or MOVE pairs as many UIDs as it counts, and the body stream never asks for more than its `max_literal_len`.
 
@@ -8,12 +8,15 @@ The `stream_batch` target drives the batched FETCH body stream the way a consume
 
 The `fetch_line` target reads each input as the rest of a `* 1 FETCH (` line, so it explores the recovery of a FETCH response that does not decode whole: the scanner splitting its top level into items, then each item decoded alone. On top of never panicking, it checks that every failed item it names starts with its name and is bytes the server sent.
 
+The `server` target feeds the bytes to `server::ImapServerSession`, its first byte picking the options (LITERAL+ or LITERAL-, QRESYNC, PREAUTH, STARTTLS, LOGINDISABLED, the verdict), under small limits (1 KiB lines, 4 KiB literals). A fake store answers every command with an EXISTS and a tagged completion. On top of never panicking, it checks that the session closes once the input is used up, stays closed, and writes only a greeting followed by responses a client decodes.
+
 cargo-fuzz needs a nightly toolchain (for the `-Z` sanitizer flags). The `fuzz` devShell of the repository flake carries both, nightly via fenix plus cargo-fuzz:
 
 ```sh
 nix develop .#fuzz --command cargo fuzz run response
 nix develop .#fuzz --command cargo fuzz run stream_batch
 nix develop .#fuzz --command cargo fuzz run fetch_line
+nix develop .#fuzz --command cargo fuzz run server
 ```
 
 Bound a run with the libFuzzer flags, which come after the `--` separator:

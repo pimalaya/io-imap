@@ -1,6 +1,6 @@
 //! Light std client: build the TLS stream yourself, wrap it in an
 //! [`ImapStream`], hand it off to [`ImapClientStd::new`], let the client
-//! read the greeting. Requires the `client` feature.
+//! read the greeting. Requires the `std` feature.
 //!
 //! Run with: `HOST=imap.example.org cargo run --example std_client_light`
 

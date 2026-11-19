@@ -59,7 +59,7 @@ use core::{
 
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
 
-#[cfg(feature = "client")]
+#[cfg(feature = "std")]
 use std::time::Instant;
 
 use imap_codec::{
@@ -82,7 +82,7 @@ use crate::{coroutine::*, imap_try, send::*};
 
 /// Default refresh interval: 29 s survives NAT middle-boxes and stays
 /// well under the 29-minute RFC 2177 §3 cap.
-#[cfg(feature = "client")]
+#[cfg(feature = "std")]
 const IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(29);
 
 /// Failure causes during the IMAP IDLE flow.
@@ -163,7 +163,7 @@ impl From<ImapYield> for ImapIdleYield {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImapIdleOptions {
     /// Refresh interval; defaults to 29 s so the connection survives
-    /// middle-boxes. Unused without the `client` feature.
+    /// middle-boxes. Unused without the `std` feature.
     pub timeout: Option<Duration>,
 }
 
@@ -176,9 +176,9 @@ pub struct ImapIdle {
     untagged: Vec<StatusBody<'static>>,
     tag: Option<Tag<'static>>,
     done: Arc<AtomicBool>,
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     opts: ImapIdleOptions,
-    #[cfg(feature = "client")]
+    #[cfg(feature = "std")]
     timer: Option<Instant>,
 }
 
@@ -204,17 +204,17 @@ impl ImapIdle {
             tag: None,
             done,
             opts,
-            #[cfg(feature = "client")]
+            #[cfg(feature = "std")]
             timer: None,
         }
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(feature = "std")]
     fn timeout(&self) -> Duration {
         self.opts.timeout.unwrap_or(IDLE_DEFAULT_TIMEOUT)
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(feature = "std")]
     fn timed_out(&self) -> bool {
         self.timer
             .as_ref()
@@ -232,7 +232,7 @@ impl ImapCoroutine for ImapIdle {
         fragmentizer: &mut Fragmentizer,
         mut arg: Option<&[u8]>,
     ) -> ImapCoroutineState<Self::Yield, Self::Return> {
-        #[cfg(feature = "client")]
+        #[cfg(feature = "std")]
         if self.timer.is_none() {
             self.timer = Some(Instant::now());
         }
@@ -368,9 +368,9 @@ impl ImapCoroutine for ImapIdle {
                     }
 
                     let done = self.done.load(Ordering::SeqCst);
-                    #[cfg(feature = "client")]
+                    #[cfg(feature = "std")]
                     let timed_out = self.timed_out();
-                    #[cfg(not(feature = "client"))]
+                    #[cfg(not(feature = "std"))]
                     let timed_out = false;
 
                     if done || timed_out {
@@ -398,13 +398,13 @@ impl ImapCoroutine for ImapIdle {
                         return ImapCoroutineState::Complete(Err(ImapIdleError::MissingTagged));
                     };
 
-                    #[cfg(feature = "client")]
+                    #[cfg(feature = "std")]
                     let timed_out = self
                         .timer
                         .take()
                         .map(|t| t.elapsed() >= self.timeout())
                         .unwrap_or(false);
-                    #[cfg(not(feature = "client"))]
+                    #[cfg(not(feature = "std"))]
                     let timed_out = false;
 
                     match body.kind {
@@ -580,7 +580,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(feature = "std")]
     #[test]
     fn data_read_before_refresh_completion_yields_event() {
         let done = Arc::new(AtomicBool::new(false));

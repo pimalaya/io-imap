@@ -1,0 +1,17 @@
+---
+cairn: log
+change: the-server-side
+landed: 2026-11-18
+---
+
+# The server side
+
+io-imap gains an I/O-free server session for the Pimalaya mail server, and its features are split so a server pulls neither the client coroutines nor std.
+
+Features (breaking): the old `client` (std runtime and imap-types tag generator) is renamed `std`; `client` now gates the I/O-free client coroutines (coroutine, send, session, watch, sasl and every rfc* module) and is on by default; `server` gates the new `server` module. The types and the `codec`/`types` re-exports are always compiled. `default = ["client", "rustls-ring", "scram"]`; the TLS features pull `std` and `client`; `scram` pulls `client`. io-sasl is taken with `default-features = false`, `client` enabling `io-sasl/client` and `server` `io-sasl/server`; chrono, mime-rs and base64-codec became optional under `client`. The two former `client` sites, the IDLE refresh timer in src/rfc2177/idle.rs and its watch test in src/watch.rs, measure time with `std::time::Instant`, so they moved to `std`; the tag generator stays with `std` because imap-types needs std for it. io-sasl's new features are unreleased: Cargo.toml and fuzz/Cargo.toml patch io-sasl to ../io-sasl until they are.
+
+Server session: `server::ImapServerSession`, resumed with `ImapServerArg` (`Read`, `Respond`, `Verdict`) and yielding `ImapServerYield` (`Write`, `WantsRead`, `Command`, `WantsResponse`, `Login`, `Authenticate`, `WantsVerdict`, `StartTls`, `Idle`, `IdleDone`, `Close`). It frames with imap-codec's `Fragmentizer`, decodes with `CommandCodec`, `AuthenticateDataCodec` and `IdleDoneCodec`, encodes with `GreetingCodec` and `ResponseCodec`, and runs PLAIN and LOGIN through `io_sasl::server`. It answers CAPABILITY, LOGOUT, STARTTLS, ENABLE and IDLE itself and hands everything else to the caller; capabilities per state are computed from `ImapServerSessionOptions::capabilities` (STARTTLS, LOGINDISABLED, AUTH= and SASL-IR added as the options say) or replaced by the caller. STARTTLS drops what was read past the command, closing the command injection hole. Before authentication, literals are held to the line limit.
+
+Capabilities moved: server-session (new), coroutines (the no_std requirement names `std` as the only std feature, a client and server scenario added).
+
+Verified: tests/server.rs, 25 tests (22 without `client`): the RFC 3501 §8 session (its FETCH data trimmed) and the RFC 2177 IDLE example replayed, pipelining, state checks, SASL PLAIN (with and without initial response), LOGIN (challenges, cancel, bad base64), STARTTLS with an injected command, ENABLE, synchronising and non-synchronising literals (LITERAL+, LITERAL-, neither), oversized literals before and after authentication, line limits terminated and not, byte-by-byte input, EOF, caller BYE, a streamed answer; then the greeting, LOGIN (plain and as a literal), SELECT, FETCH, APPEND (synchronising and not), AUTHENTICATE PLAIN with SASL-IR, IDLE and LOGOUT client coroutines run against the session in memory over a fake store. The `server` fuzz target ran 60 s clean (747k runs). `cargo clippy --all-targets` clean with all features, defaults, `server`, `client`, `std` and none; `cargo test` passes with defaults and all features. Not done: the doc tests of the client coroutines import `TagGenerator`, so they fail under `--no-default-features --features client` (they failed the same way under `--no-default-features` before).

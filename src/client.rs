@@ -14,7 +14,7 @@ use core::{
     time::Duration,
 };
 
-use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec, vec::Vec};
 
 use std::{
     io::{self, Read, Write},
@@ -594,14 +594,15 @@ macro_rules! imap_client_commands {
             }
 
             /// Sends one or more caller-tagged command lines
-            /// byte-for-byte and returns the verbatim server response.
+            /// byte-for-byte and returns the server's responses, exact.
             ///
             /// The bytes are written exactly as given (no tag is
             /// injected, no CRLF is trimmed or appended), so callers must
             /// tag every command and separate them with CRLF. The
-            /// response spans up to and including the tagged completion
-            /// of every command, which may arrive out of order.
-            fn raw(&mut self, command: &[u8]) -> Result<String, ImapClientError> {
+            /// responses, one entry each with its CRLF and literals, run
+            /// up to and including the tagged completion of every
+            /// command, which may arrive out of order.
+            fn raw(&mut self, command: &[u8]) -> Result<Vec<Vec<u8>>, ImapClientError> {
                 self.run(ImapRaw::new(command)?)
             }
 
@@ -704,17 +705,18 @@ macro_rules! imap_client_commands {
             }
 
             /// Sends one or more caller-tagged command lines
-            /// byte-for-byte and returns the verbatim server response.
+            /// byte-for-byte and returns the server's responses, exact.
             ///
             /// The bytes are written exactly as given (no tag is
             /// injected, no CRLF is trimmed or appended), so callers must
             /// tag every command and separate them with CRLF. The
-            /// response spans up to and including the tagged completion
-            /// of every command, which may arrive out of order.
+            /// responses, one entry each with its CRLF and literals, run
+            /// up to and including the tagged completion of every
+            /// command, which may arrive out of order.
             fn raw(
                 &mut self,
                 command: &[u8],
-            ) -> impl Future<Output = Result<String, ImapClientError>> + Send {
+            ) -> impl Future<Output = Result<Vec<Vec<u8>>, ImapClientError>> + Send {
                 async move { self.run(ImapRaw::new(command)?).await }
             }
 
@@ -1054,7 +1056,7 @@ const FRAGMENTIZER_MAX_MESSAGE_SIZE: u32 = 100 * 1024 * 1024;
 
 // NOTE: both are protocol constants rather than client state, so they
 // live next to the scheme table in the session module and stay reachable
-// without the client feature. Re-exported here because config layers
+// without the std feature. Re-exported here because config layers
 // already reach for them through this path.
 pub use crate::session::{default_alpn, default_port};
 
@@ -1664,6 +1666,8 @@ pub trait ImapStream: Read + Write + Send + Any {
 #[cfg(test)]
 mod tests {
     use core::mem;
+
+    use alloc::string::String;
 
     use imap_codec::imap_types::response::{Code, StatusKind};
 

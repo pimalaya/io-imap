@@ -27,7 +27,7 @@
 //!
 //! NOTE: the 29-second IDLE refresh that keeps middle-boxes from
 //! dropping the connection is measured with a std `Instant`, so it is
-//! compiled in with the `client` cargo feature (on by default). Built
+//! compiled in with the `std` cargo feature (on by default). Built
 //! without it, the IDLE below is never refreshed.
 
 use core::sync::atomic::{AtomicBool, Ordering};

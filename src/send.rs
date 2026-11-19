@@ -21,7 +21,7 @@ use imap_codec::{
     imap_types::{
         IntoStatic,
         command::{Command, CommandBody},
-        core::{LiteralMode, Tag, Vec1},
+        core::{LiteralMode, Tag, Text, Vec1},
         error::ValidationError,
         fetch::MessageDataItem,
         response::{
@@ -90,6 +90,25 @@ impl From<StatusBody<'static>> for ImapStatusError {
             code: body.code,
             text: body.text.to_string(),
         }
+    }
+}
+
+impl ImapStatusError {
+    /// The response code as spelled on the wire, without its brackets,
+    /// such as `COPYUID 7 1:3 4:6`.
+    ///
+    /// Refs: <https://datatracker.ietf.org/doc/html/rfc3501#section-7.1>
+    pub fn code_bytes(&self) -> Option<Vec<u8>> {
+        let body = StatusBody {
+            kind: StatusKind::Ok,
+            code: Some(self.code.clone()?),
+            text: Text::unvalidated("x"),
+        };
+
+        let response = Response::Status(Status::Untagged(body));
+        let bytes = ResponseCodec::new().encode(&response).dump();
+
+        Some(bytes[b"* OK [".len()..bytes.len() - b"] x\r\n".len()].to_vec())
     }
 }
 
@@ -1464,5 +1483,29 @@ mod tests {
         ));
 
         (send, frag)
+    }
+
+    #[test]
+    fn status_code_bytes_spell_the_wire_code() {
+        let wire: [&[u8]; 4] = [
+            b"COPYUID 7 1:3 4:6",
+            b"TRYCREATE",
+            b"PERMANENTFLAGS (\\Seen \\*)",
+            b"X-WEIRD \xe9t\xe9",
+        ];
+
+        for code in wire {
+            let mut line = b"a1 NO [".to_vec();
+            line.extend_from_slice(code);
+            line.extend_from_slice(b"] refused\r\n");
+
+            let (_, response) = ResponseCodec::new().decode(&line).unwrap();
+            let Response::Status(Status::Tagged(Tagged { body, .. })) = response else {
+                panic!("expected a tagged status, got {response:?}");
+            };
+
+            let status = ImapStatusError::from(body.into_static());
+            assert_eq!(status.code_bytes().as_deref(), Some(code));
+        }
     }
 }

@@ -1,12 +1,13 @@
 # I/O IMAP [![Documentation](https://img.shields.io/docsrs/io-imap?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-imap/latest/io_imap) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya) [![Sponsor](https://img.shields.io/badge/sponsor-pink?style=flat&logo=github-sponsors&logoColor=white)](https://pimalaya.org/sponsor/)
 
-IMAP client library for Rust
+IMAP client and server library for Rust
 
-This library is composed of 3 feature-gated layers:
+This library is composed of 3 feature-gated client layers and an I/O-free server session:
 
-- Low-level **I/O-free** coroutines: no_std-compatible state machines containing the whole IMAP logic, usable anywhere
-- Mid-level **light client**: a standard, blocking client wrapping a stream you opened yourself
-- High-level **full client**: the light client plus TCP connections and TLS negotiations handled for you
+- Low-level **I/O-free** coroutines (`client`): no_std-compatible state machines containing the whole IMAP logic, usable anywhere
+- Mid-level **light client**: a standard, blocking client wrapping a stream you opened yourself (`std`)
+- High-level **full client**: the light client plus TCP connections and TLS negotiations handled for you (`rustls-ring`, `rustls-aws`, `native-tls`)
+- **I/O-free server session** (`server`): framing, limits, state tracking, LOGIN, AUTHENTICATE, ENABLE and IDLE handled, every other command handed to your own store
 
 ## Table of contents
 

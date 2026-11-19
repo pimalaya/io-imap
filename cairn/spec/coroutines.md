@@ -28,11 +28,16 @@ A coroutine never generates a command tag. Before writing each tagged command, i
 
 ### Requirement: The bare core is no_std
 
-Building io-imap without default features enables no `std` feature in its dependency tree, with the `scram` feature as without it. Only the `client` feature pulls std, including the imap-types tag generator `ImapClientStd` answers `WantsTag` with; the rand dependency that draws a SCRAM nonce comes with the TLS features, which compile the only code using it.
+Building io-imap without default features enables no `std` feature in its dependency tree, with the `client`, `server` and `scram` features as without them. Only the `std` feature pulls std, including the imap-types tag generator `ImapClientStd` answers `WantsTag` with; the rand dependency that draws a SCRAM nonce comes with the TLS features, which compile the only code using it.
 
 #### Scenario: Bare build
 
 - **WHEN** io-imap is built with `--no-default-features`
+- **THEN** no dependency has its `std` feature enabled
+
+#### Scenario: Coroutines and server session
+
+- **WHEN** io-imap is built with `--no-default-features --features client,server`
 - **THEN** no dependency has its `std` feature enabled
 
 #### Scenario: SCRAM alone
@@ -101,6 +106,25 @@ A send SHALL collect the untagged data and status responses read before its comp
 - **WHEN** a send with a budget of 2 responses and 24 octets reads `* 1 EXISTS`, `* 2 EXISTS`, then its `OK`
 - **THEN** it completes with both responses
 
+### Requirement: The raw passthrough returns the responses as received
+
+`ImapRaw` SHALL return every response read until the tagged completion of every command sent, in the order received, one entry per response framed by the `Fragmentizer`, each holding its exact octets: its lines with their CRLF and its literals as sent. A line inside a literal SHALL NOT start a response. A response past the `Fragmentizer` size limit SHALL fail the exchange with `MessageTooLong`.
+
+#### Scenario: Latin-1 literal
+
+- **WHEN** a raw `A1 FETCH 1 BODY[]` reads `* 1 FETCH (BODY[] {4}\r\nab\xe9c)\r\n`, then `A1 OK done\r\n`
+- **THEN** it returns those two responses, the octet `0xe9` kept
+
+#### Scenario: Body line spelling a completion
+
+- **WHEN** a raw `A1 FETCH 1 BODY[]` reads a 21-octet literal of seven `0xe9` octets, CRLF and `A1 NO forged`, then `A1 OK done`
+- **THEN** it returns two responses, the literal whole in the first, and `A1 OK done` as the second
+
+#### Scenario: Response past the read limit
+
+- **WHEN** a raw exchange reads a response longer than the `Fragmentizer` size limit
+- **THEN** it fails with `MessageTooLong`
+
 ### Requirement: A LOGOUT ends on its completion, not on its BYE
 
 An untagged BYE ends an exchange at once, the server closing the session, except for LOGOUT, whose BYE precedes its tagged completion (RFC 3501 section 6.1.3): a LOGOUT send SHALL read on to that completion, and the LOGOUT succeeds as well when the stream ends after the BYE.
@@ -126,7 +150,7 @@ A FETCH body stream SHALL hand the bytes it read past its tagged completion or B
 
 ### Requirement: A refused command reports its response code
 
-The error of a command refused with NO or BAD SHALL carry the kind, the response code and the text of that completion, for every command but STARTTLS, whose reply is read without a codec. The blocking client's error SHALL give access to it without matching on the command, including for a command refused while opening a session, running a watch or sorting client-side.
+The error of a command refused with NO or BAD SHALL carry the kind, the response code and the text of that completion, for every command but STARTTLS, whose reply is read without a codec. The blocking client's error SHALL give access to it without matching on the command, including for a command refused while opening a session, running a watch or sorting client-side. `ImapStatusError::code_bytes` SHALL spell the response code as on the wire, without its brackets.
 
 #### Scenario: APPEND to a missing mailbox
 
@@ -137,6 +161,11 @@ The error of a command refused with NO or BAD SHALL carry the kind, the response
 
 - **WHEN** the AUTHENTICATE PLAIN of a session being opened completes with `NO [ALERT] account disabled`
 - **THEN** the client error gives the kind `NO`, the code `ALERT` and the text `account disabled`
+
+#### Scenario: Code spelled as sent
+
+- **WHEN** a command completes with `NO [COPYUID 7 1:3 4:6] refused`
+- **THEN** `code_bytes` of its error is `COPYUID 7 1:3 4:6`
 
 ### Requirement: A skipped response is kept
 
