@@ -716,7 +716,9 @@ dependencies = [
 
 [[package]]
 name = "io-sasl"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74074034a8b5a55a08c4effb9d71c64ecea0617865cdcecde04721ffd877075"
 dependencies = [
  "base64-codec",
  "hmac",

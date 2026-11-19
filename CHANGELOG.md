@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- **BREAKING**: Changed the io-sasl dependency to 0.3.
 - Renamed the `client` cargo feature to `std` (BREAKING): it gates the std runtime, `client::ImapClientStd` and the imap-types tag generator, as `client` did. Consumers enabling it change their dependency line:
 
   ```toml
